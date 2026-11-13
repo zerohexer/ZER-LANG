@@ -1531,6 +1531,43 @@ These would get their own `lambda_zer_*/` directory with operational semantics e
    Extension: continuation-passing wp, Löb induction, state-struct invariants.
    Effort: ~40-80 hours. Builds on concurrency subset.
 
+### The spawn-window model — `lambda_zer_concurrency/window_cfg.v` (2026-11-13, BUG-1651)
+
+A self-contained oracle (stdpp `base` + `decidable` only; no Iris), so it compiles alone:
+
+```
+coqc -Q lambda_zer_concurrency zer_conc -w -notation-overridden lambda_zer_concurrency/window_cfg.v
+```
+
+What it states: a function body is an ARBITRARY control-flow graph (`succ` is any relation —
+goto, break, loops are all just edges); a node spawns a handle lending a variable, joins a
+handle, accesses a variable, or does nothing. The checker's per-handle fact "the thread may
+be running here" is a predicate `W h : node -> Prop`. `window_sound`: if every `W h` is a
+POST-FIXPOINT (entered at the spawn, left only through a join of `h`), no two live windows
+lend one variable, and no access to a lent variable sits inside its window, then no reachable
+configuration races. The three instances are what `checker.c` implements — `closed_window_ok`
+(hypothesis `Hlive_exit`: no edge leaves the interior except into the join),
+`tail_window_ok` (hypothesis `Hentry`: the code after the join is entered only from the join
+or from itself) and `latched_window_ok` (borrowed everywhere). `break_exit_rejected` /
+`textual_window_not_closed` are the witness that the previous textual rule was not a
+post-fixpoint.
+
+Two things to keep straight:
+- It certifies the RULE. That `checker.c` discharges `Hlive_exit` (the walk
+  `win_exits_live`) and `Hentry` (branch depth 0, outside `@once`, every goto / label
+  already passed) is argued by inspection plus the conc-matrix cells — the syntax-to-CFG
+  step is not formalized. The three decisions that ARE pure were extracted to
+  `src/safety/concurrency_rules.c` (`zer_window_*`) with a VST file,
+  `proofs/vst/verif_window_rules.v`.
+- **`verif_window_rules.v` has never been compiled** (the session that wrote it had no VST).
+  It imports the same clightgen output as `verif_concurrency_rules.v` and declares its own
+  `CompSpecs` / `Vprog`; if `make check-vst` fails on it, the likely causes are in the
+  common-errors table above (a `forward_if` that needs the join postcondition for the
+  four-test cascade, or `Z.eq_dec` destruct order). Fix the proof, never the spec — the
+  `_coq` definitions are the ones `window_cfg.v` reasons about (`join_releases_meaning`).
+- The admit gate in `make check-proofs` did not list `lambda_zer_concurrency/*.v` before
+  this change (the subset was built but not grep-gated). It does now.
+
 ### Level 3 — VST on compiler (extract-and-link, IN PROGRESS)
 
 See "Verification strategy — extract-and-link" above for the full pattern.

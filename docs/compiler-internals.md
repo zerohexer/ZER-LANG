@@ -406,6 +406,21 @@ program, flow-insensitive: `mem_edge_add`), the object behind a local pointer
 "copy of a volatile global" sink must consult all of them — `rmw_value_sources` is the read
 side they all feed.
 
+**11l. Write the model BEFORE trusting a relaxation — the proof found three races
+(BUG-1651).** BUG-1648's "closed window keeps the textual rule" and "the join after the last
+jump releases" were relaxations argued in prose. Stating them as Coq hypotheses
+(`window_cfg.v`: a window must be a POST-FIXPOINT of the step relation — left only through a
+join of its handle) showed two were false as implemented and that the pre-existing textual
+rule had the same hole without any goto (a `break` out of the window + a tail that never
+reaches the function exit). The pattern to keep: for any rule of the form "fact F holds
+between program points A and B", ask *which edges leave the region* and *which edges enter
+the code after B* — those two questions are the two hypotheses (`Hlive_exit`, `Hentry`), and
+each needs a syntactic check that discharges it (`win_exits_live`; branch depth 0 + jump
+census). A "joined before function exit" check does NOT cover a path that never exits.
+Tooling note: `apt-get install coq libcoq-stdpp` (Coq 8.18, stdpp 1.9) is enough to compile
+a self-contained oracle (`coqc -Q lambda_zer_concurrency zer_conc ...window_cfg.v`); VST /
+CompCert need opam and were not installable in a sandbox with no opam mirror.
+
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key
 built from `&tbl[i]` names a different slot per evaluation and re-broke the valid teardown

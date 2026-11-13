@@ -308,6 +308,9 @@ struct Symbol {
      * the double-lend check reads, which the latch must not trip. */
     bool borrow_latched;
     bool lend_live;
+    /* BUG-1651: on a ThreadHandle — its spawn's window is CLOSED (see
+     * spawn_stmt.window_closed); only then does the textual join release. */
+    bool th_window_closed;
     const char *th_borrows_name;
     uint32_t th_borrows_name_len;
     /* 2026-08-03: Checker.branch_depth at the SPAWN. A join is only allowed to

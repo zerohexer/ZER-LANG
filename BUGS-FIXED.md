@@ -351,6 +351,29 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   `esc_check_loop` (`EscState.rmw`). Gate: hw-matrix "RMW split through memory" (9 negative
   cells, all false negatives on the pre-fix build; 6 boundary positives).
 
+- **BUG-1651 — the spawn..join window let a path LEAVE it with the thread running; and one
+  handle's join released another handle's variable.** Three accepted, TSan-confirmed races,
+  all found while writing the soundness proof for BUG-1648 (the proof needed a hypothesis no
+  check provided): (1) `for (..) { th = spawn w(&x); if (c) { break; } th.join(); }
+  for (;;) { x += 1; }` — the break path never reaches the function exit, so the
+  "joined before exit" check never fires, and the textual join had released `x` (no goto
+  involved; predates this session); (2) the same break-out with a `goto` back to a later
+  join, so every path joins — accepted by BUG-1648's own closed-window shortcut; (3) in a
+  labelled function the last join in the text (of `h`) released `y`, lent by `h2`, whose
+  thread was still running. Fix: a window is CLOSED only when no statement can leave its
+  interior with the thread running (`win_exits_live`: return / goto / break / continue /
+  the `orelse` exits, unless a `th.join()` earlier in the same statement list ended the
+  thread); an OPEN window is released only by its own handle's TAIL JOIN, and releases only
+  what that handle lent (`Symbol.th_window_closed`, `EscState.open_sites` counted live from
+  the entry of a labelled function). The join is ordered against jumps by COUNT
+  (`jump_seen` / `jump_total`), not by line (`done: th.join();`). The atomic-downgrade
+  window follows (`sync_walk`: only a closed window reaches SW_AFTER). Oracle:
+  `lambda_zer_concurrency/window_cfg.v` (`window_sound`, `closed_window_ok`,
+  `tail_window_ok`, `break_exit_rejected`); decisions extracted to
+  `src/safety/concurrency_rules.c` (`zer_window_*`). Tests: four
+  `window_*_bug1651` negatives, positive `window_exit_after_join_closed_ok_bug1651`;
+  conc-matrix open-window cells (3 false negatives on the previous build).
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

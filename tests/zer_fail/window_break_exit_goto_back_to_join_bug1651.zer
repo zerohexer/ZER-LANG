@@ -1,0 +1,20 @@
+// expect-error: cannot write to 'x' while it is borrowed
+// BUG-1651: a break leaves the window, the parent writes, then a goto reaches a later join — every path joins, the write still races (TSan)
+void w(*u32 p) { for (u32 i = 0; i < 50000; i += 1) { *p += 1; } }
+u32 cnd;
+void f() {
+    u32 x = 0;
+    for (u32 i = 0; i < 2; i += 1) {
+    LS:
+        ThreadHandle th = spawn w(&x);
+        if (cnd == 0) { break; }
+        th.join();
+        continue;
+    L2:
+        th.join();
+        return;
+    }
+    for (u32 k = 0; k < 50000; k += 1) { x += 1; }
+    goto L2;
+}
+u32 main() { f(); return 0; }

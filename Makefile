@@ -455,7 +455,8 @@ check-proofs:
 	          proofs/operational/lambda_zer_qualifier/*.v \
 	          proofs/operational/lambda_zer_capture/*.v \
 	          proofs/operational/lambda_zer_volatile/*.v \
-	          proofs/operational/lambda_zer_disjoint/*.v; do \
+	          proofs/operational/lambda_zer_disjoint/*.v \
+	          proofs/operational/lambda_zer_concurrency/*.v; do \
 	    FILES="$$FILES $$f"; \
 	 done; \
 	 if grep -l 'Admitted\|admit\.' $$FILES 2>/dev/null | grep -q .; then \
@@ -531,7 +532,8 @@ check-vst:
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/cast_rules.v && \
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_cast_rules.v && \
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/concurrency_rules.v && \
-	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_concurrency_rules.v'
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_concurrency_rules.v && \
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_window_rules.v'
 	@echo "=== VST proofs compile green ==="
 	@if grep -l 'Admitted\|admit\.' proofs/vst/verif_*.v 2>/dev/null | grep -q .; then \
 	    echo "FAIL: admits found in VST proofs"; exit 1; \

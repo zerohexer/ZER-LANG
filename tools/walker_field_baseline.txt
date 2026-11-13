@@ -2554,3 +2554,15 @@ checker.c:vrp_cond_effect_free:NODE_WHILE:while_stmt.cond
 checker.c:isrref_walk:NODE_FILE:file.decls
 checker.c:isrref_walk:NODE_FUNC_DECL:func_decl.body
 checker.c:isrref_walk:NODE_INTERRUPT:interrupt.body
+
+# --- checker.c: win_exits_live (BUG-1651) ---
+# "Can this statement leave a spawn window with the thread running?" The arms below
+# ANSWER without descending: a `return` / `await` leaves whatever its operand is, and
+# the top-level declaration kinds (which cannot appear in a body) answer YES — the
+# rejecting direction for the relaxation this walk feeds.
+checker.c:win_exits_live:NODE_AWAIT:await_stmt.cond
+checker.c:win_exits_live:NODE_FILE:file.decls
+checker.c:win_exits_live:NODE_FUNC_DECL:func_decl.body
+checker.c:win_exits_live:NODE_GLOBAL_VAR:var_decl.init
+checker.c:win_exits_live:NODE_INTERRUPT:interrupt.body
+checker.c:win_exits_live:NODE_RETURN:ret.expr

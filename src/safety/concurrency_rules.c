@@ -140,3 +140,48 @@ int zer_yield_context_valid(int in_async, int in_critical, int in_defer) {
     }
     return 1;
 }
+
+/* ---- scoped-spawn WINDOW decisions (BUG-1648 / BUG-1651) ----
+ * Oracle: lambda_zer_concurrency/window_cfg.v. Flat cascades, VST style. */
+
+/* A closed window's textual join releases; an open one needs its tail join. */
+int zer_window_join_releases(int closed, int branch_depth, int in_once, int after_last_jump) {
+    if (closed != 0) {
+        return 1;
+    }
+    if (branch_depth != 0) {
+        return 0;
+    }
+    if (in_once != 0) {
+        return 0;
+    }
+    if (after_last_jump == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* return / goto leave the interior; break / continue only at loop depth 0. */
+int zer_window_stmt_leaves(int is_return_or_goto, int is_loop_jump, int loop_depth) {
+    if (is_return_or_goto != 0) {
+        return 1;
+    }
+    if (is_loop_jump == 0) {
+        return 0;
+    }
+    if (loop_depth != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* An open window in a latched walk was already counted at the function entry. */
+int zer_window_counts_at_spawn(int closed, int latched) {
+    if (closed != 0) {
+        return 1;
+    }
+    if (latched != 0) {
+        return 0;
+    }
+    return 1;
+}

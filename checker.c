@@ -1659,8 +1659,9 @@ static void check_stmt(Checker *c, Node *node);
 static void check_stmt_cond_body(Checker *c, Node *body);
 static bool esc_fn_is_sticky(Checker *c);   /* BUG-1611: the body has a label / goto */
 static void esc_note_spawn(Checker *c);    /* BUG-1648 */
-static bool esc_latch_holds(Checker *c, int line);
-static void esc_latch_release_all(Checker *c);
+static bool esc_latched(Checker *c);
+static bool esc_join_after_jumps(Checker *c, int line);
+static void esc_note_open(Checker *c, Node *spawn);
 static void esc_latch_suspend(Checker *c, bool resume);
 static bool esc_note_lent(Checker *c, Symbol *vs, int param_pos, bool is_global, const void *site, bool closed);
 static Type *resolve_type(Checker *c, TypeNode *tn);
@@ -17983,29 +17984,40 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                          * conditional-nesting check above, so a join on SOME paths
                          * leaves the window open — the same conservative direction
                          * that check already takes for the borrow. */
-                        /* BUG-1648: in a function with a goto / label the window
-                         * is latched — only a join after the last jump, outside any
-                         * conditional body, releases anything. */
-                        bool latch_holds = esc_latch_holds(c, (int)node->loc.line);
+                        /* BUG-1651: an OPEN window (a path left it with the thread
+                         * running — see win_exits_live) is released only by its
+                         * handle's TAIL JOIN: outside every conditional body and
+                         * @once, and after the function's last goto / label, so
+                         * the code that follows is entered only by running this
+                         * join (window_cfg.v, `tail_window_sound`). A CLOSED
+                         * window's join is the textual one. */
+                        if (!zer_window_join_releases(osym2->th_window_closed ? 1 : 0,
+                                c->branch_depth, c->cur_once_node != NULL ? 1 : 0,
+                                esc_join_after_jumps(c, (int)node->loc.line) ? 1 : 0)) {
+                            result = ty_void;
+                            typemap_set(c, field_node, result);
+                            break;
+                        }
                         if (osym2->th_live) {
                             osym2->th_live = false;
                             if (c->live_scoped_threads > 0) c->live_scoped_threads--;
-                            if (c->live_scoped_threads == 0 && !latch_holds)
+                            if (c->live_scoped_threads == 0)
                                 c->lent_param_live_mask = 0;   /* BUG-1303 */
                             if (c->live_scoped_threads == 0 &&
-                                !c->unbounded_spawn_in_func && !latch_holds) {
+                                !c->unbounded_spawn_in_func) {
                                 c->after_spawn_in_func = false;
                                 c->once_lent_count = 0;   /* BUG-1276 */
                             }
                         }
+                        /* releases what THIS handle lent, and nothing else */
                         for (int bi = 0; bi < osym2->th_borrow_count; bi++) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrow_names[bi],
                                 osym2->th_borrow_lens[bi]);
                             if (bv) {
                                 bv->lend_live = false;
-                                if (!bv->borrow_latched)   /* a latched one: esc_latch_release_all */
-                                    bv->is_borrowed_by_thread = false;
+                                bv->borrow_latched = false;
+                                bv->is_borrowed_by_thread = false;
                             }
                         }
                         osym2->th_borrow_count = 0;
@@ -18014,14 +18026,12 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                                 osym2->th_borrows_name, osym2->th_borrows_name_len);
                             if (bv) {
                                 bv->lend_live = false;
-                                if (!bv->borrow_latched)   /* a latched one: esc_latch_release_all */
-                                    bv->is_borrowed_by_thread = false;
+                                bv->borrow_latched = false;
+                                bv->is_borrowed_by_thread = false;
                             }
                             osym2->th_borrows_name = NULL;
                             osym2->th_borrows_name_len = 0;
                         }
-                        if (!latch_holds && c->live_scoped_threads == 0)
-                            esc_latch_release_all(c);   /* BUG-1648 */
                         result = ty_void;
                         typemap_set(c, field_node, result);
                         break;
@@ -25915,7 +25925,9 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
             cal->field.object && cal->field.object->kind == NODE_IDENT &&
             cal->field.object->ident.name_len == w->handle_len &&
             memcmp(cal->field.object->ident.name, w->handle, w->handle_len) == 0) {
-            w->phase = SW_AFTER;
+            /* BUG-1651: only a CLOSED window ends at its textual join */
+            if (w->spawn && w->spawn->kind == NODE_SPAWN && w->spawn->spawn_stmt.window_closed)
+                w->phase = SW_AFTER;
             return;
         }
         /* BUG-1565 (C1): the call of the function that started a fire-and-
@@ -26426,6 +26438,14 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
         }
         Symbol *e = s->encl;
         ww[i].c = c; ww[i].out = &win[i]; ww[i].phase = SW_BEFORE; ww[i].spawn = s->spawn;
+        /* BUG-1651: under a goto / label the code written before an open (or
+         * unjoinable) spawn can run beside its thread */
+        if (s->spawn && s->spawn->kind == NODE_SPAWN && s->spawn->spawn_stmt.in_jump_fn &&
+            !s->spawn->spawn_stmt.window_closed) {
+            ww[i].phase = SW_IN;
+            ww[i].handle = s->spawn->spawn_stmt.handle_name;
+            ww[i].handle_len = (uint32_t)s->spawn->spawn_stmt.handle_name_len;
+        }
         if (e && e->func_node && e->func_node->kind == NODE_FUNC_DECL) {
             ww[i].fnode = e->func_node;
             DeclModuleSave dm = decl_module_enter(c, e);
@@ -32824,10 +32844,14 @@ static void check_stmt_impl(Checker *c, Node *node) {
                  * conditional-nesting guard needs it whether or not anything was
                  * lent by reference. */
                 sym->th_live = true;
+                sym->th_window_closed = node->spawn_stmt.window_closed;   /* BUG-1651 */
                 sym->th_spawn_branch_depth = c->branch_depth;
-                c->live_scoped_threads++;
+                /* an OPEN window in a latched walk was counted at the entry */
+                if (zer_window_counts_at_spawn(node->spawn_stmt.window_closed ? 1 : 0,
+                                               esc_latched(c) ? 1 : 0))
+                    c->live_scoped_threads++;
                 c->after_spawn_in_func = true;
-                if (!node->spawn_stmt.window_closed) esc_note_spawn(c);   /* BUG-1648 */
+                if (!node->spawn_stmt.window_closed) esc_note_open(c, node);
                 typemap_set(c, node, ty_u64);
                 /* Scoped-borrow exclusivity: a non-shared stack local lent via
                  * `&x` to a scoped spawn is exclusively borrowed by the thread
@@ -34930,8 +34954,11 @@ struct EscState {
     bool has_spawn;     /* the function spawns (any kind) */
     bool latch;         /* this walk holds the window open from the function's entry */
     int last_jump_line; /* line of the textually last goto / label */
+    int jump_total;     /* BUG-1651: goto / label statements in the body ... */
+    int jump_seen;      /* ... and how many this walk has passed (text order) */
     uint64_t lent_params;            /* params lent to a scoped spawn, by position */
     Symbol **lent_glob; int lent_glob_n, lent_glob_cap;   /* globals lent */
+    Node **open_sites; int open_n, open_cap;   /* BUG-1651: scoped spawns with an OPEN window */
     /* BUG-1650: the value-taint (BUG-1010) an outer local holds at the END of a
      * loop body reaches the top on the back edge — `g = x + 1; x = g;`. */
     struct EscRmw { const void *loop; const char *name; uint32_t len; Symbol *g; } *rmw;
@@ -35043,11 +35070,15 @@ static void esc_apply_fact(Checker *c, const void *loop, Symbol *s) {
  * wrote `x` while the thread held it (TSan). In a function with a jump the window
  * is therefore LATCHED: every declaration some spawn lends is borrowed from its
  * declaration on (a param / global from the function's entry), the window flags
- * are on from the entry, and a join releases nothing — except a join written
- * after the LAST jump and outside any conditional body, from which control can
- * only run forward (every thread still running there is one zercheck_ir's CFG
- * requires a later join for). One declaration may be lent by ONE spawn site
- * only: the textual double-lend check cannot order two sites under a goto.
+ * are on from the entry, and the textual join releases nothing. What does
+ * release is the TAIL JOIN of that handle (BUG-1651): a join written after the
+ * last jump and outside any conditional body — the code after it is entered
+ * only by running that join, so its thread is dead there. It releases only what
+ * ITS handle lent; the function's window flags fall when every open handle has
+ * had its tail join. One declaration may be lent by ONE spawn site only: the
+ * textual double-lend check cannot order two sites under a goto.
+ * Certified by proofs/operational/lambda_zer_concurrency/window_cfg.v (the
+ * `tail_window_sound` instance; the CLOSED window is `closed_window_sound`).
  * Facts ride the escape fixpoint: the first walk records them and raises an
  * event, the re-walks apply them. */
 static bool esc_lent_fact(Checker *c, const Symbol *s) {
@@ -35110,13 +35141,33 @@ static bool esc_note_lent(Checker *c, Symbol *vs, int param_pos, bool is_global,
     }
     return one_site;
 }
-/* Function entry (params are in scope): open the latched window. */
+/* A scoped spawn whose window is OPEN (BUG-1651). */
+static void esc_note_open(Checker *c, Node *spawn) {
+    if (!esc_on(c) || !c->esc->sticky) return;
+    struct EscState *e = c->esc;
+    for (int i = 0; i < e->open_n; i++) if (e->open_sites[i] == spawn) return;
+    if (e->open_n >= e->open_cap) {
+        int nc = e->open_cap ? e->open_cap * 2 : 8;
+        Node **nb = (Node **)realloc(e->open_sites, (size_t)nc * sizeof(Node *));
+        if (!nb) { e->has_spawn = true; e->growth++; e->event = true; return; }   /* cannot count it: never released */
+        e->open_sites = nb; e->open_cap = nc;
+    }
+    e->open_sites[e->open_n++] = spawn;
+    e->growth++;
+    e->event = true;
+}
+/* Function entry (params are in scope): open the latched window. Every OPEN
+ * scoped spawn is counted live from here (its own tail join takes it off); an
+ * unjoinable spawn (`has_spawn`) keeps the window open for good. */
 static void esc_latch_enter(Checker *c) {
     if (!esc_on(c)) return;
     struct EscState *e = c->esc;
-    e->latch = e->sticky && e->has_spawn;
+    e->jump_seen = 0;   /* a fresh walk of the body */
+    e->latch = e->sticky && (e->has_spawn || e->open_n > 0);
     if (!e->latch) return;
     c->after_spawn_in_func = true;
+    if (e->has_spawn) c->unbounded_spawn_in_func = true;
+    c->live_scoped_threads += e->open_n;
     c->lent_param_live_mask |= e->lent_params;
     ESC_FOR_LOCAL_SYMS(c, s, {
         if (esc_lent_fact(c, s)) { s->is_borrowed_by_thread = true; s->borrow_latched = true; }
@@ -35126,6 +35177,16 @@ static void esc_latch_enter(Checker *c) {
         e->lent_glob[i]->borrow_latched = true;
         lent_global_push(c, e->lent_glob[i]);
     }
+}
+static bool esc_latched(Checker *c) { return esc_on(c) && c->esc->latch; }
+/* Is the statement being checked written after EVERY goto / label of the
+ * function? Counted, not compared by line: `done: th.join();` puts the label
+ * and the join on one line. A jump the walk never passes keeps the count short,
+ * which is the conservative answer. */
+static bool esc_join_after_jumps(Checker *c, int line) {
+    (void)line;
+    if (!esc_on(c)) return false;   /* no jump census: the conservative answer */
+    return !c->esc->sticky || c->esc->jump_seen >= c->esc->jump_total;
 }
 /* Function exit: a global's flags outlive the walk — put them back. */
 static void esc_latch_leave(Checker *c) {
@@ -35142,28 +35203,6 @@ static void esc_latch_leave(Checker *c) {
 static void esc_latch_decl(Checker *c, Symbol *s) {
     if (!esc_on(c) || !c->esc->latch || !s) return;
     if (esc_lent_fact(c, s)) { s->is_borrowed_by_thread = true; s->borrow_latched = true; }
-}
-/* Does the latch keep the window open across a join written at `line`? */
-static bool esc_latch_holds(Checker *c, int line) {
-    return esc_on(c) && c->esc->latch &&
-           !(line > c->esc->last_jump_line && c->branch_depth == 0);
-}
-/* The join after the last jump, with no thread left running: the latch ends. */
-static void esc_latch_release_all(Checker *c) {
-    if (!esc_on(c) || !c->esc->latch) return;
-    struct EscState *e = c->esc;
-    ESC_FOR_LOCAL_SYMS(c, s, {
-        if (s->borrow_latched) {
-            s->borrow_latched = false;
-            if (!s->lend_live) s->is_borrowed_by_thread = false;
-        }
-    });
-    for (int i = 0; i < e->lent_glob_n; i++) {
-        Symbol *g = e->lent_glob[i];
-        g->borrow_latched = false;
-        if (!g->lend_live) g->is_borrowed_by_thread = false;
-    }
-    e->latch = false;
 }
 /* A spawn's ARGUMENTS are evaluated before its thread exists, and name the very
  * variables it lends: the latch (not a live textual lend) is lifted around them. */
@@ -35182,6 +35221,7 @@ static void esc_latch_suspend(Checker *c, bool resume) {
  * orelse block reached through an expression? Exhaustive; the conservative
  * direction (sticky) is "yes". */
 static int _esc_jump_last_line;   /* BUG-1648: max line of a goto / label seen by the walk */
+static int _esc_jump_count;       /* BUG-1651: how many the walk saw */
 static bool esc_has_jump(Checker *c, Node *n, int depth);
 static bool esc_has_jump_ob(Checker *c, Node *blk, void *ud) {
     return esc_has_jump(c, blk, *(int *)ud + 1);
@@ -35197,6 +35237,7 @@ static bool esc_has_jump(Checker *c, Node *n, int depth) {
      * one's line (the caller reads `_esc_jump_last_line > 0` as "has a jump"). */
     case NODE_GOTO: case NODE_LABEL:
         if ((int)n->loc.line > _esc_jump_last_line) _esc_jump_last_line = (int)n->loc.line;
+        _esc_jump_count++;
         return false;
     case NODE_BLOCK: for (int i = 0; i < n->block.stmt_count; i++) EHJ(n->block.stmts[i]); return false;
     case NODE_IF: EHJ(n->if_stmt.then_body); EHJ(n->if_stmt.else_body); return false;
@@ -35320,12 +35361,24 @@ static void esc_check_loop(Checker *c, Node *node) {
     if (ent != stk) free(ent);
 }
 
-/* BUG-1648: a CLOSED window — `ThreadHandle th = spawn f(..); ...; th.join();`
- * in one statement list with no goto / label between the two. No jump can enter
- * the region (it holds no label) or leave it (no goto; a break / continue /
- * return out of it leaves the thread unjoined, which zercheck_ir's CFG refuses),
- * so the code outside it never runs beside that thread and the plain textual
- * rule is exact for it. Only an OPEN window needs the latch. */
+/* ---- BUG-1648 / BUG-1651: CLOSED and OPEN spawn windows --------------------
+ * `ThreadHandle th = spawn f(..); <interior>; th.join();` in ONE statement list
+ * is a CLOSED window when no path can leave the interior with the thread still
+ * running: no `return`, no `goto`, no `break` / `continue` out of it, none of
+ * the `orelse return / break / continue` spellings — unless a `th.join()` earlier
+ * in the SAME statement list has already ended the thread on that path
+ * (`if (err) { th.join(); return; }`). Then the thread is live exactly on the
+ * text between the spawn and the join, and the plain textual rule is exact
+ * (window_cfg.v, `closed_window_sound`). A label inside is an ENTRY, which is
+ * harmless: the thread is not running where the jump comes from.
+ *
+ * Anything else is an OPEN window: the textual join proves nothing, because a
+ * path left the window with the thread running —
+ *     for (..) { th = spawn w(&x); if (c) { break; } th.join(); }
+ *     for (;;) { x += 1; }              // the break path: w is still running
+ * was accepted (TSan), and the function-exit join check never fires on a path
+ * that does not reach the exit. An open window is released only by its handle's
+ * TAIL JOIN (see the join handler). */
 static bool esc_stmt_has_jump(Checker *c, Node *n) {
     int sv = _esc_jump_last_line;
     _esc_jump_last_line = 0;
@@ -35345,25 +35398,134 @@ static bool esc_is_join_of(Node *st, const char *h, size_t hl) {
     return o && o->kind == NODE_IDENT && (size_t)o->ident.name_len == hl &&
            memcmp(o->ident.name, h, hl) == 0;
 }
+/* Can executing `n` leave the window of handle `h` with its thread running?
+ * `loopd`: loops entered since the window's own statement list (a break /
+ * continue below one of them stays inside). Feeds a RELAXATION (closed = the
+ * textual join releases), so everything unknown answers YES. No `default:`. */
+static bool win_exits_live(Checker *c, Node *n, const char *h, size_t hl, int loopd, int depth) {
+    if (!n) return false;
+    if (depth > 4 * ZER_STMT_NEST_MAX) return true;
+    #define WX(x) win_exits_live(c, (x), h, hl, loopd, depth + 1)
+    #define WXL(x) win_exits_live(c, (x), h, hl, loopd + 1, depth + 1)
+    switch (n->kind) {
+    case NODE_RETURN: case NODE_GOTO: return zer_window_stmt_leaves(1, 0, loopd) != 0;
+    /* a suspend hands control to the poller (spawn is banned in async anyway) */
+    case NODE_YIELD: case NODE_AWAIT: return true;
+    case NODE_BREAK: case NODE_CONTINUE: return zer_window_stmt_leaves(0, 1, loopd) != 0;
+    case NODE_LABEL: return false;   /* an entry; the list walk below resets on it */
+    case NODE_BLOCK: {
+        /* a `h.join()` in THIS list ends the thread for what follows it here —
+         * until a label (or a statement holding one) lets control in again */
+        bool joined = false;
+        for (int i = 0; i < n->block.stmt_count; i++) {
+            Node *st = n->block.stmts[i];
+            if (!st) continue;
+            if (st->kind == NODE_LABEL) { joined = false; continue; }
+            if (esc_is_join_of(st, h, hl)) { joined = true; continue; }
+            if (joined && !esc_stmt_has_jump(c, st)) continue;
+            joined = false;
+            if (WX(st)) return true;
+        }
+        return false;
+    }
+    case NODE_IF:
+        return WX(n->if_stmt.cond) || WX(n->if_stmt.then_body) || WX(n->if_stmt.else_body);
+    case NODE_FOR:
+        return WX(n->for_stmt.init) || WXL(n->for_stmt.cond) || WXL(n->for_stmt.step) ||
+               WXL(n->for_stmt.body);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        return WXL(n->while_stmt.cond) || WXL(n->while_stmt.body);
+    case NODE_SWITCH:
+        if (WX(n->switch_stmt.expr)) return true;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            for (int j = 0; j < n->switch_stmt.arms[i].value_count; j++)
+                if (WX(n->switch_stmt.arms[i].values[j])) return true;
+            if (WX(n->switch_stmt.arms[i].body)) return true;
+        }
+        return false;
+    case NODE_DEFER:    return WX(n->defer.body);
+    case NODE_CRITICAL: return WX(n->critical.body);
+    case NODE_ONCE:     return WX(n->once.body);
+    case NODE_SPAWN:
+        /* a nested handle of the SAME name shadows `h`: its join is not ours */
+        if (n->spawn_stmt.handle_name && n->spawn_stmt.handle_name_len == hl &&
+            memcmp(n->spawn_stmt.handle_name, h, hl) == 0) return true;
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            if (WX(n->spawn_stmt.args[i])) return true;
+        return false;
+    case NODE_VAR_DECL:  return WX(n->var_decl.init);
+    case NODE_EXPR_STMT: return WX(n->expr_stmt.expr);
+    case NODE_ORELSE:
+        if (zer_window_stmt_leaves(n->orelse.fallback_is_return ? 1 : 0,
+                (n->orelse.fallback_is_break || n->orelse.fallback_is_continue) ? 1 : 0,
+                loopd))
+            return true;
+        return WX(n->orelse.expr) || WX(n->orelse.fallback);
+    case NODE_ASSIGN:   return WX(n->assign.target) || WX(n->assign.value);
+    case NODE_BINARY:   return WX(n->binary.left) || WX(n->binary.right);
+    case NODE_UNARY:    return WX(n->unary.operand);
+    case NODE_TYPECAST: return WX(n->typecast.expr);
+    case NODE_FIELD:    return WX(n->field.object);
+    case NODE_INDEX:    return WX(n->index_expr.object) || WX(n->index_expr.index);
+    case NODE_SLICE:
+        return WX(n->slice.object) || WX(n->slice.start) || WX(n->slice.end);
+    case NODE_CALL:
+        for (int i = 0; i < n->call.arg_count; i++) if (WX(n->call.args[i])) return true;
+        return WX(n->call.callee);
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (WX(n->intrinsic.args[i])) return true;
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (WX(n->struct_init.fields[i].value)) return true;
+        return false;
+    /* leaves: no control flow inside */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_SIZEOF:
+    case NODE_CAST:
+        return false;
+    /* operand / condition expressions: an `orelse return` may sit in one */
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++)
+            if (WX(n->asm_stmt.inputs[i].expr)) return true;
+        for (int i = 0; i < n->asm_stmt.output_count; i++)
+            if (WX(n->asm_stmt.outputs[i].expr)) return true;
+        return false;
+    case NODE_STATIC_ASSERT: return WX(n->static_assert_stmt.cond);
+    /* declarations cannot appear inside a body */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return true;
+    }
+    #undef WX
+    #undef WXL
+    return true;
+}
 static void esc_mark_closed_spawns(Checker *c, Node *blk) {
+    bool sticky = c->esc && c->esc->sticky;
     for (int i = 0; i < blk->block.stmt_count; i++) {
         Node *st = blk->block.stmts[i];
-        if (!st || st->kind != NODE_SPAWN || !st->spawn_stmt.handle_name) continue;
+        if (!st || st->kind != NODE_SPAWN) continue;
+        st->spawn_stmt.in_jump_fn = sticky;
         st->spawn_stmt.window_closed = false;
+        if (!st->spawn_stmt.handle_name) continue;
+        const char *h = st->spawn_stmt.handle_name;
+        size_t hl = st->spawn_stmt.handle_name_len;
         for (int j = i + 1; j < blk->block.stmt_count; j++) {
             Node *nx = blk->block.stmts[j];
-            if (esc_is_join_of(nx, st->spawn_stmt.handle_name, st->spawn_stmt.handle_name_len)) {
-                st->spawn_stmt.window_closed = true;
-                break;
-            }
-            if (esc_stmt_has_jump(c, nx)) break;
+            if (esc_is_join_of(nx, h, hl)) { st->spawn_stmt.window_closed = true; break; }
+            if (nx && nx->kind == NODE_LABEL) continue;   /* an entry, not an exit */
+            if (win_exits_live(c, nx, h, hl, 0, 0)) break;
         }
     }
 }
 
 static void check_stmt(Checker *c, Node *node) {
     if (!node || !esc_on(c)) { check_stmt_impl(c, node); return; }
-    if (node->kind == NODE_BLOCK && c->esc->sticky) esc_mark_closed_spawns(c, node);   /* BUG-1648 */
+    if (node->kind == NODE_BLOCK) esc_mark_closed_spawns(c, node);   /* BUG-1648 / BUG-1651 */
+    if (node->kind == NODE_GOTO || node->kind == NODE_LABEL) c->esc->jump_seen++;
     switch (node->kind) {
     case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
         esc_check_loop(c, node);
@@ -35501,9 +35663,13 @@ static void check_func_body(Checker *c, Node *node) {
     e->n = 0; e->growth = 0; e->event = false; e->defers_seen = 0; e->saturate = false;
     e->dedupe_from = e->dedupe_to = 0;
     _esc_jump_last_line = 0;
+    _esc_jump_count = 0;
     e->sticky = esc_has_jump(c, body, 0) || _esc_jump_last_line > 0;
     e->last_jump_line = _esc_jump_last_line;
+    e->jump_total = _esc_jump_count;
+    e->jump_seen = 0;
     e->has_spawn = false; e->latch = false; e->lent_params = 0; e->lent_glob_n = 0;
+    e->open_n = 0;
     e->rmw_n = 0;
     Checker *snap = (Checker *)malloc(sizeof(Checker));
     if (!snap) { check_func_body_once(c, node); return; }
@@ -35544,6 +35710,7 @@ static void check_func_body(Checker *c, Node *node) {
 }
 
 static void check_func_body_once(Checker *c, Node *node) {
+    if (c->esc && c->esc->active) c->esc->jump_seen = 0;   /* BUG-1651: a fresh walk */
     /* BUG-1483: an async function's state struct, _init and _poll are generated
      * FROM ITS BODY, so a bodyless `async void f();` with no definition anywhere
      * has nothing to generate — the checker accepted it and the emitted C named

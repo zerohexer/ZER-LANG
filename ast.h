@@ -562,6 +562,9 @@ struct Node {
              * with no goto / label between — the window cannot be entered or
              * left by a jump (set by the checker, in a function with a jump) */
             bool window_closed;
+            /* BUG-1651: the enclosing function has a goto / label, so text order
+             * is not execution order around this spawn */
+            bool in_jump_fn;
         } spawn_stmt;
 
         /* NODE_INT_LIT: 42, 0xFF, 0b1010, 1_000_000 */

@@ -1418,6 +1418,38 @@ int main(void) {
               "u32 main() { u32 v = 0; for (u32 k = 0; k < 2; k += 1) { ThreadHandle th = spawn wi(&v); th.join(); }\n"
               "u32 i = 0;\nagain: ThreadHandle t2 = spawn wi(&v); t2.join(); i += 1; if (i < 2) { goto again; }\n"
               "if (v != 4) { return 1; } return 0; }\n" },
+            /* BUG-1651: OPEN windows — a path leaves the window with the thread
+             * running, so the textual join proves nothing (window_cfg.v) */
+            { "break out, then never exit", 1, "void wl2(*u32 p) { *p += 1; }\nu32 cnd;\n"
+              "void f() { u32 x = 0; for (u32 i = 0; i < 2; i += 1) { ThreadHandle th = spawn wl2(&x);\n"
+              "if (cnd == 0) { break; } th.join(); }\nfor (;;) { x += 1; if (x > 9) { @trap(); } } }\n"
+              "u32 main() { f(); return 0; }\n" },
+            { "orelse break out of window", 1, "void wl2(*u32 p) { *p += 1; }\n"
+              "?u32 mb(u32 v) { if (v == 0) { return null; } return v; }\nu32 cnd;\n"
+              "void f() { u32 x = 0; for (u32 i = 0; i < 2; i += 1) { ThreadHandle th = spawn wl2(&x);\n"
+              "u32 q = mb(cnd) orelse break; th.join(); if (q == 77) { return; } }\n"
+              "for (;;) { x += 1; if (x > 9) { @trap(); } } }\nu32 main() { f(); return 0; }\n" },
+            { "break out, goto back to a join", 1, "void wl2(*u32 p) { *p += 1; }\nu32 cnd;\n"
+              "void f() { u32 x = 0; for (u32 i = 0; i < 2; i += 1) {\nLS: ThreadHandle th = spawn wl2(&x);\n"
+              "if (cnd == 0) { break; } th.join(); continue;\nL2: th.join(); return; }\n"
+              "x += 1; goto L2; }\nu32 main() { f(); return 0; }\n" },
+            { "tail join of another handle", 1, JW
+              "u32 main() { u32 x = 0; u32 y = 0; ThreadHandle h2 = spawn w(&y); goto A;\n"
+              "B: h2.join(); return 0;\nA: ThreadHandle h = spawn w(&x); h.join(); y += 1; h2.join(); return 0; }\n" },
+            { "ok: exit after a join in the list", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 f(u32 err) { u32 x = 0; x = 5; ThreadHandle th = spawn wi(&x);\n"
+              "if (err != 0) { th.join(); return 1; } th.join(); return x; }\n"
+              "u32 main() { if (f(0) != 6) { return 1; } if (f(1) != 1) { return 2; } return 0; }\n" },
+            { "ok: joined break, use after loop", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 x = 0; for (u32 i = 0; i < 3; i += 1) { ThreadHandle th = spawn wi(&x);\n"
+              "if (i == 1) { th.join(); break; } th.join(); }\nx += 1; if (x != 3) { return 1; } return 0; }\n" },
+            { "ok: open window, own tail join", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 x = 0; ThreadHandle th = spawn wi(&x); goto A;\n"
+              "A: th.join(); x += 1; if (x != 2) { return 1; } return 0; }\n" },
+            { "ok: inner-loop break stays inside", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 x = 0; u32 n = 0; ThreadHandle th = spawn wi(&x);\n"
+              "for (u32 k = 0; k < 4; k += 1) { if (k == 2) { break; } n += 1; }\n"
+              "th.join(); if (x + n != 3) { return 1; } return 0; }\n" },
             { "late target: Handle auto-deref", 1,
               "struct T { u32 v; }\nPool(T, 4) pl;\nshared struct Reg { Handle(T) h; }\nReg reg;\n"
               "u32 main() { Handle(T) h = pl.alloc() orelse return; reg.h = h;\n"

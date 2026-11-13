@@ -47,4 +47,24 @@ int zer_isr_main_access_valid(int accessed_in_isr, int accessed_in_main, int is_
 /* F01-F04 — yield/await only valid in async, not in critical or defer. */
 int zer_yield_context_valid(int in_async, int in_critical, int in_defer);
 
+/* ---- scoped-spawn WINDOW decisions (BUG-1648 / BUG-1651) ----
+ * Oracle: proofs/operational/lambda_zer_concurrency/window_cfg.v (operational:
+ * `window_sound` over an arbitrary control-flow graph). VST:
+ * proofs/vst/verif_window_rules.v. */
+
+/* Does a `h.join()` release what h lent? A CLOSED window: yes (the textual join;
+ * `closed_window_ok`). An OPEN one: only its TAIL join — outside every
+ * conditional body and @once, after the function's last goto / label
+ * (`tail_window_ok.Hentry`). */
+int zer_window_join_releases(int closed, int branch_depth, int in_once, int after_last_jump);
+
+/* Does this statement leave a window's interior? `return` / `goto`: always.
+ * `break` / `continue`: only when no loop was entered inside the interior
+ * (`closed_window_ok.Hlive_exit`). */
+int zer_window_stmt_leaves(int is_return_or_goto, int is_loop_jump, int loop_depth);
+
+/* Is a scoped spawn counted live AT its spawn statement? An OPEN window in a
+ * latched walk (a function with a goto / label) was counted at the entry. */
+int zer_window_counts_at_spawn(int closed, int latched);
+
 #endif

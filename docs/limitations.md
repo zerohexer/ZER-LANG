@@ -97,17 +97,20 @@ each a missing SUMMARY fact, not a missing key:
 **B. Concurrency (MEDIUM, accept-unsafe — each TSan- or ASan-confirmed).**
 1. ~~A re-entrant `_poll` of the same task~~ — CLOSED (BUG-1628): the poll traps on re-entry.
 2. ~~Funcptr reach through a POINTER / SLICE spawn argument~~ — CLOSED (BUG-1631).
-3. ~~The scoped-borrow window is textual under `goto`~~ — CLOSED (BUG-1648): in a function
-   with a goto / label an OPEN spawn window is latched from the function's entry (lent
-   locals from their declaration; lent params / globals, the atomic-cell window and the
-   lent-param mask from the entry) and released only by a join written after the last jump,
-   outside any conditional body. A CLOSED pair (`th = spawn ..; ...; th.join();` in one
-   statement list with no jump between) keeps the plain rule. **Residual (precision, loud):**
-   with an open window in a labelled function, the lent variable cannot be touched anywhere
-   before that final join (a write before the spawn included), and one variable cannot be
-   lent from two spawn sites. Move the spawn..join into its own function. The
-   atomic-DOWNGRADE check's own window (`sync_walk`, SW_BEFORE / SW_IN / SW_AFTER) is still
-   textual under a goto.
+3. ~~The scoped-borrow window is textual~~ — CLOSED (BUG-1648 `goto`; BUG-1651 a `break` /
+   `continue` / `return` out of the window, and a join releasing ANOTHER handle's
+   variable). The rule is now the one `proofs/operational/lambda_zer_concurrency/
+   window_cfg.v` proves sound over an arbitrary control-flow graph: a CLOSED window
+   (spawn..join in one statement list, no path leaving it with the thread running) uses the
+   textual rule; an OPEN window is released only by its handle's TAIL JOIN (branch depth 0,
+   outside `@once`, after the last goto / label), and in a function with a goto / label it
+   is borrowed from the function's entry. **Residuals (precision, loud):** with an OPEN
+   window the lent variable cannot be touched before that tail join (in a labelled function:
+   anywhere before it, a write before the spawn included); one variable cannot be lent from
+   two spawn sites in a labelled function; a join in EVERY arm of a branch, or a deferred
+   join, never releases; an interior `goto` to a label that is itself inside the interior
+   opens the window; the atomic-downgrade check treats an open window as never closing.
+   Hoist the join, or move the spawn..join into its own function.
 4. ~~A helper lends its pointer param and touches the same global by NAME~~ — CLOSED
    (BUG-1645: per-parameter lent-global fact, call-site check), and ~~"same object" by name
    misses a plain local alias~~ — CLOSED (BUG-1646: the pair root follows a pointer local's
@@ -133,6 +136,32 @@ each a missing SUMMARY fact, not a missing key:
    `Checker.sync_spawns` re-reads Handle auto-derefs in every body the checker finished after
    the spawn site. **Residual (precision, loud):** that late check does not apply the `@once`
    single-owner exemption — declare the spawn target above its spawn site.
+
+**B2. Proof status of the data-race class (2026-11-13 — read before claiming "proven").**
+What is machine-checked, and where the chain stops:
+- `window_cfg.v` (Coq 8.18 + stdpp, zero admits, compiled in the session): the spawn-window
+  RULE is sound for every control-flow graph (`window_sound`), with the closed, tail and
+  latched windows as instances, and the old textual window refuted on the break-out graph.
+- `proofs/vst/verif_window_rules.v`: VST specs + proofs for the three extracted decisions
+  (`zer_window_join_releases`, `zer_window_stmt_leaves`, `zer_window_counts_at_spawn`).
+  **WRITTEN BUT NOT YET MACHINE-CHECKED** — neither VST nor RefinedC could be installed in
+  the session that wrote it (no opam mirror reachable). It follows the cascade pattern of
+  `verif_concurrency_rules.v` and is wired into `make check-vst`; the first run of that
+  target is its verification. A brute-force comparison of the C against the proven
+  characterization (1548 argument tuples, 0 mismatches) was run instead.
+- NOT proven: that `checker.c` discharges each hypothesis of the instances (the syntactic
+  walk `win_exits_live`, the branch-depth / jump census at the join) — by inspection and the
+  conc-matrix "jump x spawn-window" cells only. NOT modelled at all: the spawn-target race
+  scan, the atomic-cell and atomic-downgrade rules, shared-struct locking, the ISR rules.
+  The Iris subset proves the four-condition closure sufficient; nothing proves the checker
+  enforces it on every program form. "100% data-race-free, proven" is therefore NOT a claim
+  this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
+  proven" is.
+- Still OPEN and accept-unsafe (each recorded above or in the older sections): a thread's
+  split read-modify-write through a VOLATILE global carrier (spawn-scan sink); a `*opaque`
+  field of a shared struct handed to / returned from a ZER function that casts it back; two
+  pointers to one object the checker cannot name alike (`f(p, q)`, `q` from a call) at the
+  lent-param pair; the handler-side split RMW done in helpers. `cinclude` code is a floor.
 
 **C. Values / bare metal (LOW, loud).**
 - A shift COUNT literal is typed against the LEFT operand: `u3 y = x << 8;` is "cannot

@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'hs[1].p' is freed
+// BUG-1633: a callee stores its parameter into an element of a SLICE parameter
+// and the caller hands a local array (the coercion is the slice `hs[..]`). The
+// store summary was applied through a keyed argument only, and a slice has no
+// key — so the caller freed `a` while `hs[1].p` still held it and the write
+// below landed in the recycled slot of `b` (the program returned 99).
+struct T { u32 v; }
+struct H { ?*T p; }
+void link([*]H s, *T p) { s[1].p = p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    link(hs, a);
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    if (hs[1].p) |z| { z.v = 99; }
+    u32 r = b.v;
+    free(b);
+    return r;
+}

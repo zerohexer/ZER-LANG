@@ -16419,6 +16419,14 @@ static void emit_async_state_struct(Emitter *e, IRFunc *func) {
      * NULL (a silent store to address 0 on bare metal), an enum param holding
      * no variant (0 took the last switch arm). The poll traps instead. */
     emit(e, "    uint8_t _zer_inited;\n");
+    /* BUG-1628: set while a poll of this task is on the stack. The state only
+     * advances at the next `yield`, so a call in the body that reaches
+     * `_poll` of the SAME task re-ran the current segment on the same frame —
+     * `free(s); again();` with `again` re-polling freed `s` twice (ASan
+     * "attempting double-free"). The poll traps on re-entry instead, hosted
+     * and bare metal alike; `_init` of a running task traps for the same
+     * reason (it would zero the frame under the running segment). */
+    emit(e, "    uint8_t _zer_running;\n");
     if (async_ret) {
         emit(e, "    ");
         emit_type_and_name(e, async_ret, "_zer_result", 11);
@@ -16515,6 +16523,8 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
                            func->locals[li].name, func->locals[li].name_len);
     }
     emit(e, ") {\n");
+    emit(e, "    if (_zer_self->_zer_inited && _zer_self->_zer_running) _zer_trap(\"async task '%.*s' re-initialised while it is running\", __FILE__, __LINE__);\n",
+         (int)func->name_len, func->name);   /* BUG-1628 */
     emit(e, "    memset(_zer_self, 0, sizeof(*_zer_self));\n");
     emit(e, "    _zer_self->_zer_inited = 1;\n");   /* BUG-1407 */
     for (int li = 0; li < func->local_count; li++) {
@@ -16534,8 +16544,11 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     }
     emit(e, "}\n\n");
 
-    /* Poll function = Duff's device */
-    emit(e, "static inline int %.*s_poll(%.*s *_zer_self) {\n",
+    /* Poll function = Duff's device. BUG-1628: the state machine is the
+     * `_zer_pollrun_` body; `_poll` wraps it with the re-entry guard, so every
+     * exit of the body (each yield, each return, an auto-guard early-out)
+     * clears the flag without having to be found. */
+    emit(e, "static inline int _zer_pollrun_%.*s(%.*s *_zer_self) {\n",
          flen, mname, flen, mname);
 
     /* Emit static locals BEFORE the switch (C static, not in state struct).
@@ -16613,6 +16626,19 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     e->ir_last_line = sv_ir_last;
     e->current_func_ret = saved_ret;
     emit(e, "    } _zer_self->_zer_state = -1; return 1;\n");
+    emit(e, "}\n\n");
+    /* BUG-1628: the public poll — one re-entry test around the body. The
+     * trap names the async function's declaration (as the BUG-1407 one does). */
+    emit(e, "static inline int %.*s_poll(%.*s *_zer_self) {\n", flen, mname, flen, mname);
+    if (e->source_file && func->ast_node)
+        emit(e, "#line %d \"%s\"\n", func->ast_node->loc.line, e->source_file);
+    emit(e, "    if (_zer_self->_zer_running) _zer_trap(\"async task '%.*s' polled while it is "
+            "already running (a call in its body reached its own poll)\", __FILE__, __LINE__);\n",
+         (int)func->name_len, func->name);
+    emit(e, "    _zer_self->_zer_running = 1;\n");
+    emit(e, "    int _zer_r = _zer_pollrun_%.*s(_zer_self);\n", flen, mname);
+    emit(e, "    _zer_self->_zer_running = 0;\n");
+    emit(e, "    return _zer_r;\n");
     emit(e, "}\n\n");
 
     /* Restore async context */

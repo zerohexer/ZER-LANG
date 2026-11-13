@@ -981,6 +981,8 @@ typedef enum {
     WP_WINDOW_HELPER,   /* same, but the access is inside a callee               */
     WP_AFTER_JOIN,      /* after the join — the exemption's actual rationale     */
     WP_BETWEEN_JOINS,   /* two threads, one joined: the other is still running   */
+    WP_DEFER_BEFORE,    /* BUG-1629: in a `defer` registered BEFORE the spawn —
+                         * it RUNS at scope exit, after the spawn */
     WP_COUNT
 } WinPos;
 typedef enum { WK_SCOPED, WK_FIRE, WK_COUNT } WinKind;
@@ -993,6 +995,7 @@ static const char *wp_name(WinPos p) {
     case WP_WINDOW_HELPER: return "in-window-helper";
     case WP_AFTER_JOIN:    return "after-join";
     case WP_BETWEEN_JOINS: return "between-joins";
+    case WP_DEFER_BEFORE:  return "defer-before-spawn";
     case WP_COUNT:         break;
     }
     return "?";
@@ -1023,9 +1026,11 @@ static int win_cell_valid(WinPos p, WinKind k) {
 
 /* NEGATIVE exactly when the access is PLAIN and genuinely concurrent. */
 static int win_is_negative(WinPos p, WinKind k, WinAccess a) {
-    (void)k;
     if (a == WA_ATOMIC) return 0;          /* atomic access is the remedy, never a race */
     switch (p) {
+    /* The defer body runs at function exit: a fire-and-forget thread is still
+     * running then; a scoped one has been joined (the join precedes the exit). */
+    case WP_DEFER_BEFORE:  return k == WK_FIRE;
     case WP_BEFORE:        return 0;       /* one thread exists */
     case WP_AFTER_JOIN:    return 0;       /* the thread is done */
     case WP_WINDOW:        return 1;
@@ -1071,6 +1076,10 @@ static void gen_window(WinPos p, WinKind k, WinAccess a, char *out, size_t n) {
                  "ThreadHandle a = spawn worker();\n"
                  "    ThreadHandle b = spawn worker();\n"
                  "    a.join();\n    %s\n    b.join();", acc);
+        break;
+    case WP_DEFER_BEFORE:
+        snprintf(body, sizeof(body), "defer { %s }\n    %s\n    %s", acc, start,
+                 (k == WK_SCOPED) ? "t.join();" : "");
         break;
     case WP_COUNT: break;
     }

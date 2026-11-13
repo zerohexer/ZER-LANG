@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: carries a function pointer whose target the compiler cannot resolve
+// BUG-1631: a SLICE of function pointers handed to a thread.
+u32 g;
+void bump() { for (u32 i = 0; i < 100000; i += 1) { g += 1; } }
+void w([*]*() tbl) { tbl[0](); }
+u32 main() {
+    *()[1] t;
+    t[0] = bump;
+    ThreadHandle th = spawn w(t[0..]);
+    bump();
+    th.join();
+    return 0;
+}

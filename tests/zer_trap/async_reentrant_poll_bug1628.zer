@@ -1,4 +1,9 @@
-// GAP (2026-11-13 audit, docs/limitations.md): a call in an async body re-polls the same global task: the segment re-runs on one frame (ASan double free)
+// expect-trap
+// expect-trap-at: 11
+// expect-trap-msg: polled while it is already running
+// BUG-1628: a call in an async body that reaches a poll of the SAME task re-ran
+// the current segment on the same frame (the state advances only at the next
+// yield) — here a double free. The poll traps on re-entry instead.
 async void t();
 _zer_async_t ga;
 u32 depth;

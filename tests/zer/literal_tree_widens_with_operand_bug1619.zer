@@ -28,5 +28,8 @@ u32 main() {
     // a u32 operand is unaffected
     u32 w = (u32)hide(0xDEADBEEF);
     if ((w & ~0xFF) != 0xDEADBE00) { return 9; }
+    // in a shift, the VALUE being shifted is widened by a wider count
+    u64 n = hide(4);
+    if ((~0 << n) != 0xFFFFFFFFFFFFFFF0) { return 10; }
     return 0;
 }

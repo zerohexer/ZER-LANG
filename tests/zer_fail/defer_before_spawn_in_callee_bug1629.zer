@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: plain access to 'g' in a concurrent context
+// BUG-1629: the spawn is in a callee invoked after the defer is registered.
+u32 g;
+void w() { for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&g, 1); } }
+void go() { spawn w(); }
+u32 main() {
+    defer { for (u32 j = 0; j < 100000; j += 1) { g += 1; } }
+    go();
+    return 0;
+}

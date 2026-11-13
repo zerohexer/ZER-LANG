@@ -12606,12 +12606,26 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
          * width the literal can take (it is retyped by its destination, so
          * `u64 x = 1 << 40` is 2^40 and must keep folding to that; ast.h's
          * untyped evaluator applies the same 128 bound). */
+        /* BUG-1630: a count of exactly 63 on a 64-bit TYPED operand is in
+         * range (`v >> 63` is the top bit, `v << 63` moves bit 0 there) — it
+         * was refused with every count >= 63, so `comptime u64 top(u64 v) {
+         * return v >> 63; }` "could not be evaluated" while 62 and 64 folded.
+         * The one result that still cannot be returned is the sentinel's own
+         * bit pattern (2^63, from an odd value shifted left). */
         case TOK_LSHIFT:
             if (r < 0 || r >= 128 || (_ctb > 0 && r >= _ctb)) return 0;
-            return r >= 63 ? CONST_EVAL_FAIL : CTW((int64_t)((uint64_t)l << r));
+            if (r >= 63) {
+                if (_ctb == 0 || r >= 64) return CONST_EVAL_FAIL;
+                int64_t sv = (int64_t)((uint64_t)l << r);
+                return sv == CONST_EVAL_FAIL ? CONST_EVAL_FAIL : CTW(sv);
+            }
+            return CTW((int64_t)((uint64_t)l << r));
         case TOK_RSHIFT:
             if (r < 0 || r >= 128 || (_ctb > 0 && r >= _ctb)) return 0;
-            if (r >= 63) return CONST_EVAL_FAIL;
+            if (r >= 63) {
+                if (_ctb == 0 || r >= 64) return CONST_EVAL_FAIL;
+                return _u64 ? (int64_t)(_ul >> r) : (l < 0 ? -1 : 0);
+            }
             return _u64 ? (int64_t)(_ul >> r) : l >> r;
         case TOK_AMP:    return l & r;
         case TOK_PIPE:   return l | r;
@@ -14452,14 +14466,14 @@ static Type *check_expr_impl(Checker *c, Node *node) {
          * u64 cleared the upper 32 bits while `x &= ~0xFFF` and `u64 m =
          * ~0xFFF; x & m` kept them, and `x == ~0` was false for an all-ones
          * u64. The licence is exactly the var-decl sink's: the tree would be
-         * accepted flowing into the operand's type (so `0 - 1` against an
-         * unsigned operand, refused there as a negative constant, keeps its
-         * documented u32 wrap here). Shifts are excluded: a shift's result type
-         * is its LEFT operand's, not a common type. */
-        if (node->binary.op != TOK_LSHIFT && node->binary.op != TOK_RSHIFT) {
-            widen_literal_tree_operand(c, node->binary.left, &left, right);
+         * accepted flowing into the operand's type (so a tree that folds
+         * NEGATIVE against an unsigned operand, refused there, keeps its u32
+         * typing here). In a shift only the VALUE being shifted is widened
+         * (`~0 << n` with a u64 `n` is all-ones shifted, as `x & ~0` is); the
+         * count is a count whatever its width. */
+        widen_literal_tree_operand(c, node->binary.left, &left, right);
+        if (node->binary.op != TOK_LSHIFT && node->binary.op != TOK_RSHIFT)
             widen_literal_tree_operand(c, node->binary.right, &right, left);
-        }
 
         switch (node->binary.op) {
         /* arithmetic: both numeric, result = common type */
@@ -24567,13 +24581,50 @@ static bool indirect_callee_functions(Checker *c, Node *callee, BoundFnVisit v, 
     return indirect_callee_functions_in(c, callee, NULL, v, ud);
 }
 
+/* BUG-1631: every funcptr type a THREAD can reach from a value of type `t` —
+ * what it carries (funcptr_first_carried) and, through a POINTER or a SLICE,
+ * what its pointee carries. `spawn w(&o)` with `struct O { *() f; }` hands the
+ * thread `o.f` as surely as `spawn w(o)` does, and so does a slice of funcptrs;
+ * the by-value test alone left `*() f = p.f; f();`, `if (p.f) |c| { c(); }`,
+ * `run(p.f)` and `tbl[0]()` in the thread unscanned (each a TSan data race),
+ * while the direct `p.f()` was refused. A struct already on the walk's stack
+ * is not entered again (`struct N { ?*N next; *() f; }`). */
+#define FPREACH_STACK_MAX 32
+static Type *funcptr_first_reached_r(Type *t, int depth, int *nth, Type **stk, int sn) {
+    if (!t || depth > ZER_TYPE_NEST_MAX) return NULL;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return NULL;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_FUNC_PTR: if ((*nth)-- == 0) return u; return NULL;
+    case TYPE_OPTIONAL: return funcptr_first_reached_r(u->optional.inner, depth + 1, nth, stk, sn);
+    case TYPE_ARRAY:    return funcptr_first_reached_r(u->array.inner, depth + 1, nth, stk, sn);
+    case TYPE_POINTER:  return funcptr_first_reached_r(u->pointer.inner, depth + 1, nth, stk, sn);
+    case TYPE_SLICE:    return funcptr_first_reached_r(u->slice.inner, depth + 1, nth, stk, sn);
+    case TYPE_STRUCT:
+        for (int i = 0; i < sn; i++) if (stk[i] == u) return NULL;
+        if (sn >= FPREACH_STACK_MAX) return NULL;
+        stk[sn] = u;
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            Type *r = funcptr_first_reached_r(u->struct_type.fields[i].type, depth + 1,
+                                              nth, stk, sn + 1);
+            if (r) return r;
+        }
+        return NULL;
+    default: return NULL;
+    }
+}
+static Type *funcptr_first_reached(Type *t, int *nth) {
+    Type *stk[FPREACH_STACK_MAX];
+    return funcptr_first_reached_r(t, 0, nth, stk, 0);
+}
+
 /* Report an unresolved funcptr carried by spawn argument `an` (or by an
  * argument a callee forwards to a spawn). `ctx` names the sink. */
 static void funcptr_arg_sig_check(Checker *c, Node *an, int line, const char *ctx) {
     Type *at = an ? typemap_get(c, an) : NULL;
     for (int k = 0; at && k < 64; k++) {
         int nth = k;
-        Type *fpt = funcptr_first_carried(at, 0, &nth);
+        Type *fpt = funcptr_first_reached(at, &nth);   /* BUG-1631 */
         if (!fpt) break;
         const char *bad = NULL; uint32_t blen = 0;
         Symbol *hit = funcptr_sig_racy_target(c, fpt, &bad, &blen);
@@ -27280,10 +27331,9 @@ static bool vrp_guard_hoist_sound(Checker *c, Node *idx) {
     Symbol *sym = scope_lookup(c->current_scope, name, len);
     bool reachable = !sym || sym->is_static || sym->vrp_addr_taken ||
                      sym == global_decl_lookup(c, name, len);
-    /* BUG-1503: in an async body a CALL may re-enter this task's _poll and
-     * write any frame local (see vrp_widen_call_effects) — `u32 v = f() +
-     * arr[i];` tested i before f() re-polled and set it. */
-    if (c->in_async) reachable = true;
+    /* (BUG-1503 made every async frame local "reachable" by a call here; a
+     * re-entrant poll now traps — BUG-1628 — so a frame local is as private
+     * as any other local.) */
     /* The statement's OWN top-level assignment stores LAST — after every read
      * of its target's subscripts and of its value (`k += a[k] + 1` reads a[k]
      * under the pre-store k, which is exactly what the hoisted guard tests).
@@ -30798,7 +30848,23 @@ static void check_stmt_impl(Checker *c, Node *node) {
                 c->var_ranges[vi].max_val = INT64_MAX;
                 c->var_ranges[vi].known_nonzero = false;
             }
+            /* BUG-1629: the body RUNS at scope exit — after everything the
+             * function does later, so after any fire-and-forget spawn anywhere
+             * in it (or in a callee). The concurrent window was the textual
+             * one: `defer { g += 1; } spawn w();` checked the plain access as
+             * "before the spawn" and it raced the thread's @atomic_add (TSan).
+             * Same test a label uses for a backward goto (BUG-1589); the
+             * window is put back for the statements that follow the defer. */
+            bool df_after = c->after_spawn_in_func, df_unb = c->unbounded_spawn_in_func;
+            if (!c->after_spawn_in_func && c->current_func_node &&
+                c->current_func_node->kind == NODE_FUNC_DECL &&
+                subtree_can_detach(c, c->current_func_node->func_decl.body)) {
+                c->after_spawn_in_func = true;
+                c->unbounded_spawn_in_func = true;
+            }
             check_stmt(c, node->defer.body);
+            c->after_spawn_in_func = df_after;
+            c->unbounded_spawn_in_func = df_unb;
             c->var_range_count = vrp_saved;
             vrp_snap_restore(c, vrp_pre, vrp_saved);
             free(vrp_pre);
@@ -35639,16 +35705,18 @@ static void vrp_widen_global_like(Checker *c) {
  * at all). Every non-global range entry while checking an async body is a
  * frame local (a static local is already global-like). Even a `const` local is
  * re-initialised by a re-entrant run of its declaration. */
+/* BUG-1628 — RELAXED. The premise above no longer holds: `_poll` (and `_init`)
+ * of a task that is already running TRAPS (the `_zer_running` guard the emitter
+ * puts around the state machine), so no callee can run this task's body while
+ * this activation is on the stack, and nothing else can name a frame field
+ * (the task type exposes none, a task cannot be copied or punned, and a pointer
+ * into the frame needs `&local`, which carries no range at all). A call in an
+ * async body therefore changes what a call changes anywhere: the global-like
+ * ranges. Widening every frame local at every call (the cost recorded in
+ * limitations.md) is gone; `tests/zer_trap/async_reentrant_poll_frame_bug1503`
+ * is the old reproducer, now a trap. */
 static void vrp_widen_call_effects(Checker *c) {
     vrp_widen_global_like(c);
-    if (!c->in_async) return;
-    for (int ri = 0; ri < c->var_range_count; ri++) {
-        struct VarRange *r = &c->var_ranges[ri];
-        if (r->owner == c->global_scope) continue;
-        r->min_val = INT64_MIN;
-        r->max_val = INT64_MAX;
-        r->known_nonzero = false;
-    }
 }
 
 /* BUG-1093: does storing to this assignment target write THROUGH a pointer?

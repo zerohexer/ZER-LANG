@@ -5862,8 +5862,10 @@ static void ir_check_freed_arg_aliasing(ZerCheck *zc, IRFunc *func, IRPathState 
                 gh->state != IR_HS_ALIVE) continue;
             if (!ir_global_keys_may_alias(summary->freed_global[k].key,
                     summary->freed_global[k].len, gh->path, gh->path_len)) continue;
+            uint32_t kshow = summary->freed_global[k].len;
+            if (kshow > 0 && summary->freed_global[k].key[kshow - 1] == '\x01') kshow--;  /* prefix mark */
             int wl = snprintf(what, sizeof(what), "global '%.*s'",
-                              (int)(summary->freed_global[k].len > 30 ? 30 : summary->freed_global[k].len),
+                              (int)(kshow > 30 ? 30 : kshow),
                               summary->freed_global[k].key);
             if (wl >= (int)sizeof(what)) wl = (int)sizeof(what) - 1;
             ir_report_freed_alias(zc, func, ps, call, line, gh->alloc_id, -1, what, (uint32_t)wl, fn, fnl);
@@ -6485,6 +6487,13 @@ static void ir_call_hands_local_array(ZerCheck *zc, IRFunc *func, IRPathState *p
     for (int i = 0; i < call->call.arg_count; i++) {
         Node *a = ir_peel_launder(call->call.args[i]);
         if (a && a->kind == NODE_UNARY && a->unary.op == TOK_AMP) a = a->unary.operand;
+        /* BUG-1633: a slice LOCAL bound once to a view of an array IS that array
+         * for the callee (`[*]H sl = hs; drop(sl);`) — it read as "not an array"
+         * and the drain reached nothing. */
+        if (a && a->kind == NODE_IDENT) {
+            Node *sd = ir_stable_slice_local_def(zc, func, a);
+            if (sd) a = sd;
+        }
         if (a && a->kind == NODE_SLICE) a = a->slice.object;
         if (!a) continue;
         Type *t = checker_get_type(zc->checker, a);
@@ -7970,6 +7979,10 @@ static void ir_record_free_through_global(ZerCheck *zc, IRFunc *func,
 static bool ir_global_keys_may_alias(const char *a, uint32_t al,
                                      const char *b, uint32_t bl) {
     if (!a || !b) return false;
+    /* BUG-1634: a key ending in "\x01" is a PREFIX — "some slot under this
+     * place" (a callee freed a field of `&g.h`, which one is not recorded). */
+    bool a_prefix = al > 0 && a[al - 1] == '\x01';
+    if (a_prefix) al--;
     uint32_t i = 0, j = 0;
     while (i < al && j < bl) {
         if (a[i] == '[' && b[j] == '[') {
@@ -7991,6 +8004,7 @@ static bool ir_global_keys_may_alias(const char *a, uint32_t al,
         if (a[i] != b[j]) return false;
         i++; j++;
     }
+    if (a_prefix) return i == al && (j == bl || b[j] == '.' || b[j] == '[');
     return i == al && j == bl;
 }
 
@@ -9025,9 +9039,14 @@ static uint64_t ir_local_param_sources(IRFunc *func, int local, int depth) {
             if (in->dest_local != local) continue;
             if (in->op == IR_COPY && in->src1_local >= 0 && in->src1_local != local)
                 m |= ir_local_param_sources(func, in->src1_local, depth + 1);
-            else if (in->expr && in->expr->kind == NODE_IDENT) {
-                int sl = ir_find_local_exact_first(func, in->expr->ident.name,
-                                                   (uint32_t)in->expr->ident.name_len);
+            else if (in->expr) {
+                /* BUG-1632: a SUB-SLICE of a param (`[*]H t = s[0..n];`) is the same
+                 * elements under another name — only a bare copy was followed. */
+                Node *se = ir_peel_launder(in->expr);
+                while (se && se->kind == NODE_SLICE) se = ir_peel_launder(se->slice.object);
+                if (!se || se->kind != NODE_IDENT) continue;
+                int sl = ir_find_local_exact_first(func, se->ident.name,
+                                                   (uint32_t)se->ident.name_len);
                 if (sl >= 0 && sl != local) m |= ir_local_param_sources(func, sl, depth + 1);
             }
         }
@@ -9043,9 +9062,15 @@ static uint64_t ir_elem_sources_expr(IRFunc *func, Node *e, int depth) {
     e = ir_peel_launder(e);
     if (e && e->kind == NODE_ORELSE) e = ir_peel_launder(e->orelse.expr);
     bool indexed = false;
-    while (e && (e->kind == NODE_FIELD || e->kind == NODE_INDEX ||
-                 (e->kind == NODE_UNARY && e->unary.op == TOK_STAR))) {
+    /* BUG-1632: `&a[i]` and `a[lo..hi]` are VIEWS of the elements — a local bound
+     * to one (`*H h = &s[i]; free(h.p)`) reads the element through it. The walk
+     * stopped at the `&` and answered "no param", so a teardown loop written with
+     * a view left the caller's entries ALIVE. */
+    while (e && (e->kind == NODE_FIELD || e->kind == NODE_INDEX || e->kind == NODE_SLICE ||
+                 (e->kind == NODE_UNARY &&
+                  (e->unary.op == TOK_STAR || e->unary.op == TOK_AMP)))) {
         if (e->kind == NODE_INDEX) { indexed = true; e = e->index_expr.object; }
+        else if (e->kind == NODE_SLICE) e = e->slice.object;
         else if (e->kind == NODE_FIELD) e = e->field.object;
         else e = e->unary.operand;
         e = ir_peel_launder(e);
@@ -9171,9 +9196,43 @@ enum { IR_PS_NONE = 0, IR_PS_PARAM = 1, IR_PS_GLOBAL = 2, IR_PS_LOCAL = 3 };
  * of the per-state view fact (IRHandleInfo.view_root_*), for the summaries that
  * read the AST rather than a path state. The local must hold one value: not a
  * param, bound once, never reassigned or address-taken, defined by `&place`;
- * the place must be fixed below its root (fields / literal elements), and the
- * root a parameter, an unshadowed global, or a local that itself holds one
- * value (an aggregate bound once, or a stable pointer). NULL otherwise. */
+ * the place must be nameable by a summary (fields / array elements / an
+ * element of a slice parameter — ir_place_summary_nameable), and the root a
+ * parameter, an unshadowed global, or a local that itself holds one value (an
+ * aggregate bound once, or a stable pointer). NULL otherwise. */
+/* BUG-1633: the steps a STORE SUMMARY can name below a root — a struct / union
+ * field, an element of a fixed array at ANY index (ir_ps_target_rec spells a
+ * non-literal one `[*]`, the any-index slot), and an element of a SLICE when the
+ * slice is the root name itself (`&s[i]` with `s` a parameter: the caller's
+ * elements). ir_place_fixed_below_root is the stricter per-state rule (a view
+ * KEYED on a variable index names a different slot per evaluation); a summary
+ * only says "some element", so the index needs no fixing. */
+static bool ir_place_summary_nameable(ZerCheck *zc, Node *e) {
+    for (int depth = 0; e && depth <= 4096; depth++) {
+        if (e->kind == NODE_IDENT) return true;
+        Node *obj;
+        if (e->kind == NODE_FIELD) {
+            obj = e->field.object;
+            if (!obj) return false;
+            if (obj->kind != NODE_IDENT) {
+                Type *ot = checker_get_type(zc->checker, obj);
+                TypeKind ok = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+                if (ok != TYPE_STRUCT && ok != TYPE_UNION) return false;
+            }
+        } else if (e->kind == NODE_INDEX) {
+            obj = e->index_expr.object;
+            if (!obj || !e->index_expr.index) return false;
+            Type *ot = checker_get_type(zc->checker, obj);
+            TypeKind ok = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+            if (ok != TYPE_ARRAY && !(ok == TYPE_SLICE && obj->kind == NODE_IDENT))
+                return false;
+        } else {
+            return false;
+        }
+        e = obj;
+    }
+    return false;
+}
 static Node *ir_local_view_place(ZerCheck *zc, IRFunc *func, int l) {
     if (l < 0 || l >= func->local_count) return NULL;
     IRLocal *L = &func->locals[l];
@@ -9198,11 +9257,17 @@ static Node *ir_local_view_place(ZerCheck *zc, IRFunc *func, int l) {
     if (!init || init->kind != NODE_UNARY || init->unary.op != TOK_AMP ||
         !init->unary.operand) return NULL;
     Node *place = init->unary.operand;
-    if (!ir_place_fixed_below_root(zc, place)) return NULL;
+    if (!ir_place_summary_nameable(zc, place)) return NULL;
     Node *root = ir_key_root_ident(place);
     if (!root || root->kind != NODE_IDENT) return NULL;
     int rl = ir_find_local_exact_first(func, root->ident.name, (uint32_t)root->ident.name_len);
     if (rl < 0) return ir_ident_is_unshadowed_global(zc, func, root) ? place : NULL;
+    /* a SLICE root names the caller's elements only while it still holds the
+     * value it was handed: a parameter, never reassigned or address-taken */
+    if (type_dispatch_kind(func->locals[rl].type) == TYPE_SLICE &&
+        (!func->locals[rl].is_param ||
+         ast_name_mutated_or_addrd(body, root->ident.name, (uint32_t)root->ident.name_len)))
+        return NULL;
     /* one binding of the root's name: the parameter itself (none in the body),
      * or the local's single declaration */
     if (ast_name_bind_count(body, root->ident.name, (uint32_t)root->ident.name_len) !=
@@ -9662,15 +9727,47 @@ static void ir_apply_param_stores(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         const struct ZcParamStore *e = &s->param_store[k];
         if (e->src >= call->call.arg_count) continue;
         int root; const char *base = ""; uint32_t blen = 0;
+        bool dst_shifted = false;
         if (e->dst < 0) {
             root = IR_GLOBAL_ROOT_ID;          /* e->path is the global's full key */
         } else {
             if (e->dst >= call->call.arg_count) continue;
-            if (!ir_async_task_key(zc, func, ps, call->call.args[e->dst], &root, &base, &blen))
+            /* BUG-1633: the destination handed over as a SLICE of an array —
+             * `link(hs, a)` (the coercion is `hs[..]` in the AST since BUG-1516),
+             * `link(hs[0..2], a)`. A slice has no key, so the store the callee made
+             * into `s[1].p` was applied nowhere: the caller freed `a` while its
+             * array still held it (exit 99 through the recycled slot). The elements
+             * of the view ARE the array's; a view that does not start at element 0
+             * shifts the callee's literal index, so it lands on the array's
+             * any-index slot instead. */
+            Node *da = ir_peel_launder(call->call.args[e->dst]);
+            /* a slice LOCAL that names one array view for its whole life
+             * (`[*]H sl = hs; link(sl, a)`) is that view */
+            if (da && da->kind == NODE_IDENT) {
+                Node *sd = ir_stable_slice_local_def(zc, func, da);
+                if (sd) da = sd;
+            }
+            if (da && da->kind == NODE_SLICE && da->slice.object &&
+                type_dispatch_kind(checker_get_type(zc->checker, da->slice.object)) == TYPE_ARRAY) {
+                Node *lo = da->slice.start;
+                dst_shifted = lo && !(lo->kind == NODE_INT_LIT && lo->int_lit.value == 0);
+                da = da->slice.object;
+            }
+            if (!ir_async_task_key(zc, func, ps, da, &root, &base, &blen))
                 continue;
         }
-        uint32_t tot = blen + e->plen;
-        char *p = ir_cat3(zc, base, blen, e->path, e->plen, "", 0);
+        const char *spath = e->path;
+        uint32_t splen = e->plen;
+        if (dst_shifted && splen > 2 && spath[0] == '[' && spath[1] != '*') {
+            uint32_t close = 1;
+            while (close < splen && spath[close] != ']') close++;
+            if (close >= splen) continue;
+            spath = ir_cat3(zc, "[*]", 3, spath + close + 1, splen - close - 1, "", 0);
+            if (!spath) continue;
+            splen = 3 + (splen - close - 1);
+        }
+        uint32_t tot = blen + splen;
+        char *p = ir_cat3(zc, base, blen, spath, splen, "", 0);
         if (!p || tot == 0) continue;
         if (root >= 0) {                                   /* BUG-1373 */
             const char *rp = p;
@@ -14762,7 +14859,19 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                  * start with '.' or '['); the coarse call-site widening marks
                  * every rooted field regardless of path, so the exact sentinel
                  * value is immaterial. */
-                if (rpl == 0 && rl >= 0 && rl < func->local_count &&
+                /* BUG-1634: the same fact when the argument is a PLACE UNDER the
+                 * param (`drop(*Ctx c) { drop2(&c.h); }`) — only the bare-param
+                 * forward recorded it, so the second hop lost the free and the
+                 * outer caller's alias stayed ALIVE (exit 99). And when it is a
+                 * place under a GLOBAL (`drop() { drop2(&g.h); }`): the callee
+                 * freed something under that slot, which this function's summary
+                 * hands on as a freed-global PREFIX (a trailing "\x01" — see
+                 * ir_global_keys_may_alias). */
+                if (rl == IR_GLOBAL_ROOT_ID && rpl > 0) {
+                    char *gk = ir_cat3(zc, rp, rpl, "\x01", 1, "", 0);
+                    if (gk) ir_note_freed_global(zc, gk, rpl + 1);
+                }
+                if (rl >= 0 && rl < func->local_count &&
                     func->locals[rl].is_param) {
                     static const char field_sentinel[] = "\x01";
                     IRHandleInfo *sh = ir_add_compound_handle(ps, rl,

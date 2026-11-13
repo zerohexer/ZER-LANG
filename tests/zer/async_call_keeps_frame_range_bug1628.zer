@@ -1,0 +1,22 @@
+// BUG-1628 (relaxation of BUG-1503): a call in an async body no longer widens
+// every frame-local range — a re-entrant poll of the task traps, so nothing a
+// callee does can change this frame. `i` stays proven across `tick()`.
+u32 ticks;
+void tick() { ticks += 1; }
+async u32 fill() {
+    u32[4] arr;
+    u32 i = 2;
+    tick();
+    arr[i] = 7;          // proven: i is still [2,2] after the call
+    yield;
+    tick();
+    return arr[i] + i;
+}
+u32 main() {
+    _zer_async_fill t;
+    _zer_async_fill_init(&t);
+    while (_zer_async_fill_poll(&t) == 0) { }
+    if (_zer_async_fill_result(&t) != 9) { return 1; }
+    if (ticks != 2) { return 2; }
+    return 0;
+}

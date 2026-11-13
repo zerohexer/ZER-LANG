@@ -955,6 +955,26 @@ cell p45_safe_readonly_callee compile "$P45"' u32 main(){ ?*T45[2] a; *T45 x = a
 cell p45_safe_consume_loop compile "$P45"' u32 main(){ ?*T45[4] t; for (u32 i = 0; i < 4; i += 1) { t[i] = alloc(T45); } u32 n = 0; for (u32 i = 0; i < 4; i += 1) { *T45 q = t[i] orelse { return 1; }; n += q.v; free(q); } return n; }'
 cell p45_safe_reset_after_free compile "$P45"' u32 main(){ ?*T45[4] t; for (u32 i = 0; i < 4; i += 1) { t[i] = alloc(T45); } for (u32 i = 0; i < 4; i += 1) { *T45 q = t[i] orelse { return 1; }; free(q); t[i] = null; } u32 n = 0; for (u32 j = 0; j < 4; j += 1) { if (t[j]) |r| { n += r.v; } } return n; }'
 
+# BUG-1632: the drain written with a VIEW of the element (`*H h = &s[i]`) or over
+# a SUB-SLICE of the param (`[*]H t = s[0..n]`) — the element-source walk stopped
+# at the `&` / followed only a bare copy, so the caller's entries stayed ALIVE.
+# BOUNDARY: the same view used read-only; teardown, refill, teardown again.
+P45V='struct T45 { u32 v; }
+struct H45 { ?*T45 p; u32 n; }
+void vdrain45([*]H45 s) { for (u32 i = 0; i < s.len; i += 1) { *H45 h = &s[i]; if (h.p) |q| { free(q); } h.p = null; } }
+void sdrain45([*]H45 s) { [*]H45 t = s[0..s.len]; for (u32 i = 0; i < t.len; i += 1) { if (t[i].p) |q| { free(q); } t[i].p = null; } }
+void kdrain45([*]H45 s, u32 k) { if (k >= s.len) { return; } *H45 h = &s[k]; ?*T45 m = h.p; h.p = null; if (m) |q| { free(q); } }
+u32 vsum45([*]H45 s) { u32 c = 0; for (u32 i = 0; i < s.len; i += 1) { *H45 h = &s[i]; c += h.n; } return c; }
+'
+cell p45_view_drain_callee  reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; vdrain45(hs); return a.v; }'
+cell p45_subslice_drain     reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[1].p = a; sdrain45(hs); return a.v; }'
+cell p45_view_drain_one     reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; kdrain45(hs, 0); return a.v; }'
+cell p45_view_drain_dblfree reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; vdrain45(hs); free(a); return 0; }'
+cell p45_slice_local_drain  reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; [*]H45 sl = hs; vdrain45(sl); return a.v; }'
+cell p45_slice_local_dblfree reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; [*]H45 sl = hs[0..1]; sdrain45(sl); free(a); return 0; }'
+cell p45_safe_view_readonly compile "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; hs[0].n = 3; a.v = vsum45(hs); u32 r = a.v - 3; vdrain45(hs); return r; }'
+cell p45_safe_view_refill   compile "$P45V"' u32 main(){ H45[2] hs; hs[0].p = alloc(T45); hs[1].p = alloc(T45); vdrain45(hs); hs[0].p = alloc(T45); u32 r = 0; if (hs[0].p) |z| { z.v = 7; r = z.v - 7; } sdrain45(hs); return r; }'
+
 # SHAPE p46 (BUG-1303): a scoped-spawn BORROW that reaches the caller's object
 # through two PARAMS — the callee lends one and uses the other in the window, and
 # the caller passes one object as both. BOUNDARY: distinct objects; the second
@@ -1078,6 +1098,26 @@ cell p50_global_elem        reject "$P50"' u32 main(){ *T50 a = alloc(T50) orels
 cell p50_global_literal     reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; reg_l(a); free(a); return rd50(); }'
 cell p50_global_var_index   reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; reg_v(a, 1); free(a); return rd50(); }'
 cell p50_safe_reset         compile "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; S50 s; put_lit(&s, a); free(a); s.data[1].p = null; *T50 b = alloc(T50) orelse return; reg_g(b); g50 = null; free(b); return 0; }'
+
+# BUG-1633: the DESTINATION is a slice of the caller's array (`link(hs, a)` is
+# `hs[..]`, a slice has no key), written directly or through an element view;
+# a sub-slice that does not start at 0 lands on the any-index slot.
+P50S='struct T50 { u32 v; } struct PT50 { ?*T50 p; }
+void sput_lit([*]PT50 s, *T50 p) { s[1].p = p; }
+void sput_var([*]PT50 s, *T50 p, u32 k) { if (k >= s.len) { return; } s[k].p = p; }
+void sput_view([*]PT50 s, *T50 p) { *PT50 h = &s[1]; h.p = p; }
+void sput_vview([*]PT50 s, *T50 p, u32 k) { if (k >= s.len) { return; } *PT50 h = &s[k]; h.p = p; }
+void sput_elem([*]?*T50 s, *T50 p) { s[0] = p; }
+'
+cell p50_slice_dst_literal  reject "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50[2] hs; sput_lit(hs, a); free(a); if (hs[1].p) |q| { return q.v; } return 0; }'
+cell p50_slice_dst_var      reject "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50[2] hs; sput_var(hs, a, 1); free(a); if (hs[1].p) |q| { return q.v; } return 0; }'
+cell p50_slice_dst_view     reject "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50[2] hs; sput_view(hs, a); free(a); if (hs[1].p) |q| { return q.v; } return 0; }'
+cell p50_slice_dst_varview  reject "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50[2] hs; sput_vview(hs, a, 0); free(a); if (hs[0].p) |q| { return q.v; } return 0; }'
+cell p50_slice_dst_subslice reject "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50[3] hs; sput_lit(hs[1..3], a); free(a); if (hs[2].p) |q| { return q.v; } return 0; }'
+cell p50_slice_dst_optelem  reject "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; ?*T50[2] hs; sput_elem(hs, a); free(a); if (hs[0]) |q| { return q.v; } return 0; }'
+cell p50_slice_dst_local    reject "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50[2] hs; [*]PT50 sl = hs; sput_lit(sl, a); free(a); if (hs[1].p) |q| { return q.v; } return 0; }'
+cell p50_safe_slice_local   compile "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50[2] hs; [*]PT50 sl = hs; sput_lit(sl, a); a.v = 2; u32 r = 0; if (sl[1].p) |q| { r = q.v - 2; } hs[1].p = null; free(a); return r; }'
+cell p50_safe_slice_dst     compile "$P50S"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50[2] hs; sput_view(hs, a); a.v = 3; u32 r = 0; if (hs[1].p) |q| { r = q.v - 3; } hs[1].p = null; free(a); *T50 b = alloc(T50) orelse return; sput_vview(hs, b, 0); if (hs[0].p) |q| { free(q); } hs[0].p = null; return r; }'
 
 # SHAPE p51 (BUG-1363): keep inference — a non-keep param reaching a GLOBAL in a
 # spelling the alias sites could not follow: a CALL result (var-decl, assignment,
@@ -1767,7 +1807,7 @@ struct C77 { H77 h; N77 n; }
 C77 gc77;
 H77 gh77;
 '
-cell p77_deref_pp_free      reject "$P77"' u32 main(){ *T77 a = alloc(T77) orelse return; **T77 pp = &a; free(*pp); u32 r = a.v; g_p = null; return r; }'
+cell p77_deref_pp_free      reject "$P77"' u32 main(){ *T77 a = alloc(T77) orelse return; **T77 pp = &a; free(*pp); u32 r = a.v; return r; }'
 cell p77_deref_pp_dblfree   reject "$P77"' u32 main(){ *T77 a = alloc(T77) orelse return; **T77 pp = &a; free(*pp); free(a); return 0; }'
 cell p77_param_view_free    reject "$P77"' u32 f(*C77 c) { *N77 h = &c.n; free(h.p); return c.n.p.v; } u32 main(){ return 0; }'
 cell p77_global_nested_free reject "$P77"' u32 main(){ gc77.h.p = alloc(T77); *H77 h = &gc77.h; if (h.p) |q| { free(q); } if (gc77.h.p) |z| { return z.v; } return 0; }'
@@ -1776,6 +1816,28 @@ cell p77_callee_view_capfree reject "$P77"' void drop(*C77 c) { *H77 h = &c.h; i
 cell p77_callee_view_store  reject "$P77"' void link(*C77 c, *T77 p) { *H77 h = &c.h; h.p = p; } u32 main(){ *T77 a = alloc(T77) orelse return; C77 c; link(&c, a); free(a); if (c.h.p) |z| { return z.v; } return 0; }'
 cell p77_callee_gview_store reject "$P77"' void link(*T77 p) { *H77 h = &gh77; h.p = p; } u32 main(){ *T77 a = alloc(T77) orelse return; link(a); free(a); if (gh77.p) |z| { return z.v; } return 0; }'
 cell p77_callee_gview_free  reject "$P77"' void drop() { *H77 h = &gh77; if (h.p) |q| { free(q); } h.p = null; } u32 main(){ *T77 a = alloc(T77) orelse return; gh77.p = a; drop(); return a.v; }'
+# BUG-1634: the free is TWO HOPS away — the callee forwards a place under its
+# param / under a global to the helper that frees a field of it.
+P77H='struct T77 { u32 v; } struct H77 { ?*T77 p; } struct N77 { *T77 p; }
+struct C77 { H77 h; H77 h2; N77 n; }
+C77 gc77;
+void zap77(*H77 h) { if (h.p) |q| { free(q); } h.p = null; }
+void zapn77(*N77 n) { free(n.p); }
+u32 peek77(*H77 h) { if (h.p) |q| { return q.v; } return 0; }
+void hop_param(*C77 c) { zapn77(&c.n); }
+void hop_param_opt(*C77 c) { zap77(&c.h); }
+void hop3(*C77 c) { hop_param_opt(c); }
+void hop_glob() { zap77(&gc77.h); }
+void hop_glob3() { hop_glob(); }
+u32 hop_read(*C77 c) { return peek77(&c.h); }
+'
+cell p77_hop_param_use      reject "$P77H"' u32 main(){ *T77 a = alloc(T77) orelse return; C77 c; c.n.p = a; hop_param(&c); return a.v; }'
+cell p77_hop_param_dblfree  reject "$P77H"' u32 main(){ *T77 a = alloc(T77) orelse return; C77 c; c.h.p = a; hop_param_opt(&c); free(a); return 0; }'
+cell p77_hop3_param_use     reject "$P77H"' u32 main(){ *T77 a = alloc(T77) orelse return; C77 c; c.h.p = a; hop3(&c); return a.v; }'
+cell p77_hop_global_use     reject "$P77H"' u32 main(){ *T77 a = alloc(T77) orelse return; gc77.h.p = a; hop_glob(); return a.v; }'
+cell p77_hop3_global_use    reject "$P77H"' u32 main(){ *T77 a = alloc(T77) orelse return; gc77.h.p = a; hop_glob3(); return a.v; }'
+cell p77_safe_hop_teardown  compile "$P77H"' void clean(*C77 c) { zap77(&c.h); zap77(&c.h2); } u32 main(){ C77 c; c.h.p = alloc(T77); c.h2.p = alloc(T77); clean(&c); c.h.p = alloc(T77); c.h2.p = alloc(T77); clean(&c); gc77.h.p = alloc(T77); hop_glob(); gc77.h.p = alloc(T77); hop_glob(); return 0; }'
+cell p77_safe_hop_readonly  compile "$P77H"' u32 main(){ *T77 a = alloc(T77) orelse return; C77 c; c.h.p = a; a.v = 2; u32 r = hop_read(&c) - a.v; zap77(&c.h); return r; }'
 cell p77_safe_teardown      compile "$P77"' void drop(*C77 c) { *H77 h = &c.h; if (h.p) |q| { free(q); } h.p = null; } void dropg() { *H77 h = &gc77.h; if (h.p) |q| { free(q); } h.p = null; } void link(*C77 c, *T77 p) { *H77 h = &c.h; h.p = p; } u32 main(){ *T77 a = alloc(T77) orelse return; C77 c; link(&c, a); drop(&c); gc77.h.p = alloc(T77); dropg(); return 0; }'
 cell p77_safe_deref_pp      compile "$P77"' u32 main(){ *T77 a = alloc(T77) orelse return; a.v = 4; **T77 pp = &a; u32 r = (*pp).v; free(*pp); return r - 4; }'
 

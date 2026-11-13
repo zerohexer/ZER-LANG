@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1634: the forwarded place is under a GLOBAL (`drop2(&g.h)`). The callee's
+// summary says "frees a field of its parameter" — which field of `g.h` is not
+// recorded — and the forwarding function had no entry under `g.h` to mark, so
+// its own summary named no freed global at all.
+struct T { u32 v; }
+struct H { *T p; }
+struct G { H h; }
+G g;
+void drop2(*H h) { free(h.p); }
+void drop() { drop2(&g.h); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    g.h.p = a;
+    drop();
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    a.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

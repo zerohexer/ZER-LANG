@@ -270,8 +270,8 @@ u32 main() {
 ```
 
 Only when nothing wider is involved does the expression stay `u32` (`u32 w = ~0xFF;`
-is `0xFFFF_FF00`). A shift is typed by its LEFT operand alone, so a literal count
-never widens anything.
+is `0xFFFF_FF00`). In a shift the rule applies to the value being shifted — `~0 << n`
+with a `u64` count `n` shifts sixty-four ones — and never to the count.
 
 A **character literal** `'A'` is a `u8`. It widens to `u32` / `u64`
 implicitly; it does not convert to a signed type (`i8 c = 'A';` is an error).
@@ -6430,6 +6430,23 @@ u32 main() {
 }
 ```
 
+A `defer` body is judged by when it RUNS, not where it is written: it runs at the end
+of its scope, so after any fire-and-forget `spawn` anywhere in the function (or in a
+function it calls). A plain access to the cell inside it is in the concurrent context
+even when the `defer` line comes first:
+
+<!-- audit: expect-error: plain access to 'g_n' in a concurrent context -->
+```zer
+u32 g_n;
+void worker() { u32 v = @atomic_add(&g_n, 1); }
+
+u32 main() {
+    defer { g_n += 1; }                // ERROR — runs after the spawn below
+    spawn worker();
+    return 0;
+}
+```
+
 With two scoped threads live, one `join` does not close the window — the other thread is
 still running.
 
@@ -6834,6 +6851,12 @@ u32 main() {
   Hand the thread the DATA (copy the fields into a `shared struct`), not the handle
 - Scoped spawn: freeing a payload the child still holds **before** `.join()` →
   compile error, including when the payload is carried inside a by-value struct
+- A callback handed to the thread inside an ARGUMENT is covered whichever way the
+  argument holds it — by value in a struct, behind a pointer (`spawn w(&o)` with a
+  funcptr field in `o`), or in a slice of function pointers: when the compiler
+  cannot tell which function it is, every function of that type must be race-free
+  ("this spawn argument carries a function pointer whose target the compiler cannot
+  resolve").
 - A callback the spawn target invokes is scanned too — if it touches a
   non-shared global that is a data race, no matter how the target reaches it:
   a function name passed as an argument (`spawn worker(bump)`), a local bound
@@ -7124,6 +7147,34 @@ u32 main() {
     g_ready = 1;
     if (_zer_async_waiter_poll(&task) != 1) { return 2; }   // condition met -> done
     if (g_seen != 1) { return 3; }
+    return 0;
+}
+```
+
+**A TASK CANNOT BE POLLED WHILE IT IS RUNNING**
+
+A poll runs the body from the last `yield` to the next one. If a function the body
+calls polls the SAME task again (or `_init`s it), the task is already running:
+the program traps ("async task 'NAME' polled while it is already running") instead
+of re-running the current step on the same frame. One task polling ANOTHER task
+from its body is fine, and so is polling or re-initialising a task after its poll
+has returned.
+
+<!-- audit: expect-trap: polled while it is already running -->
+```zer
+async void step();
+_zer_async_step task;
+u32 depth;
+void again() { depth += 1; if (depth == 1) { _zer_async_step_poll(&task); } }   // re-enters
+async void step() {
+    yield;
+    again();          // TRAP — this poll of `task` is still on the stack
+    yield;
+}
+u32 main() {
+    _zer_async_step_init(&task);
+    _zer_async_step_poll(&task);
+    _zer_async_step_poll(&task);
     return 0;
 }
 ```

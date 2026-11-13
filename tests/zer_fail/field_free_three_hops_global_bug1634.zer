@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: which may already be freed
+// BUG-1634: the freed-global prefix is transitive — a third function calling
+// the forwarder inherits it, and a free of the caller's alias is a double free.
+struct T { u32 v; }
+struct H { ?*T p; }
+struct G { H h; H h2; }
+G g;
+void zap(*H h) { if (h.p) |q| { free(q); } h.p = null; }
+void dropg() { zap(&g.h); }
+void outer() { dropg(); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    g.h.p = a;
+    outer();
+    free(a);
+    return 0;
+}

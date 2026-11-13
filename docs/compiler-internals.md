@@ -162,7 +162,7 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
-## The 2026-11-13 audit (BUG-1609..1627) — what took a loop to find
+## The 2026-11-13 audit (BUG-1609..1634) — what took a loop to find
 
 Read with BUGS-FIXED.md "Session 2026-11-13". Only what is not obvious from the diff.
 
@@ -258,15 +258,78 @@ a stable global pointer's aim (`ir_global_projection_key`). Three things cost lo
 retypes a pure literal tree to its destination (BUG-939). A binary OPERAND retyped it only
 when its exact value fit the other side, so `~0xFFF` against a `u64` stayed u32 and was
 zero-extended. `widen_literal_tree_operand` applies the var-decl sink's own licence
-(`value_flows_to_ex`), so the operand position and `u64 m = <tree>;` cannot disagree; shifts
-are excluded (a shift's type is its LEFT operand's). Measured consequence: `x > 0 - 1` on a
+(`value_flows_to_ex`), so the operand position and `u64 m = <tree>;` cannot disagree; in a
+shift only the LEFT operand (the value) is widened — a shift's result is the COMMON type of
+its operands by design, so `~0 << n` with a u64 `n` was u32 ones zero-extended. Measured consequence: `x > 0 - 1` on a
 u64 now compares against all-ones (as `u64 k = 0 - 1;` always produced), not 0xFFFFFFFF.
 
-**8. Running `make check` while editing: use a snapshot.** `make check` takes 15-30 minutes
+**8. A runtime guard can DISCHARGE a static precondition — and then the conservative
+widening it forced can go (BUG-1628).** BUG-1503 kept VRP sound under a re-entrant `_poll`
+by widening every async frame local at every call, because "refusing re-entrant polling
+would need a whole-program call-graph question". The other reading of the same sentence:
+make re-entry impossible at run time. `_poll` is now a wrapper around `_zer_pollrun_NAME`
+(the Duff's-device body) that tests and sets `_zer_running`; wrapping means none of the
+body's six exit forms (yield, await-not-ready, return, auto-guard early-out, orelse return,
+fall-off) had to be found. With that guard the precondition "no callee runs this task's
+body while this activation is live" is a fact, the handle states are sound across calls
+(the double free that prompted this), and the VRP widening is a pure over-rejection, so it
+was removed in the same change. Two things to keep: (a) the argument needs EVERY door to
+the frame closed — the task type exposes no fields, a task cannot be copied / punned, and
+`&local` already drops the range; a new way to name a frame field re-opens BUG-1503;
+(b) an existing POSITIVE test exercised the re-entry on purpose
+(`vrp_async_reentrant_poll_bug1503`) — it is a trap test now, and that is the tell that a
+"fix" changed the language: re-entrant polling used to be defined (and unsound), and is
+now a trap.
+
+**9. "What a thread can reach from this argument" is not "what the argument carries"
+(BUG-1631).** `funcptr_first_carried` answers by-value containment (optional / array /
+struct) and is right for a GLOBAL's binding. The spawn-argument fallback needs reach:
+through a pointer and a slice too (`funcptr_first_reached`, with a stack of structs being
+walked so `struct N { ?*N next; *() f; }` terminates). Do not widen `funcptr_first_carried`
+itself — `global_bound_functions` uses it to decide which globals have an initializer
+binding at all.
+
+**10. Running `make check` while editing: use a snapshot.** `make check` takes 15-30 minutes
 here and reads `./zerc`, so the tree cannot be rebuilt under it. Copy the working tree
 (`git ls-files -co --exclude-standard | tar …`) into a scratch directory and run it there;
 keep a second scratch build of the pre-change compiler for A/B. A probe subagent given a
 prebuilt compiler path and a read-only repo cannot disturb either.
+
+**11. A summary APPLIER resolves its argument by KEY — and three argument spellings have no
+key (BUG-1632..1634).** Every cross-function fact (`param_store`, `frees_param_elems`,
+`frees_param_field`) is computed on the callee and APPLIED at the call through the argument's
+compound key. The callee half was right in all three bugs; the applier dropped the fact
+because the argument was not a keyed place:
+- a SLICE of an array (`f(hs)` is `f(hs[..])` in the AST since BUG-1516, and `f(hs[1..3])`) —
+  peel to the array; a view that does not start at 0 shifts the callee's literal index, so
+  the store lands on the any-index slot `[*]`;
+- a slice LOCAL bound once to such a view — `ir_stable_slice_local_def` (BUG-1463) already
+  answered this for a projection `sl[1]`; the bare name as an ARGUMENT did not ask it;
+- a place under the function's OWN parameter or under a global, when the function has no
+  entry there to mark (`drop2(&c.h)`, `drop2(&g.h)`) — the fact must be re-recorded against
+  the outer function's root (the `\x01` field sentinel for a param, a freed-global PREFIX key
+  for a global), or the second hop loses it.
+When adding a summary fact, write the applier's argument resolution FIRST and test it with:
+the array itself, `&agg`, `&agg.field`, a sub-slice, a slice local, a forwarded parameter,
+and a global place. A fact that is right in the callee and applied to nothing looks exactly
+like "the callee does nothing".
+
+**12. Two strictness levels for "a place a view names" — do not merge them.**
+`ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key
+built from `&tbl[i]` names a different slot per evaluation and re-broke the valid teardown
+loop. `ir_place_summary_nameable` (flow-insensitive SUMMARIES, BUG-1633) accepts it, because
+`ir_ps_target_rec` spells a non-literal index `[*]` — "some element" — and a summary never
+claims more. A slice is nameable only as the ROOT (`&s[i]` with `s` a parameter that is
+never reassigned or address-taken): its elements are the caller's. Using the strict rule
+for summaries is the hole of BUG-1633; using the loose one for state keys is the regression
+of BUG-1621.
+
+**13. A promoted negative must be re-measured against the compiler just BEFORE the fix, not
+the session's oldest baseline.** Several BUG-1632..1634 negatives were already REJECTED by
+the previous compiler — for a different reason (a false "never freed" on the same program).
+`expect-error` is what makes them discriminate; a bare exit-code negative would have passed
+before and after. Likewise a `// expect-trap-at:` line is an offset into the FILE: adding a
+directive line above the code moves it (two trap tests failed the full run for exactly that).
 
 ## Reachability for the interrupt-sharing rules (BUG-1608, 2026-10-15)
 

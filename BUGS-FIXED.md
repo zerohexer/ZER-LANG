@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-11-13 — BUG-1609..1627: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
+## Session 2026-11-13 — BUG-1609..1634: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
 
 **Branch.** The one branch ahead of main, `zerohexer-automated/serene-shannon-0xnbk1`
 (BUG-1566..1608, 3 commits), forked AT main's head, so it was a fast-forward; `make check`
@@ -15,7 +15,7 @@ on it was green before anything else was touched. Every other branch is in main 
 arithmetic / emitter, concurrency / ISR / bare metal) against a build of the adopted tree,
 plus own probes. Every fix below was A/B-measured against that build; every new negative /
 matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
-`docs/limitations.md` "residuals of the 2026-11-13 audit" with 26 executed reproducers in
+`docs/limitations.md` "residuals of the 2026-11-13 audit" with 23 executed reproducers in
 `tests/zer_gaps/`.
 
 **Globals that carry a function pointer**
@@ -94,8 +94,8 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   binary-operand position was retyped only when its exact value fit the other side, so a `~`
   tree stayed u32 and was zero-extended, while `x &= ~0xFFF` and `u64 m = ~0xFFF; x & m` kept
   the bits (and `x == ~0` was false for an all-ones u64). It is now computed at the wider
-  operand's width under the var-decl sink's own licence (`widen_literal_tree_operand`). Test:
-  `literal_tree_widens_with_operand_bug1619`.
+  operand's width under the var-decl sink's own licence (`widen_literal_tree_operand`); in a
+  shift only the value being shifted is widened. Test: `literal_tree_widens_with_operand_bug1619`.
 
 **Allocation tracker — views** (gate: SHAPE p77; valid idioms `view_of_param_and_global_slot_teardown_bug1621`)
 - **BUG-1620 — `free(*pp)` with `**T pp = &a` freed an entry nobody names.** The key of a
@@ -131,6 +131,75 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   thread read a Slab's page table while main grew it (ASan heap-use-after-free in
   `_zer_slab_get`). Both scans read `field.handle_alloc`, and the checker records the use for
   the ISR rule where it resolves the auto-deref. Tests: `{spawn,isr}_handle_autoderef_*_bug1625`.
+- **BUG-1628 — a re-entrant `_poll` re-ran the current segment on the same frame.** The state
+  advances only at the next `yield`, so `free(s); again();` with `again` polling the same
+  global task freed `s` twice (ASan "attempting double-free"). The state machine is now the
+  `_zer_pollrun_NAME` body and `_poll` wraps it with a `_zer_running` flag: a poll (or an
+  `_init`) of a running task TRAPS, hosted and bare metal, at the async function's line.
+  **And the relaxation it licenses:** BUG-1503 had made the checker widen EVERY frame-local
+  range at EVERY call in an async body ("a callee may re-poll this task"). With re-entry
+  impossible and no other way to name a frame field (the task type exposes none, a task
+  cannot be copied or punned, `&local` carries no range), that widening is removed —
+  `vrp_widen_call_effects` and the hoist-soundness test treat an async frame local like any
+  local. Tests: `zer_trap/async_reentrant_poll_bug1628`, `zer_trap/async_reentrant_poll_frame_bug1503`
+  (was a positive that exercised the re-entry), `zer_trap/vrp_async_reentrant_hoist_bug1503`
+  (now traps at the poll), positives `async_poll_guard_sequential_ok_bug1628` (every exit of a
+  poll clears the flag; one task polling another) and `async_call_keeps_frame_range_bug1628`
+  (two auto-guard warnings on the old build, none now).
+- **BUG-1629 — a `defer` registered BEFORE a fire-and-forget spawn was checked as "before the
+  spawn".** Its body runs at scope exit, after any detach anywhere in the function (or in a
+  callee): `defer { g += 1; } spawn w();` raced the thread's `@atomic_add` (TSan). The body
+  is checked with the concurrent window open when the function can detach
+  (`subtree_can_detach`, the test a label already uses). Gate: the new `defer-before-spawn`
+  position in the CONCURRENT-WINDOW grid (`tests/test_conc_matrix.c`; scoped = positive, the
+  join precedes the exit). Tests: `defer_before_spawn_{plain_access,in_callee}_bug1629`.
+- **BUG-1631 — funcptr reach stopped at a POINTER / SLICE spawn argument.** The signature
+  fallback (BUG-1290) asked what the argument CARRIES by value, so `spawn w(&o)` with a
+  callback field was scanned only for a direct `p.f()`; `*() f = p.f; f();`, `if (p.f) |c| {
+  c(); }`, `run(p.f)`, `tbl[0]()` on a slice of funcptrs and a shared-struct funcptr field
+  loaded into a local all ran an unscanned function (TSan). `funcptr_first_reached` follows
+  pointers and slices (a struct on the walk's stack is not re-entered). Corpus cost: zero.
+  Tests: `spawn_funcptr_{via_ptr_arg_local_copy,slice_arg}_bug1631`, positive
+  `spawn_ptr_arg_funcptr_racefree_ok_bug1631`.
+
+**Allocation tracker — what a CALLEE did to the caller's array / struct (second pass)**
+- **BUG-1632 — a teardown loop written with an element VIEW freed nothing the caller could
+  see.** `void drop([*]H s) { for (..) { *H h = &s[i]; if (h.p) |q| { free(q); } h.p = null;
+  } }`: the element-source walk behind `FuncSummary.frees_param_elems` (BUG-1300) stopped at
+  the `&`, and followed only a bare copy of the parameter — a sub-slice local (`[*]H t =
+  s[0..n];`) was a stranger. The caller's alias stayed ALIVE (exit 99 through a recycled
+  slot), and the VALID teardown-refill-teardown program was refused as a leak. The walk peels
+  `&` and a slice step; `ir_local_param_sources` follows a sub-slice definition. Tests:
+  `callee_{view_drain_slice_param,subslice_drain_slice_param,view_drain_double_free}_bug1632`,
+  positive `callee_view_teardown_refill_ok_bug1632`; p45 view / sub-slice cells.
+- **BUG-1633 — a callee's store into a SLICE parameter's element reached no caller entry.**
+  `void link([*]H s, *T p) { s[1].p = p; }` called as `link(hs, a)`: the store summary
+  (BUG-1361) was applied through the destination argument's KEY, and the array -> slice
+  coercion (`hs[..]` in the AST since BUG-1516) has none. `free(a)` then left `hs[1].p`
+  dangling unflagged (exit 99). Four parts, one class: (1) `ir_apply_param_stores` resolves a
+  slice of an array to the array (a view that does not start at element 0 lands on the
+  any-index slot); (2) a slice LOCAL bound once to such a view is that view, at the store
+  applier AND at the drain applier (`ir_call_hands_local_array`); (3) a store summary can name
+  a view of a slice parameter's element and a variable-index element
+  (`ir_place_summary_nameable` — a summary says "some element", so the index needs no fixing,
+  unlike the per-state view key of BUG-1621). Tests:
+  `callee_stores_param_{in_slice_arg_elem,via_slice_elem_view,subslice_arg}_bug1633`, positive
+  `callee_stores_param_in_slice_arg_ok_bug1633`; p50 slice-destination cells.
+- **BUG-1634 — a field free TWO HOPS away was lost.** `void drop(*Ctx c) { drop2(&c.h); }`
+  with `drop2` freeing `h.p`: the "frees a field of this param" fact was carried into the
+  outer summary only for a BARE parameter forward (`drop2(c)`), so the caller's alias stayed
+  ALIVE (exit 99) and the valid two-hop teardown was refused as a leak. The forward of a
+  place under the parameter records it too. The GLOBAL form (`drop() { drop2(&g.h); }`) had
+  no entry under `g.h` to mark and so named no freed global at all: it now notes a freed-global
+  PREFIX (a key ending in `\x01`, matched by `ir_global_keys_may_alias` as "some slot under
+  this place"), which is transitive like every freed-global key. Tests:
+  `field_free_{two_hops_param_place,two_hops_global_place,three_hops_global}_bug1634`,
+  positive `field_free_two_hops_teardown_ok_bug1634`; p77 hop cells.
+
+**Compile-time evaluation**
+- **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
+  (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern
+  (2^63) is still refused. Test: `comptime_shift_by_63_bug1630`.
 
 ---
 

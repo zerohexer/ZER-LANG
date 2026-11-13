@@ -1,4 +1,6 @@
-// GAP (2026-11-13 audit, docs/limitations.md): a defer registered BEFORE a fire-and-forget spawn runs a plain access after it (atomic-cell rule is textual; TSan)
+// EXPECTED: compile error
+// expect-error: plain access to 'g' in a concurrent context
+// BUG-1629: a defer registered BEFORE a fire-and-forget spawn runs AFTER it.
 u32 g;
 void w() { for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&g, 1); } }
 u32 main() {

@@ -30,7 +30,7 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1627; measured, reproducers in `tests/zer_gaps/`)
+## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1634; measured, reproducers in `tests/zer_gaps/`)
 
 Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
 executed reproducer in `tests/zer_gaps/` (compile-clean = the gap still holds; the runner
@@ -42,16 +42,21 @@ The view work of BUG-1620..1626 resolves a view whose root is a local aggregate,
 that holds one value (a parameter, a local bound once), a whole or nested global slot, and a
 stable global pointer — in the function AND in the summaries built from it. What is left is
 each a missing SUMMARY fact, not a missing key:
-1. **A variable-index view in a callee** — `void drop([*]H s) { for (i..) { *H h = &s[i]; if
-   (h.p) |q| { free(q); } h.p = null; } }`: the view is refused for a non-literal index (a view
-   keyed on it re-broke the valid teardown loop, see BUG-1621), so `frees_param_elems` is not
-   set. `alloc_callee_teardown_loop_slice_view`, `alloc_callee_store_slice_elem_view`.
-2. **Two hops** — a callee forwarding `&param.field` (or `&global.field`) to a freeing helper:
-   the inner summary's `frees_param_field` is applied to a path the outer function does not
-   record against ITS parameter. `alloc_callee_forwards_addr_of_param_field`,
-   `alloc_callee_forwards_addr_global_field`, and the in-function form
-   `alloc_param_field_freed_by_callee_then_used` (a pointer param's field freed by a callee
-   stays ALIVE in the caller of that callee).
+1. ~~A variable-index view in a callee~~ — CLOSED (BUG-1632 the free through `*H h =
+   &s[i]` / a sub-slice local; BUG-1633 the store into a slice parameter's element, direct or
+   through a view, and a slice local handed to either kind of callee).
+2. **A field free the summary cannot NAME.** `frees_param_field` is one bit per parameter —
+   "frees some field". The two-hop forwards are CLOSED (BUG-1634: `drop2(&c.h)`,
+   `drop2(&g.h)`), but the bit carries neither WHICH field nor whether the callee RESET it:
+   - inside a function, a pointer param's field freed by a callee stays ALIVE for a direct
+     read (`drop(h); h.p.v = 99;` — no entry exists under `h` to mark, and marking every
+     pointer field read after the call would refuse `free_a(h); free(h.b);`).
+     `alloc_param_field_freed_by_callee_then_used`.
+   - (over-rejection, loud) a teardown that frees AND resets its fields, called again after a
+     PARTIAL refill, is "handed 'c', which carries a freed pointer at 'c.h2.p'" — one hop or
+     two. Refill every field, or reset them in the caller.
+   The durable fix is a per-path list (`{param, path, must, reset}`, the shape `param_store`
+   and `ret_field` already have) in place of the two bool arrays.
 3. **A getter of an ADDRESS** — `*H geth() { return &g_h; }`: `ret_global_key` (BUG-1311) is
    for a getter returning the global's VALUE. `alloc_getter_returns_addr_of_global`,
    `alloc_getter_through_local_view` (a getter reading a field through a local view is not a
@@ -88,21 +93,16 @@ each a missing SUMMARY fact, not a missing key:
    use-after-free; `defer th.join();` in a function with a label is "not joined".
 
 **B. Concurrency (MEDIUM, accept-unsafe — each TSan- or ASan-confirmed).**
-1. **A re-entrant `_poll` of the same task** — a call in an async body that reaches
-   `_poll(&task)` re-runs the current segment on the same frame (the state advances at the
-   next `yield`): a double free. VRP already widens for it (BUG-1503); the handle states do
-   not, and `_poll` has no "running" flag. `conc_reentrant_poll_double_free`.
-2. **Funcptr reach through a POINTER / SLICE spawn argument** — `void w(*O p) { *() f = p.f;
-   f(); }`, `if (p.f) |c| { c(); }`, `run(p.f)`, `tbl[0]()` on a slice of funcptrs, a funcptr
-   field of a shared struct loaded into a local. The by-value struct argument and the direct
-   `p.f()` are refused. The BUG-1290 signature fallback is keyed on the ARGUMENT carrying a
-   funcptr by value. `conc_funcptr_field_copy_via_ptr_arg`.
-3. **The window rules are textual** — a `goto` runs an access inside a spawn..join window it
-   is written before (`conc_goto_orders_access_into_borrow_window`; the downgrade check
-   likewise), and a `defer` registered BEFORE a fire-and-forget spawn runs a plain access
-   after it (`conc_defer_registered_before_spawn`). `Symbol.is_borrowed_by_thread` and
-   `Checker.after_spawn_in_func` are linear in the text; the escape fixpoint's answer (a
-   labelled function is flow-insensitive, a defer body sees "ever") is the model to copy.
+1. ~~A re-entrant `_poll` of the same task~~ — CLOSED (BUG-1628): the poll traps on re-entry.
+2. ~~Funcptr reach through a POINTER / SLICE spawn argument~~ — CLOSED (BUG-1631).
+3. **The scoped-borrow window is textual under `goto`** — a `goto` runs an access inside a
+   spawn..join window it is written before (`conc_goto_orders_access_into_borrow_window`; the
+   atomic-downgrade check likewise, and its `defer` form: thread `g += 1; @atomic_store(&f,
+   1);` against `{ defer { g += 1; } spawn w(); }`). `Symbol.is_borrowed_by_thread` is linear
+   in the text; the escape fixpoint's answer (a labelled function is flow-insensitive) is the
+   model to copy — but a flow-insensitive borrow also refuses the read AFTER the join, so it
+   needs a per-label join of the borrow set, not a blanket latch. (The atomic-cell rule's
+   `defer`-before-spawn form is CLOSED, BUG-1629.)
 4. **A helper lends its pointer param and touches the same global by NAME** — `void sp(*u32
    p) { th = spawn w(p); g += 1; th.join(); } ... sp(&g);`. BUG-1303's pairs are
    param-versus-param. `conc_helper_lends_param_touches_global`; and "same object" by name
@@ -124,7 +124,10 @@ each a missing SUMMARY fact, not a missing key:
 **C. Values / bare metal (LOW, loud).**
 - A shift COUNT literal is typed against the LEFT operand: `u3 y = x << 8;` is "cannot
   initialize 'u3' with 'u32'" while `x << 7` compiles (the documented result is 0).
-- A comptime shift by exactly 63 (`v >> 63`, `v << 63`) is "could not be evaluated".
+- ~~A comptime shift by exactly 63~~ — CLOSED (BUG-1630).
+- Shift typing: a shift's result is the COMMON type of its operands (by design), and a lone
+  literal count adopts the left operand's type — so `u8 s; u32 d = s << 12;` shifts at u8
+  width and is 0. Cast the value first (`(u32)s << 12`).
 - `if (i < 8) { return reg[i]; }` on an MMIO pointer with max index 7 still gets the
   auto-guard (precision).
 - `@cpu_save_context` / `@cpu_restore_context` emit `sd` / `ld` for riscv32 (RV64-only
@@ -237,9 +240,8 @@ each a missing SUMMARY fact, not a missing key:
    is not retyped wider and still wraps at 64 bits (BUG-1505 residual — pre-existing).
 3. **Label functions widen VRP over the whole body** when anything takes an address (BUG-1499):
    sound, but a function with a label and an `&` anywhere loses ranges it could keep.
-4. **Every call inside an async body widens every frame-local range** (BUG-1503) — the price of
-   a possible re-entrant `_poll`. A whole-program "does this call reach a poll of this task?"
-   query would recover it.
+4. ~~Every call inside an async body widens every frame-local range (BUG-1503)~~ — CLOSED
+   2026-11-13 (BUG-1628): a re-entrant `_poll` traps, so the widening is removed.
 
 ## OPEN — residuals of the 2026-09-28 MMIO / parser / compile-time round (BUG-1480..1487)
 

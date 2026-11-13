@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: which may be a view of 'a'
+// BUG-1633: the destination is a sub-slice that does not start at element 0
+// (`hs[1..3]`), so the callee's `s[0]` is the caller's `hs[1]`. The store lands
+// on the array's any-index slot: reading any element after `free(a)` is refused.
+struct T { u32 v; }
+struct H { ?*T p; }
+void link([*]H s, *T p) { s[0].p = p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[3] hs;
+    link(hs[1..3], a);
+    free(a);
+    if (hs[1].p) |z| { z.v = 99; }
+    return 0;
+}

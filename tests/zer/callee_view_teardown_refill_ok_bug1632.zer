@@ -1,0 +1,37 @@
+// BUG-1632: teardown through an element view, refill, teardown again. The
+// pre-fix compiler saw no free in `drop` and reported the refilled slot as a
+// leak; a read-only view walk (`count`) must leave the entries usable.
+struct T { u32 v; }
+struct H { ?*T p; u32 n; }
+void drop([*]H s) {
+    for (u32 i = 0; i < s.len; i += 1) {
+        *H h = &s[i];
+        if (h.p) |q| { free(q); }
+        h.p = null;
+    }
+}
+u32 count([*]H s) {
+    u32 c = 0;
+    for (u32 i = 0; i < s.len; i += 1) {
+        *H h = &s[i];
+        c += h.n;
+    }
+    return c;
+}
+u32 main() {
+    H[2] hs;
+    hs[0].p = alloc(T);
+    hs[1].p = alloc(T);
+    hs[0].n = 3;
+    hs[1].n = 4;
+    u32 c = count(hs);
+    if (hs[0].p) |z| { z.v = c; }
+    drop(hs);
+    hs[0].p = alloc(T);
+    u32 r = 0;
+    if (hs[0].p) |z| { z.v = 7; r = z.v; }
+    drop(hs);
+    if (c != 7) { return 1; }
+    if (r != 7) { return 2; }
+    return 0;
+}

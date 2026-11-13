@@ -6876,9 +6876,77 @@ static void rmw_arg_targets_main(Checker *c, Node *arg, WriteTargetFn fn, void *
     if (s && !s->is_function && s->type && type_carries_data_pointer(s->type, 0))
         for_each_write_target_ex(c, a, true, arg_target_filter, &u);
 }
+/* ---- BUG-1652: ONE answer to "is this statement a read-modify-write of volatile
+ * global g?" for every THREAD sink ----------------------------------------------
+ * The question had three answers. The main checker's sink (main_rmw_visit and the
+ * call sinks) knows every spelling — compound, written out, split through a local,
+ * a pointer, an out-parameter, a callee, memory (BUG-1010 / 1561 / 1650) — but fed
+ * only the ISR rule. The spawn scan re-derived a subset with its own taint table
+ * and no scopes, so a thread's `vmem = g; g = vmem + 1;` (any global carrier),
+ * `rd(&t); g = t + 1;` and `*p = g; g = t + 1;` were plain stores to it. And the
+ * spawner's window sink (BUG-1591) recognised the COMPOUND operator alone, so
+ * `g = g + 1`, the split forms and a helper doing `g += 1` all erased a thread's
+ * store unseen.
+ *
+ * Now: the main checker records each finding as a FACT keyed by the statement
+ * node, and the walk that already knows which code runs in a thread and which in
+ * a spawner's window (sync_walk) reads the facts at the nodes it visits. A
+ * spelling taught to the main sink reaches all three rules at once. */
+static struct VolRmwFact {
+    Node *node; Symbol *g; Node *once; int line; const char *file, *src;
+    bool win_only;   /* a CALL whose callee read-modify-writes through a parameter:
+                      * a thread walk judges that at the statement inside the callee
+                      * (it may sit in an @once the call does not) */
+} *_vol_rmw_facts = NULL;
+/* A statement that read-modify-writes THROUGH A PARAMETER (`*p += 1`), recorded by
+ * the param-mask scan; which global that is depends on the caller's argument. */
+static struct VolRmwPFact { Node *node; } *_vol_rmw_pfacts = NULL;
+static int _vol_rmw_pfact_n = 0, _vol_rmw_pfact_cap = 0;
+static void vol_rmw_pfact_add(Node *node) {
+    for (int i = 0; i < _vol_rmw_pfact_n; i++)
+        if (_vol_rmw_pfacts[i].node == node) return;
+    if (_vol_rmw_pfact_n >= _vol_rmw_pfact_cap) {
+        int nc = _vol_rmw_pfact_cap ? _vol_rmw_pfact_cap * 2 : 16;
+        struct VolRmwPFact *nb = (struct VolRmwPFact *)realloc(_vol_rmw_pfacts,
+                                     (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _vol_rmw_pfacts = nb; _vol_rmw_pfact_cap = nc;
+    }
+    _vol_rmw_pfacts[_vol_rmw_pfact_n++].node = node;
+}
+static int _vol_rmw_fact_n = 0, _vol_rmw_fact_cap = 0;
+/* A threadlocal global is one object PER THREAD: nothing another thread does can
+ * land between the two halves of a read-modify-write of it. */
+static bool global_is_threadlocal(Symbol *g) {
+    return g && g->func_node && g->func_node->kind == NODE_GLOBAL_VAR &&
+           g->func_node->var_decl.is_threadlocal;
+}
+static void vol_rmw_fact_add_ex(Node *node, Symbol *g, Node *once, int line,
+                                const char *file, const char *src, bool win_only) {
+    if (!node || !g || g->is_function || !g->is_volatile || g->is_const) return;
+    if (global_is_threadlocal(g)) return;
+    for (int i = 0; i < _vol_rmw_fact_n; i++)
+        if (_vol_rmw_facts[i].node == node && _vol_rmw_facts[i].g == g) return;
+    if (_vol_rmw_fact_n >= _vol_rmw_fact_cap) {
+        int nc = _vol_rmw_fact_cap ? _vol_rmw_fact_cap * 2 : 16;
+        struct VolRmwFact *nb = (struct VolRmwFact *)realloc(_vol_rmw_facts,
+                                    (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _vol_rmw_facts = nb; _vol_rmw_fact_cap = nc;
+    }
+    struct VolRmwFact *f = &_vol_rmw_facts[_vol_rmw_fact_n++];
+    f->node = node; f->g = g; f->once = once; f->line = line; f->file = file; f->src = src;
+    f->win_only = win_only;
+}
+static void vol_rmw_fact_add(Checker *c, Node *node, Symbol *g, bool win_only) {
+    if (!node) return;
+    vol_rmw_fact_add_ex(node, g, c->cur_once_node, (int)node->loc.line,
+                        c->file_name, c->source, win_only);
+}
+/* `ud` is the NODE_CALL whose argument reaches g. */
 static void track_rmw_arg_visit(Checker *c, Symbol *g, void *ud) {
-    (void)ud;
     track_isr_global(c, g->name, g->name_len, true);
+    vol_rmw_fact_add(c, (Node *)ud, g, true);   /* BUG-1652 */
 }
 static void track_opaque_arg_visit(Checker *c, Symbol *g, void *ud) {
     (void)ud;
@@ -8055,9 +8123,9 @@ static void call_rmw_globals(Checker *c, RmwTaintEnt *tab, int n, Node *call,
 static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
                                 bool is_compound, bool is_static_local, int line);
 static void main_call_rmw_hit(Checker *c, Symbol *g, bool may, void *ud) {
-    (void)ud;
     if (may) track_isr_global_opaque(c, g->name, g->name_len);
     else track_isr_global(c, g->name, g->name_len, true);
+    vol_rmw_fact_add(c, (Node *)ud, g, false);   /* BUG-1652: `ud` is the NODE_CALL */
 }
 static bool once_single_owner(Symbol *g, Node *once);
 static Node *_scan_once_node;
@@ -8113,8 +8181,10 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, MmioPwA
                 for (int pi = 0; pi < fd->func_decl.param_count && pi < 64; pi++) {
                     ParamDecl *pd = &fd->func_decl.params[pi];
                     if (pd->name && pd->name_len == root->ident.name_len &&
-                        memcmp(pd->name, root->ident.name, pd->name_len) == 0)
+                        memcmp(pd->name, root->ident.name, pd->name_len) == 0) {
                         *mask |= (1ULL << pi);
+                        vol_rmw_pfact_add(n);   /* BUG-1652 */
+                    }
                 }
             }
         }
@@ -8994,6 +9064,7 @@ static int _mem_edge_n = 0, _mem_edge_cap = 0;
 static struct MemCand {
     Symbol *g, *m; bool isr; Node *body; int line;
     const char *file, *source, *module; uint32_t module_len;
+    Node *node, *once; bool crit;   /* BUG-1652: the store itself, for the thread rules */
 } *_mem_cands = NULL;
 static int _mem_cand_n = 0, _mem_cand_cap = 0;
 static void mem_edge_add(Symbol *m, Symbol *s) {
@@ -9008,10 +9079,11 @@ static void mem_edge_add(Symbol *m, Symbol *s) {
     }
     _mem_edges[_mem_edge_n].m = m; _mem_edges[_mem_edge_n].s = s; _mem_edge_n++;
 }
-static void mem_cand_add(Checker *c, Symbol *g, Symbol *m, int line) {
-    if (!g || !m || g == m || m->is_function || c->critical_depth > 0) return;
+static void mem_cand_add(Checker *c, Symbol *g, Symbol *m, Node *node) {
+    if (!g || !m || g == m || m->is_function || !node) return;
+    int line = (int)node->loc.line;
     for (int i = 0; i < _mem_cand_n; i++)
-        if (_mem_cands[i].g == g && _mem_cands[i].m == m &&
+        if (_mem_cands[i].g == g && _mem_cands[i].m == m && _mem_cands[i].node == node &&
             _mem_cands[i].isr == c->in_interrupt && _mem_cands[i].body == c->current_body)
             return;
     if (_mem_cand_n >= _mem_cand_cap) {
@@ -9022,6 +9094,9 @@ static void mem_cand_add(Checker *c, Symbol *g, Symbol *m, int line) {
     }
     struct MemCand *k = &_mem_cands[_mem_cand_n++];
     k->g = g; k->m = m; k->isr = c->in_interrupt; k->body = c->current_body; k->line = line;
+    /* @critical makes the split atomic against an INTERRUPT (the ISR rule skips it);
+     * it excludes no other THREAD, so the store is still a fact for those rules. */
+    k->node = node; k->once = c->cur_once_node; k->crit = c->critical_depth > 0;
     k->file = c->file_name; k->source = c->source;
     k->module = c->current_module; k->module_len = c->current_module_len;
 }
@@ -9049,6 +9124,8 @@ static void check_mem_split_rmw(Checker *c) {
         struct MemCand *k = &_mem_cands[i];
         int ns = 0;
         if (seen && !mem_reaches(k->m, k->g, seen, &ns, cap)) continue;
+        vol_rmw_fact_add_ex(k->node, k->g, k->once, k->line, k->file, k->source, false);   /* BUG-1652 */
+        if (k->crit) continue;
         c->in_interrupt = k->isr; c->current_body = k->body; c->critical_depth = 0;
         c->file_name = k->file; c->source = k->source;
         c->current_module = k->module; c->current_module_len = k->module_len;
@@ -9069,12 +9146,23 @@ static void main_call_gin(Checker *c, struct VfSummary *s, void *ud) {
     Node *call = (Node *)ud;
     if (!s || s->opaque) return;
     for (int k = 0; k < call->call.arg_count && k < VF_MAX_PARAMS; k++) {
-        if (!s->gin[k].n) continue;
+        if (!s->gin[k].n && !s->ptd_dest[k].g.n) continue;
         Node *a = call->call.args[k] ? unwrap_ptr_launder(call->call.args[k]) : NULL;
         VfSet pg = {0};
         if (call->call.args[k]) call_arg_pointees(c, call->call.args[k], &pg);
-        for (int i = 0; i < pg.n; i++)
-            for (int j = 0; j < s->gin[k].n; j++) mem_edge_add(pg.v[i], s->gin[k].v[j]);
+        for (int i = 0; i < pg.n; i++) {
+            for (int j = 0; j < s->gin[k].n; j++) {
+                mem_edge_add(pg.v[i], s->gin[k].v[j]);
+                /* BUG-1652: that store IS a store into the pointee whose value
+                 * read the source — the write-back half when the source holds a
+                 * copy of the pointee (`void f(*u32 p){ vm = *p; *p = vm + 1; }`). */
+                mem_cand_add(c, pg.v[i], s->gin[k].v[j], call);
+            }
+            /* ... and the callee copying the pointee into a global is the read half */
+            for (int j = 0; j < s->ptd_dest[k].g.n; j++)
+                mem_edge_add(s->ptd_dest[k].g.v[j], pg.v[i]);
+        }
+        if (!s->gin[k].n) continue;
         /* the local the argument points into: `&m`, `&m.f`, or a pointer local */
         Node *r = a;
         if (r && r->kind == NODE_UNARY && r->unary.op == TOK_AMP) r = r->unary.operand;
@@ -9103,13 +9191,16 @@ static void main_rmw_visit(Checker *c, Symbol *g, void *ud) {
                   assign_reads_own_target(c, node->assign.value, g) ||
                   rmw_value_taints_global(c, c->rmw_taints, c->rmw_taint_count,
                                           node->assign.value, g, 0);  /* BUG-1010 */
-    if (is_rmw) track_isr_global(c, g->name, g->name_len, true);
+    if (is_rmw) {
+        track_isr_global(c, g->name, g->name_len, true);
+        vol_rmw_fact_add(c, node, g, false);   /* BUG-1652 */
+    }
     /* BUG-1650: what this store leaves in `g`, and whose copies it read */
     VfSet srcs = {0};
     rmw_value_sources(c, c->rmw_taints, c->rmw_taint_count, node->assign.value, 0, &srcs);
     for (int i = 0; i < srcs.n; i++) {
         mem_edge_add(g, srcs.v[i]);
-        if (!is_rmw) mem_cand_add(c, g, srcs.v[i], (int)node->loc.line);
+        if (!is_rmw) mem_cand_add(c, g, srcs.v[i], node);
     }
 }
 
@@ -9176,6 +9267,7 @@ static void spawn_rmw_visit(Checker *c, Symbol *ts, void *ud) {
     SpawnRmwUd *u = (SpawnRmwUd *)ud;
     Node *node = u->node;
     if (u->hit || !ts || ts->is_function || ts->is_const) return;
+    if (global_is_threadlocal(ts)) return;   /* BUG-1652: `threadlocal volatile` was refused */
     bool is_rmw = (node->assign.op != TOK_EQ) ||
                   target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                   assign_reads_own_target(c, node->assign.value, ts) ||
@@ -17646,7 +17738,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
         /* BUG-1561/1564: a call storing a value derived from a global back into
          * it (`wr(t + 1)` after `u32 t = rd();`, `wr(&g, g + 1)`, a forwarding
          * helper, an indirect call's candidates) read-modify-writes it. */
-        call_rmw_globals(c, c->rmw_taints, c->rmw_taint_count, node, main_call_rmw_hit, NULL);
+        call_rmw_globals(c, c->rmw_taints, c->rmw_taint_count, node, main_call_rmw_hit, node);
         vf_for_each_callee(c, node, main_call_gin, node);   /* BUG-1650 */
         if (node->call.callee) {
             Node *cal = node->call.callee;
@@ -17663,7 +17755,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * spawn scans already resolved the alias; this sink matched
                      * only the literal `&g`. */
                     rmw_arg_targets_main(c, node->call.args[i],
-                                         track_rmw_arg_visit, NULL);   /* BUG-1124 */
+                                         track_rmw_arg_visit, node);   /* BUG-1124 */
                 }
             } else if (callee_is_opaque_funcptr(c, cal)) {
                 /* BUG-1046: a call through a function pointer — no body to
@@ -22892,6 +22984,17 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             if (node->intrinsic.arg_count > 0) {
                 Symbol *acell = atomic_scalar_global_target(c, node->intrinsic.args[0]);
                 if (acell) acell->is_atomic_cell = true;
+                /* BUG-1652: `@atomic_store(&a, g)` leaves a copy of g in a — a
+                 * memory carrier like any other: `g = @atomic_load(&a) + 1;` then
+                 * read-modify-writes g through it. Every value operand counts
+                 * (`@atomic_add(&a, g)` leaves a value derived from g). */
+                if (acell)
+                    for (int vi = 1; vi < node->intrinsic.arg_count; vi++) {
+                        VfSet asrc = {0};
+                        rmw_value_sources(c, c->rmw_taints, c->rmw_taint_count,
+                                          node->intrinsic.args[vi], 0, &asrc);
+                        for (int si = 0; si < asrc.n; si++) mem_edge_add(acell, asrc.v[si]);
+                    }
                 /* BUG-1284: a pointer VALUE operand (`p` aimed at `&g`), or a param
                  * whose caller's argument the post-check resolves. */
                 if (!acell && node->intrinsic.args[0] &&
@@ -25363,6 +25466,66 @@ static void check_parent_volatile_rmw(Checker *c) {
     c->file_name = sv_fn; c->source = sv_src;
 }
 
+static struct VolStore { Symbol *g, *lock; } *_vol_stores = NULL;
+static int _vol_store_n = 0, _vol_store_cap = 0;
+static void vol_store_note(Symbol *g, Symbol *lock) {
+    for (int i = 0; i < _vol_store_n; i++)
+        if (_vol_stores[i].g == g && _vol_stores[i].lock == lock) return;
+    if (_vol_store_n >= _vol_store_cap) {
+        int nc = _vol_store_cap ? _vol_store_cap * 2 : 16;
+        struct VolStore *nb = (struct VolStore *)realloc(_vol_stores, (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _vol_stores = nb; _vol_store_cap = nc;
+    }
+    _vol_stores[_vol_store_n].g = g; _vol_stores[_vol_store_n].lock = lock; _vol_store_n++;
+}
+static struct VolLockedRmw { Symbol *g, *lock; struct SyncSpawnSite *site; } *_vol_locked = NULL;
+static int _vol_locked_n = 0, _vol_locked_cap = 0;
+static bool _vol_locked_lost = false;   /* an entry could not be kept: refuse */
+static void vol_locked_note(Symbol *g, Symbol *lock, struct SyncSpawnSite *site) {
+    for (int i = 0; i < _vol_locked_n; i++)
+        if (_vol_locked[i].g == g && _vol_locked[i].lock == lock &&
+            _vol_locked[i].site == site) return;
+    if (_vol_locked_n >= _vol_locked_cap) {
+        int nc = _vol_locked_cap ? _vol_locked_cap * 2 : 8;
+        struct VolLockedRmw *nb = (struct VolLockedRmw *)realloc(_vol_locked,
+                                      (size_t)nc * sizeof(*nb));
+        if (!nb) { _vol_locked_lost = true; return; }
+        _vol_locked = nb; _vol_locked_cap = nc;
+    }
+    _vol_locked[_vol_locked_n].g = g; _vol_locked[_vol_locked_n].lock = lock;
+    _vol_locked[_vol_locked_n].site = site; _vol_locked_n++;
+}
+/* BUG-1652: a thread's read-modify-write of a volatile flag UNDER A LOCK is exact
+ * only if every other store of that flag holds the same lock — an unlocked
+ * `flag = 1` elsewhere lands between the read and the write-back and is erased. */
+static void check_volatile_locked_rmw(Checker *c) {
+    const char *sv_fn = c->file_name, *sv_src = c->source;
+    for (int i = 0; i < _vol_locked_n; i++) {
+        struct VolLockedRmw *k = &_vol_locked[i];
+        bool bad = _vol_locked_lost;
+        for (int j = 0; j < _vol_store_n && !bad; j++)
+            bad = _vol_stores[j].g == k->g && _vol_stores[j].lock != k->lock;
+        if (!bad || !k->site || !k->site->target) continue;
+        c->file_name = k->site->file; c->source = k->site->source;
+        checker_error(c, k->site->line,
+            "spawn target '%.*s' read-modify-writes volatile global '%.*s' under lock "
+            "'%.*s', but another store of '%.*s' (in a thread, or in the code that "
+            "spawned one) does not hold that lock — it can land between the read and "
+            "the write-back and be erased. Take the same lock at every write, or use "
+            "@atomic_*",
+            (int)k->site->target->name_len, k->site->target->name,
+            (int)k->g->name_len, k->g->name,
+            (int)k->lock->name_len, k->lock->name,
+            (int)k->g->name_len, k->g->name);
+    }
+    c->file_name = sv_fn; c->source = sv_src;
+}
+static void vol_rmw_tables_reset(void) {   /* one program per run (the LSP re-checks) */
+    _vol_rmw_fact_n = 0; _vol_rmw_pfact_n = 0; _vol_store_n = 0; _vol_locked_n = 0;
+    _vol_locked_lost = false;
+}
+
 /* THE exemption set of the spawn race scan: does a non-function global `sym`
  * need synchronisation when a spawned thread touches it? (Extracted for
  * BUG-1562, which asks the same question of the globals a thread WRITES.) */
@@ -25636,6 +25799,11 @@ typedef struct {
      * spawn site was scanned (`late_seq` >= 0 arms the check). */
     int late_seq;
     Symbol *late_alloc;
+    /* BUG-1652: 1 = a spawned thread's body, 2 = a spawner's window (0 = an
+     * interrupt handler's walk: the ISR rules own those). */
+    int rmw_mode;
+    Symbol *vol_rmw;          /* THREAD: a volatile global read-modify-written unlocked */
+    struct SyncSpawnSite *site;
 } SyncWalk;
 typedef struct { Symbol **v; int n, cap; bool direct; } SyncGl;
 static void sync_gl_add(SyncGl *l, Symbol *g) {
@@ -25730,12 +25898,79 @@ static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
      * the access kind is known; a thread that only READS the flag cannot lose
      * the spawner's update (it used to be recorded by the exemption itself,
      * so `vg |= 2` was refused against a reader). */
-    if (w->phase == SW_THREAD && write && g && g->is_volatile && !g->is_function &&
-        g->type && volatile_global_exempt_from_race_check(w->c, g))
+    /* BUG-1652: `rmw_mode != 2` — sync_descend runs a WINDOW walk's callees in
+     * the THREAD phase ("the whole callee runs in the window"), so the phase
+     * alone recorded a store made by the SPAWNER's helper as a thread's, and the
+     * spawner's own read-modify-write of a flag no thread touches was refused
+     * "while a spawned thread may store it". */
+    if (w->phase == SW_THREAD && w->rmw_mode != 2 && write && g && g->is_volatile &&
+        !g->is_function && g->type && volatile_global_exempt_from_race_check(w->c, g))
         record_thread_volatile(w->c, g);
+    /* BUG-1652: every store of such a flag by a thread or in a spawner's window,
+     * with the lock it was made under — what a LOCKED read-modify-write of the
+     * same global has to be checked against. */
+    if (w->rmw_mode && write && g && g->is_volatile && !g->is_function && g->type &&
+        volatile_global_exempt_from_race_check(w->c, g))
+        vol_store_note(g, ctx.lock);
     if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
     SyncAcc a = { g, write, ctx.lock, ctx.acq, ctx.pub };
     sync_acc_add(w->out, a);
+}
+/* A thread read-modify-writes volatile `g`: refused outright, as the spawn scan
+ * always did — unless a lock is held, in which case every OTHER store must hold
+ * it too (check_volatile_locked_rmw). An @once body is never walked. */
+static void sync_vol_rmw_thread_hit(SyncWalk *w, Symbol *g, SyncCtx ctx) {
+    if (!g || g->is_function || !g->is_volatile || g->is_const || global_is_threadlocal(g))
+        return;
+    if (!ctx.lock) { if (!w->vol_rmw) w->vol_rmw = g; }
+    else vol_locked_note(g, ctx.lock, w->site);
+}
+/* BUG-1652: the read-modify-write facts the main checker recorded for statement
+ * `n`, applied in the context this walk is in. */
+static void sync_vol_rmw_facts(SyncWalk *w, Node *n, SyncCtx ctx) {
+    if (!w->rmw_mode) return;
+    if (w->phase != SW_THREAD && w->phase != SW_IN) return;
+    Checker *c = w->c;
+    /* through a parameter: the global is whatever this walk bound the name to */
+    if (w->rmw_mode == 1 && n->kind == NODE_ASSIGN)
+        for (int i = 0; i < _vol_rmw_pfact_n; i++) {
+            if (_vol_rmw_pfacts[i].node != n) continue;
+            Node *r = n->assign.target;
+            int steps = 0;
+            bool star = false;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                         (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+                if (r->kind == NODE_FIELD) r = r->field.object;
+                else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+                else { r = r->unary.operand; star = true; }
+                steps++;
+            }
+            if (!r || r->kind != NODE_IDENT || steps == 0) break;
+            for (int bi = w->nbind - 1; bi >= w->frame; bi--) {
+                SyncBind *b = &w->bind[bi];
+                if (b->len != (uint32_t)r->ident.name_len ||
+                    memcmp(b->name, r->ident.name, b->len) != 0) continue;
+                if (b->g && (b->direct || star || steps >= 2))
+                    sync_vol_rmw_thread_hit(w, b->g, ctx);
+                if (b->decl) break;
+            }
+            break;
+        }
+    for (int i = 0; i < _vol_rmw_fact_n; i++) {
+        struct VolRmwFact *f = &_vol_rmw_facts[i];
+        if (f->node != n) continue;
+        if (w->rmw_mode == 1) {
+            if (f->win_only) continue;
+            if (f->once && once_single_owner(f->g, f->once)) continue;
+            sync_vol_rmw_thread_hit(w, f->g, ctx);
+        } else {
+            /* the spawner's window: an error only if a thread stores it */
+            const char *sf = c->file_name, *ss = c->source;
+            c->file_name = f->file; c->source = f->src;
+            record_parent_volatile_rmw(c, f->g, f->line);
+            c->file_name = sf; c->source = ss;
+        }
+    }
 }
 /* BUG-1565 (C2): an access THROUGH a name bound to a global — `*p`, `p.f`,
  * `p[i]`, and for a carrier `*h.p` / `h.p.f` — is an access of that global.
@@ -25870,6 +26105,7 @@ static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCt
         sync_bind_push(w, nb[i].name, nb[i].len, nb[i].g, nb[i].direct, nb[i].decl);
     w->phase = SW_THREAD;   /* the whole callee runs in the window */
     w->fnode = fd;
+    if (w->rmw_mode == 1) (void)func_rmw_param_mask(w->c, fs, 0);   /* BUG-1652: its pfacts */
     DeclModuleSave dm = decl_module_enter(w->c, fs);
     sync_walk(w, fd->func_decl.body, ctx, depth + 1);
     decl_module_leave(w->c, dm);
@@ -25893,6 +26129,7 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         return;
     }
     case NODE_ASSIGN: {
+        sync_vol_rmw_facts(w, n, ctx);   /* BUG-1652 */
         sync_record(w, resolve_write_target_global(c, n->assign.target, 0), true, ctx);
         sync_record_bound(w, n->assign.target, true, ctx);
         sync_lvalue(w, n->assign.target, ctx, depth + 1);
@@ -25917,6 +26154,7 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         SW(n->unary.operand);
         return;
     case NODE_CALL: {
+        sync_vol_rmw_facts(w, n, ctx);   /* BUG-1652 */
         SW(n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++) SW(n->call.args[i]);
         Node *cal = n->call.callee;
@@ -26341,6 +26579,7 @@ static void sync_window_callers(Checker *c, SyncCensus *k, Symbol *encl, SyncAcc
                 memset(&w, 0, sizeof(w));
                 w.c = c; w.out = out; w.phase = SW_BEFORE; w.spawn = cs->call;
                 w.fnode = cl->func_node;
+                w.rmw_mode = 2;   /* BUG-1652 */
                 DeclModuleSave dm = decl_module_enter(c, cl);
                 sync_walk(&w, cl->func_node->func_decl.body, none, 0);
                 decl_module_leave(c, dm);
@@ -26407,6 +26646,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             memset(&tw, 0, sizeof(tw));
             tw.c = c; tw.out = &thr[i]; tw.phase = SW_THREAD; tw.fnode = t->func_node;
             tw.late_seq = s->seq + 1;   /* BUG-1649 (0 = unarmed) */
+            tw.rmw_mode = 1; tw.site = s;   /* BUG-1652 */
             /* the target's params, bound to what the spawn handed them */
             Node *fd = t->func_node;
             for (int p = 0; p < fd->func_decl.param_count; p++) {
@@ -26434,10 +26674,21 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
                     (int)t->name_len, t->name,
                     (int)tw.late_alloc->name_len, tw.late_alloc->name);
             }
+            if (tw.vol_rmw) {   /* BUG-1652 */
+                c->file_name = s->file; c->source = s->source;
+                checker_error(c, s->line,
+                    "spawn target '%.*s' performs a non-atomic read-modify-write "
+                    "on volatile global '%.*s' — data race. volatile gives NO "
+                    "atomicity, so the read and the write can interleave with "
+                    "another thread; use @atomic_add / @atomic_* or a shared struct",
+                    (int)t->name_len, t->name,
+                    (int)tw.vol_rmw->name_len, tw.vol_rmw->name);
+            }
             sync_walk_free(&tw);
         }
         Symbol *e = s->encl;
         ww[i].c = c; ww[i].out = &win[i]; ww[i].phase = SW_BEFORE; ww[i].spawn = s->spawn;
+        ww[i].rmw_mode = 2;   /* BUG-1652 */
         /* BUG-1651: under a goto / label the code written before an open (or
          * unjoinable) spawn can run beside its thread */
         if (s->spawn && s->spawn->kind == NODE_SPAWN && s->spawn->spawn_stmt.in_jump_fn &&
@@ -43455,7 +43706,9 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
     check_alias_spawn_calls(c);   /* BUG-1303 */
     check_async_frame_cycles(c);  /* BUG-1559 */
     check_sync_spawn_writers(c, files, count);  /* BUG-1562/1563 */
+    check_volatile_locked_rmw(c);               /* BUG-1652 */
     check_parent_volatile_rmw(c);               /* BUG-1591 */
+    vol_rmw_tables_reset();
     check_c_extern_signatures(c, files, count); /* BUG-1606 */
     unprefix_c_externs(c);                      /* BUG-1593 */
 

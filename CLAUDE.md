@@ -205,6 +205,7 @@ SHAPE in `tools/sink_matrix.sh`; "conc" / "hw" = `tests/test_conc_matrix.c` /
 | Spawn-arg gates: does this arg let the child reach my memory? | `type_carries_handle`, `type_carries_nonshared_pointer` | conc CARRIER grid |
 | Funcptr REACH: which function does this callback run? (spawn AND ISR sinks) | `scan_funcname_binding`, `scan_returned_funcname`, `func_forwards_param_to_spawn`, `funcptr_sig_racy_target`, `global_bound_functions`, `indirect_callee_functions`, `for_each_orelse_block`; from an argument's type: `funcptr_first_reached` | conc REACH grid + ISR sub-grid |
 | Non-atomic RMW on a shared global (site x spelling x position x reach x call x aim) | `resolve_write_target_global`, `assign_reads_own_target`, `for_each_write_target`, `vf_summary`, `call_rmw_globals`, `carrier_value_global` | hw RMW FORM grid |
+| Is this statement an RMW of volatile `g` — in a THREAD, or in a spawner's WINDOW? | the main checker classifies once and records a fact per statement (`vol_rmw_fact_add`); `sync_walk` reads it (`sync_vol_rmw_facts`); locked: `check_volatile_locked_rmw`. Never teach the spawn scan a spelling by hand | hw "volatile RMW at the thread sinks" |
 | A copy of a volatile global held in MEMORY (split RMW) | `mem_edge_add` / `check_mem_split_rmw`, `rmw_taint_maintain`, `VfSummary.gin` | hw "RMW split through memory" |
 | ISR single writer (tick-counter relaxation) | `isr_rmw_regular_code_only_reads` | hw SINGLE-WRITER grid |
 | Static locals in a race scan | `static_local_record` | hw STATIC-LOCAL grid |

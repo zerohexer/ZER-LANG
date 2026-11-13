@@ -1,0 +1,41 @@
+// BUG-1652 boundary: everything here is exact and must keep compiling.
+//  1. a read-modify-write under a CAS lock, from two threads (every store of g
+//     in the window holds the lock)
+//  2. a `threadlocal volatile` counter — one object per thread (was refused)
+//  3. the spawner's own read-modify-write of a flag NO thread stores, next to
+//     a helper that stores it (the helper's store was recorded as a thread's)
+//  4. a read-modify-write before the spawn and after the join
+volatile u32 g;
+volatile u32 vg;
+volatile u32 other;
+threadlocal volatile u32 tv;
+u32 lk;
+
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        u32 t = g;
+        g = t + 1;                    /* 1 */
+        @atomic_store(&lk, 0);
+        tv += 1;                      /* 2 */
+    }
+    other = 1;
+}
+
+void helper() { vg = 5; }
+
+u32 main() {
+    g = g + 1;                        /* 4: before the spawn */
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    helper();
+    vg |= 2;                          /* 3 */
+    a.join();
+    b.join();
+    u32 t = g;                        /* 4: after the joins */
+    g = t + 1;
+    if (g != 2002) { return 1; }
+    if (vg != 7) { return 2; }
+    if (other != 1) { return 3; }
+    return 0;
+}

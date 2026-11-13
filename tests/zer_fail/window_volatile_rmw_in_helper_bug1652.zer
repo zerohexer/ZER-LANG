@@ -1,0 +1,16 @@
+// expect-error: while a spawned thread may store it
+// BUG-1652: the read-modify-write is in a HELPER the spawner calls between the
+// spawn and the join. The window rule looked at the spawner's own statements.
+volatile u32 g;
+void bump() { g += 1; }
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) { g = i; }
+}
+u32 main() {
+    ThreadHandle a = spawn w();
+    for (u32 i = 0; i < 1000; i += 1) {
+        bump();
+    }
+    a.join();
+    return 0;
+}

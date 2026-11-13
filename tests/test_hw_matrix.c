@@ -1109,6 +1109,9 @@ int main(void) {
             { "callee out-param 2 hops", 1, MEMPRE "void st(*u32 p){ *p = g; }\nvoid mid(*u32 q){ st(q); }\n"
                                          "u32 main(){ u32 m = 0; mid(&m); g = m + 1; return 0; }\n" },
             { "loop back edge", 1, MEMPRE "u32 main(){ u32 x = 0; for (u32 i = 0; i < 2; i += 1) { g = x + 1; x = g; } return 0; }\n" },
+            /* BUG-1652: through a PARAMETER and a global carrier at once */
+            { "param + global carrier", 1, MEMPRE "u32 mem;\nvoid bump(volatile *u32 p){ mem = *p; *p = mem + 1; }\n"
+                                         "u32 main(){ bump(&g); return 0; }\n" },
             { "ok: other global", 0, MEMPRE "u32 mem;\nu32 main(){ mem = g; h = mem + 1; return 0; }\n" },
             { "ok: carrier holds no copy", 0, MEMPRE "u32 mem;\nu32 main(){ mem = 7; g = mem + 1; return 0; }\n" },
             { "ok: @critical", 0, MEMPRE "u32 mem;\nu32 main(){ @critical { mem = g; g = mem + 1; } return 0; }\n" },
@@ -1124,6 +1127,87 @@ int main(void) {
             snprintf(mnm, sizeof(mnm), "rmw-mem/%s", mc[mi].name);
             int ok = run_vol(mnm, mc[mi].body, "", mc[mi].neg);
             fprintf(stderr, "  [%-26s][%s] %s\n", mc[mi].name, mc[mi].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
+    /* BUG-1652 — ONE answer to "is this a read-modify-write of volatile g?" at
+     * the two THREAD sinks. The main checker knew every spelling but fed only
+     * the ISR rule; the spawn scan re-derived a subset, and the spawner's window
+     * rule knew the compound operator alone. SINK x SPELLING, so a spelling
+     * taught to one sink and not the other fails here:
+     *   thread/*  the read-modify-write runs in a spawned thread (always refused)
+     *   window/*  it runs in the spawner between spawn and join, and the thread
+     *             STORES the flag (the store is erased by the write-back)
+     *   locked/*  under a CAS lock it is exact only if every other store holds it
+     * The positive cells pin the boundary of each. */
+    fprintf(stderr, "\n--- volatile RMW at the thread sinks (BUG-1652) ---\n");
+    {
+        #define TW(pre, body) "volatile u32 g;\n" pre "\nvoid w(){ for (u32 i = 0; i < 4; i += 1) { " body " } }\n" \
+            "u32 main(){ ThreadHandle a = spawn w(); ThreadHandle b = spawn w(); a.join(); b.join(); return 0; }\n"
+        #define WW(pre, body) "volatile u32 g;\n" pre "\nvoid w(){ for (u32 i = 0; i < 4; i += 1) { g = i; } }\n" \
+            "u32 main(){ ThreadHandle a = spawn w(); " body " a.join(); return 0; }\n"
+        #define LK "while (!@atomic_cas(&lk, 0, 1)) { } "
+        #define UL " @atomic_store(&lk, 0);"
+        static const struct { const char *name; int neg; const char *body; } tc[] = {
+            { "thread/volatile carrier", 1, TW("volatile u32 vm;", "vm = g; g = vm + 1;") },
+            { "thread/carrier in helper", 1, TW("volatile u32 vm;\nvoid h(){ vm = g; g = vm + 1; }", "h();") },
+            { "thread/threadlocal carrier", 1, TW("threadlocal u32 tl;", "tl = g; g = tl + 1;") },
+            { "thread/shared-struct carrier", 1, TW("shared struct S { u32 v; }\nS s;", "s.v = g; g = s.v + 1;") },
+            { "thread/atomic carrier", 1, TW("u32 a;", "@atomic_store(&a, g); g = @atomic_load(&a) + 1;") },
+            { "thread/out-param", 1, TW("void rd(*u32 o){ *o = g; }", "u32 t = 0; rd(&t); g = t + 1;") },
+            { "thread/pointer to local", 1, TW("", "u32 t = 0; *u32 p = &t; *p = g; g = t + 1;") },
+            { "thread/compound beside @atomic", 1, TW("u32 a;", "@atomic_add(&a, 1); g += 1;") },
+            { "window/written out", 1, WW("", "g = g + 1;") },
+            { "window/split local", 1, WW("", "u32 t = g; g = t + 1;") },
+            { "window/volatile carrier", 1, WW("volatile u32 vm;", "vm = g; g = vm + 1;") },
+            { "window/helper compound", 1, WW("void bump(){ g += 1; }", "bump();") },
+            { "window/helper split", 1, WW("void bump(){ u32 t = g; g = t + 1; }", "bump();") },
+            { "window/call split", 1, WW("u32 rd(){ return g; }\nvoid wr(u32 v){ g = v; }", "wr(rd() + 1);") },
+            { "window/param helper", 1, WW("void bump(volatile *u32 p){ *p += 1; }", "bump(&g);") },
+            { "thread/param + carrier", 1, TW("volatile u32 vm;\nvoid bump(volatile *u32 p){ vm = *p; *p = vm + 1; }", "bump(&g);") },
+            { "window/param + carrier", 1, WW("volatile u32 vm;\nvoid bump(volatile *u32 p){ vm = *p; *p = vm + 1; }", "bump(&g);") },
+            { "thread/has-sync param helper", 1, TW("u32 a;\nvoid bump(volatile *u32 p){ *p += 1; }", "@atomic_add(&a, 1); bump(&g);") },
+            { "locked/unlocked parent store", 1,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "g += 1;" UL " }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); g = 5; a.join(); return 0; }\n" },
+            { "locked/unlocked other thread", 1,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "g += 1;" UL " }\nvoid st(){ g = 9; }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); ThreadHandle b = spawn st(); a.join(); b.join(); return 0; }\n" },
+            { "ok: locked, two instances", 0,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "u32 t = g; g = t + 1;" UL " }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); ThreadHandle b = spawn w(); a.join(); b.join(); return 0; }\n" },
+            { "ok: locked, parent store locked", 0,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "g += 1;" UL " }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); " LK "g = 5;" UL " a.join(); return 0; }\n" },
+            { "ok: thread only reads", 0,
+              "volatile u32 g;\nvoid w(){ u32 t = g; if (t > 5) { } }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); g = g + 1; a.join(); return 0; }\n" },
+            { "ok: before spawn, after join", 0, 
+              "volatile u32 g;\nvoid w(){ g = 1; }\n"
+              "u32 main(){ g = g + 1; ThreadHandle a = spawn w(); a.join(); u32 t = g; g = t + 1; return 0; }\n" },
+            { "ok: another flag", 0, WW("volatile u32 h;", "h = h + 1;") },
+            { "ok: helper store, own RMW", 0,
+              "volatile u32 vg;\nvolatile u32 other;\nvoid helper(){ vg = 7; }\nvoid w(){ other = 1; }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); helper(); vg |= 2; a.join(); return 0; }\n" },
+            { "ok: @once owner", 0, TW("", "@once { g += 1; }") },
+            { "ok: threadlocal volatile", 0, TW("threadlocal volatile u32 tv;", "tv += 1;") },
+            { "ok: carrier holds no copy", 0, TW("volatile u32 vm;", "vm = i; g = vm + 1;") },
+            { "ok: param copies another flag", 0,
+              TW("volatile u32 h;\nvolatile u32 vm;\nvoid cp(volatile *u32 p){ vm = *p; }\nvoid st(volatile *u32 p){ *p = vm + 1; }",
+                 "cp(&h); st(&g);") },
+        };
+        #undef TW
+        #undef WW
+        #undef LK
+        #undef UL
+        for (size_t ti = 0; ti < sizeof(tc) / sizeof(tc[0]); ti++) {
+            valid_cells++;
+            char tnm[192];
+            snprintf(tnm, sizeof(tnm), "vol-rmw/%s", tc[ti].name);
+            int ok = run_vol(tnm, tc[ti].body, "", tc[ti].neg);
+            fprintf(stderr, "  [%-30s][%s] %s\n", tc[ti].name, tc[ti].neg ? "neg" : "pos",
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }

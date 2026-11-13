@@ -374,6 +374,33 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   `window_*_bug1651` negatives, positive `window_exit_after_join_closed_ok_bug1651`;
   conc-matrix open-window cells (3 false negatives on the previous build).
 
+- **BUG-1652 — "is this a read-modify-write of volatile `g`?" had three answers, and the two
+  THREAD sinks had the weak ones.** The main checker's sink knew every spelling (compound,
+  written out, split through a local / pointer / out-parameter / callee / memory) but fed only
+  the interrupt rule. (a) The spawn scan re-derived a subset with its own taint table and no
+  scopes: a thread's `vm = g; g = vm + 1;` through any global carrier (volatile, threadlocal,
+  a shared struct, an atomic cell), `rd(&t); g = t + 1;` and `*p = g; g = t + 1;` were plain
+  stores. (b) An unrelated `@atomic_*` anywhere in the spawn target downgraded the scan's
+  finding to a WARNING — including `g += 1` on a volatile flag from two threads. (c) The
+  spawner's window rule (BUG-1591) recognised the compound operator alone: `g = g + 1`, the
+  split forms, a helper doing `g += 1`, `wr(rd() + 1)` and `bump(&g)` all erased a thread's
+  store unseen. Fix: the main checker records each finding as a FACT keyed by the statement
+  node (`vol_rmw_fact_add`; through-parameter statements by `vol_rmw_pfact_add`), and the
+  walk that already knows which code runs in a thread and which in a spawner's window
+  (`sync_walk`) reads the facts at the nodes it visits (`sync_vol_rmw_facts`). A thread's
+  read-modify-write is refused unless it is under a CAS lock, and then every other store of
+  the flag must hold that lock (`check_volatile_locked_rmw`). Also closed on the way: a
+  read-modify-write through a PARAMETER split through a global
+  (`void f(*u32 p){ vm = *p; *p = vm + 1; }`) at all three sinks, the interrupt rule
+  included (`main_call_gin` now records the candidate and the `ptd_dest` edge); an atomic
+  cell as a carrier (`@atomic_store(&a, g)` is an edge). Two over-rejections removed: a
+  `threadlocal volatile` counter in a thread, and the spawner's own read-modify-write of a
+  flag no thread stores when one of ITS helpers stores it (`sync_descend` runs a window
+  walk's callees in the thread phase, so the phase alone recorded the helper's store as a
+  thread's). Tests: seven `*_bug1652` negatives, positive
+  `volatile_rmw_thread_sinks_ok_bug1652` (refused before); hw-matrix "volatile RMW at the
+  thread sinks" (30 cells) + one ISR cell — 23 cells fail on the previous build.
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

@@ -430,6 +430,22 @@ Tooling note: `apt-get install coq libcoq-stdpp` (Coq 8.18, stdpp 1.9) is enough
 a self-contained oracle (`coqc -Q lambda_zer_concurrency zer_conc ...window_cfg.v`); VST /
 CompCert need opam and were not installable in a sandbox with no opam mirror.
 
+**11m. A second scanner without scopes will always know fewer spellings — feed it FACTS
+(BUG-1652).** The spawn scan walks a callee's AST from the spawn site, where the callee's
+locals are not in scope, so every spelling that needs a Symbol (a pointer local's borrow
+root, an out-parameter summary, the memory relation) was taught to the main checker and
+silently not to the scan. Patching the scan per spelling is the BUG-1010 → 1561 → 1650
+history. The durable shape: the main checker, which checks EVERY body with its scopes,
+records each finding as a fact keyed by the STATEMENT NODE (`vol_rmw_fact_add`), and the
+context walk (`sync_walk`: thread / spawner's window / caller's window) only asks "is there
+a fact at this node?". A node key is position-exact — a per-function key would pull in
+statements before the spawn or after the join — and a through-parameter statement gets a
+param-relative fact resolved by the walk's own bindings, which also puts it inside or
+outside an `@once` correctly. Two traps met on the way: `sync_descend` switches a WINDOW
+walk to the THREAD phase for callees, so "phase == THREAD" does not mean "a thread runs
+this" (use the walk's mode); and a finding downgraded to a warning because "the function
+has an @atomic somewhere" was a hole for every rule that no atomic elsewhere can repair.
+
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key
 built from `&tbl[i]` names a different slot per evaluation and re-broke the valid teardown

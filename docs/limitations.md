@@ -129,9 +129,13 @@ each a missing SUMMARY fact, not a missing key:
    g = mem + 1;` is refused (loud); (b) the split done in HELPERS called only from a handler
    (`interrupt T { rd(); wr(); }`) is not attributed to the handler — the handler side of the
    rule (a handler is not preempted by main) is the conservative half, the main side is the
-   lost update and is covered; (c) the SPAWN scan's sink does not read the global carrier
-   relation (a thread doing `vmem = g; g = vmem + 1` through a VOLATILE carrier; a
-   non-volatile carrier is already a refused plain access).
+   lost update and is covered; ~~(c) the SPAWN scan's sink does not read the global carrier
+   relation~~ — CLOSED (BUG-1652: both thread sinks now read the main checker's facts).
+   **Residuals of BUG-1652 (precision, loud):** the spawner's-window rule ignores locks — a
+   read-modify-write in the window under the same CAS lock the thread's store holds is
+   refused; a thread's unlocked read-modify-write is refused even when it is the flag's only
+   writer (use `@atomic_*`, or the `@once` form); the carrier relation is flow-insensitive,
+   so in `vm = g; g = vm + 1;` the diagnostic may name the carrier `vm` rather than `g`.
 8. ~~BUG-1625 sees a CHECKED body only~~ — CLOSED (BUG-1649): the post-pass over
    `Checker.sync_spawns` re-reads Handle auto-derefs in every body the checker finished after
    the spawn site. **Residual (precision, loud):** that late check does not apply the `@once`
@@ -157,8 +161,7 @@ What is machine-checked, and where the chain stops:
   enforces it on every program form. "100% data-race-free, proven" is therefore NOT a claim
   this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
   proven" is.
-- Still OPEN and accept-unsafe (each recorded above or in the older sections): a thread's
-  split read-modify-write through a VOLATILE global carrier (spawn-scan sink); a `*opaque`
+- Still OPEN and accept-unsafe (each recorded above or in the older sections): a `*opaque`
   field of a shared struct handed to / returned from a ZER function that casts it back; two
   pointers to one object the checker cannot name alike (`f(p, q)`, `q` from a call) at the
   lent-param pair; the handler-side split RMW done in helpers. `cinclude` code is a floor.

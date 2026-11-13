@@ -1,5 +1,14 @@
 # Compiler Internals — Read When Working on Specific Components
 
+> **How to use this file.** It is ~1 MB: do not read it end to end. `grep -n '^## '
+> docs/compiler-internals.md` is its table of contents; read the section you need.
+> Companion documents (split out of `CLAUDE.md` on 2026-11-13 so that the always-loaded file
+> stays small): **`docs/multi-site-classes.md`** — the registry of safety questions answered
+> at N sites (sites, the ONE query, the gate, the history); **`docs/session-playbook.md`** —
+> process lessons with their evidence (tests, audits, harvesting, debugging, proof standards).
+> A citation `CLAUDE.md "<title>"` below that `CLAUDE.md` no longer contains resolves to one
+> of those two files. Open gaps live in `docs/limitations.md`, never only here.
+
 ## ZER's Goal — Why This Compiler Exists
 
 **The locked architectural commitment** (full statement in CLAUDE.md "ZER's Goal" section + `docs/firmware_safety_extensions.md`):

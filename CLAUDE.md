@@ -1,5 +1,25 @@
 # CLAUDE.md
 
+> **This file is loaded into EVERY session, so it holds RULES and POINTERS only.** The long
+> form — case studies, per-bug history, full tables — lives in docs read on demand:
+>
+> | Need | Read |
+> |---|---|
+> | A safety question answered at N sites: its ONE query, its gate, its history | `docs/multi-site-classes.md` |
+> | Process lessons with their evidence (tests, audits, harvesting, debugging, proofs) | `docs/session-playbook.md` |
+> | Architecture, emission patterns, IR invariants | `docs/compiler-internals.md` (1 MB: `grep -n '^## ' docs/compiler-internals.md` is its table of contents — read the section, never the whole file) |
+> | Coq / Iris / VST | `docs/proof-internals.md` |
+> | What is open / deferred / over-rejected | `docs/limitations.md` |
+> | Past bugs and root causes | `BUGS-FIXED.md` |
+> | The language as users see it | `docs/reference.md`, `ZER-LANG-LLM.md` (compact) |
+>
+> An older doc citing `CLAUDE.md "<section title>"` that is not below: the section moved
+> verbatim (2026-11-13) — grep the title in `docs/session-playbook.md` or
+> `docs/multi-site-classes.md`.
+>
+> **Adding a lesson: one or two lines HERE, the story in the doc that owns it.** Nothing here
+> quotes counts, cell numbers or dated history — those drift. RUN the gate; count from the tree.
+
 ## ZER's Goal — Program-Consequence Coverage (Locked Architectural Commitment)
 
 **ZER's safety claim, stated precisely:**
@@ -55,554 +75,224 @@ ZER exists because escape hatches (Rust's `unsafe`, contract-based verification 
 - Architecture-agnostic (delegates ISA to GCC, vendor-specific to user libraries via cinclude)
 - Currently shipping (publicly available, VS Code extension, GitHub repo)
 
-### The Verification Endgame — 100% Sound Checker via Core λZER (LOCKED DIRECTION)
+### The Verification Endgame — 100% sound checker via core λZER (LOCKED DIRECTION)
 
-This is the formal-proof endgame for the Program-Consequence Coverage claim above.
-Full technical context: `docs/compiler-internals.md` "Verification endgame — core
-λZER + verified desugaring".
+Full text: `docs/session-playbook.md` "The Verification Endgame". The plan is WRITTEN:
+**read `docs/unified-oracle-proved-ZER.md` before any work on unification, oracles or the
+per-class safety architecture. Do NOT re-derive it.**
 
-**The goal (locked):** a machine-checked **100%-sound checker** —
-`accepted(p) → ∀ reachable config c, ¬ bad(c)` (if ZER accepts a program, no
-reachable state is a program-consequence UB), for ALL programs, over the REAL
-checker. This is the proof OF program-consequence coverage, not a new claim.
+- **Goal:** a machine-checked 100%-SOUND checker — `accepted(p) → ∀ reachable c, ¬ bad(c)` —
+  for all programs, over the REAL checker. Soundness is Rice-immune. 100% PRECISION is
+  impossible and is NOT a goal: an over-rejected program never runs, so it is harmless.
+  ZER is annotation-free, so the theorem certifies the auto-inference itself.
+- **Method:** core λZER (~15-20 semantic primitives) with TWO judgments — a type system
+  (statics; lives in `checker.c` on the AST) and an operational semantics (dynamics;
+  IR-shaped) — plus a VERIFIED desugaring and a forward simulation. A missing abstract
+  state is a diagram that will not close = a stuck proof. Not 53 per-node semantics.
+  Never say "core = IR" (that drops the type-system half).
+- **Scope:** language level. Floors, not failures: `cinclude` / C-FFI, hardware. Separate
+  axis: emitter + GCC — a sound CHECKER is not a verified compiler to asm.
+- **Sequencing:** not Coq-first while the C checker still moves. Core semantics + a UAF
+  vertical slice first, then class by class, then one `accepted → safe` theorem.
+  Oracle-driven always: spec against the SEMANTICS, never against current C.
+- **Current gap:** the per-class oracles prove each transfer sound over the states LISTED,
+  not that the listed states COVER the semantics.
 
-**Soundness, NOT precision — and that is what makes it reachable.** 100%
-SOUNDNESS (never accept an unsafe program) is achievable and **Rice-IMMUNE**.
-100% PRECISION (accept every safe program) is **impossible** by Rice and is NOT
-a goal — permanent over-rejection is harmless to safety (a wrongly-rejected
-program just never runs; no UB). Rice is the enemy of ergonomics, never of
-safety. Why this matters more for ZER than Rust: ZER is annotation-free, so ALL
-the trust sits on the inference — no human-supplied (checked) lifetime shares the
-burden. The soundness theorem is therefore not polish; it is the ONLY thing that
-can justify trusting a fully-automatic analysis. The theorem certifies the
-AUTO-INFERENCE itself (a stronger object than RustBelt's human-assisted system).
+## Critical gotchas (each cost at least one cycle — long form: `docs/session-playbook.md`)
 
-**Method — core λZER + verified desugaring + simulation (NOT all 53 node kinds).**
-A node kind is GRAMMAR; its MEANING is given by DESUGARING into a small core.
-Define a CORE λZER = ONE term language (~15-20 semantic primitives) with TWO
-judgments over it (TAPL/λRust shape): a **type system** (the "logic in types" —
-type resolution / optional / qualifier / provenance, which in the impl lives in
-`checker.c` on the AST = the STATICS) AND an **operational semantics**
-(small-step `step` + a `bad` UB predicate = the DYNAMICS). The core spans BOTH
-the AST (statics) and the IR (dynamics) layers — the IR is the flat CFG that
-"runs" so it grounds `step`/emission, but it is the EXECUTION half, NOT the whole
-core (do not say "core = IR" — that drops the type-system half). The 53 surface
-NodeKinds collapse to ~15-20 MEANINGS (for/while/do-while → loop+branch, orelse →
-branch, += → assign, range-for → index loop, …). Two safety halves to prove:
-**type safety** (preservation+progress on the statics — type-level correctness)
-AND **memory safety** (the flow-analysis invariants, by **forward simulation**
-from the operational semantics to the abstract analysis, excluding `bad`);
-**a missing abstract state = a diagram that won't close = a STUCK PROOF**, so
-"coverage / no missing state" is SUBSUMED by the simulation and the silent
-missing-state hole class (BH-18) becomes loud. All 53 are COVERED — via
-translation, not 53 separate semantics.
+**Build / tooling**
+- **Stale objects.** The Makefile has ZERO header dependencies. After touching ANY `.h` — or
+  whenever a `make zerc` build rejects trivial programs or segfaults on a test that just
+  passed — `rm -f *.o src/safety/*.o` before `make zerc`. Sanitizers cannot see this class;
+  `objdump` can.
+- **`make check` reports failure ONLY in its exit code.** Always record `MAKE_CHECK_EXIT=$?`.
+  Make stops at the first failing step, so every later gate silently never runs. Verify each
+  gate by ITS OWN verdict line (table below) — never `grep 'OK — no'`, which matches an
+  earlier gate. On a Windows checkout normalise CRLF first
+  (`find . -name "*.sh" -exec sed -i 's/\r$//' {} +`) or the run dies before the audits.
+- `make check` takes 5-25 minutes: run it in the background and wait on a status file; do not
+  poll by hand (`pgrep -x make`, not `pgrep -f`). `grep -c error build.log` lies
+  (`-Werror=switch` is on the command line); use `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.
+- **`zerc f.zer -o out.c` is the checker-only probe** (a `.c` suffix means emit only; exit 1
+  on a checker error). Any other `-o` path — `/dev/null` included — runs GCC, which rejects
+  for reasons of its own (every `interrupt` block on hosted x86-64) and builds the exe NEXT
+  TO THE SOURCE. Read the diagnostic, never the exit code.
+- **Windows host (the dev machine).** Never execute compiled binaries natively and never use
+  a writable bind mount (unsigned `.exe` = Defender Wacatac). Use `make docker-check`, or the
+  `:ro` mount + tar-into-container pattern (playbook "Ad-hoc Docker verify"; VST and lattice
+  variants beside it). An agent that compiles must be told the same; after any agent run,
+  `git status` + `git diff` — a "design only" agent may still edit files.
+- `test_modules/run_tests.sh` uses a relative `../zerc`: run it FROM `test_modules/`.
+- `audit_type_dispatch.sh` matches inside comments: never write the literal raw kind
+  comparison in a comment; in code use `type_dispatch_kind(t) == TYPE_X`.
+- Coq comments NEST: a C example like `(*opaque)` inside a `(* … *)` comment opens another.
 
-**The desugaring MUST be verified — this is what makes it 100%, not 90%.**
-`surface-sound = core-sound (simulation) ∘ desugar-preserving`. Formalizing all
-53 directly is a TRAP: it re-creates the uncompression/drift bug class (this
-session's form-coverage holes) INSIDE the trusted spec where no test catches it,
-and bloats the trusted artifact. Keep the trusted semantics small + hand-auditable;
-make the desugaring a CHECKABLE syntactic function with a preservation proof. ZER
-alignment: the **type system (statics) comes from `checker.c`/AST**, the
-**operational `step` (dynamics) is IR-shaped**, and the **desugaring-to-verify ≈
-the parser desugarings ∘ `ir_lower.c`** — all already exist as code (the IR is
-the execution half, not the whole core).
+**Compiler structure**
+- **Two emitter dispatch paths.** Every intrinsic / coercion / safety wrapper needs a handler
+  in BOTH the AST path and the IR-rewritten path of `emitter.c` (`grep -n '"name"' emitter.c`
+  must show two hits), or the IR path emits a placeholder that segfaults at run time.
+- **`type_name()` rotates TWO static buffers** (types.c): a third call in one `printf` /
+  `checker_error` overwrites the first. Copy each result into a local buffer.
+- **Entry points.** The compile path is `zerc_main.c` → `checker_check_bodies` +
+  `check_keep_inference` + `checker_post_passes_files`; `checker_check` is the LSP / unit-test
+  path. Wire a new deferred pass in BOTH. A whole-program pass goes INSIDE
+  `checker_post_passes_files`, which is fed every module — never a second call in the driver.
+- **Never hold two different shared-struct locks at once**: per-statement locking is what
+  makes lock order deadlock-free by construction.
+- **An AST node rewritten in place by `ir_lower` must survive a second lowering** (record it
+  through `hoist_undo` / `hoist_restore`); the shim and `test_firmware` lower twice — run
+  `test_firmware` after touching `ir_lower.c`.
+- **A terminator is the last instruction of its block** (`ir_add_inst_checked`; exit
+  consumers ask `ir_block_is_live_return`). A `defer` push without a reachable fire is a
+  hard `ir_validate` error. A new IR op needs its `ir_validate` case.
+- **A ternary between two FORMAT STRINGS switches `-Wformat` off**: use two calls.
+- **An exhaustive switch proves every kind was CONSIDERED, not considered correctly.** When
+  you put a kind in a no-op arm, write WHY it is a no-op.
+- Layout-fragile Heisenbug (vanishes under prints / ASan / `-O0`): env-gate code paths on the
+  SAME binary, `gdb` break + `bt`, `objdump` the emitted code (playbook, same title).
 
-**Scope — LANGUAGE LEVEL only. Explicit floors; do NOT chase them.**
-- **IN (the 100% target):** every program-consequence — every operation on a
-  value in ZER source.
-- **OUT (floors, not failures to verify — no language escapes them):**
-  **cinclude / C-FFI** (values from hand-written C are outside the language) and
-  **hardware** (physics).
-- **SEPARATE axis (not "unsafe", but not free either):** the **emitter**
-  (core→C) + **GCC** (C→asm). A 100%-sound CHECKER ≠ a 100%-safe BINARY without
-  emitter correctness; emit-C keeps GCC trusted (verify the emitter later, or
-  trust it). NEVER conflate "sound checker" with "verified compiler to asm."
+**Escape / keep analysis** (map: compiler-internals.md "Escape & keep analysis")
+- The policy for every call-result sink is ONE function, `call_result_escapes`; "which non-keep
+  params may this value carry?" is ONE query, `keep_value_roots`. Call them; never re-inline.
+- **Forming a reference aliases; reading a value does not.** A widened alias / escape rule
+  must be rooted at `&expr` or a slice; a bare `h.field` / `s[0]` reads a value out. Reading a
+  POINTER-carrying field yields a reference, a SCALAR field does not — gate every
+  field-reading alias arm on the field type (`test_modules/move_user.zer` broke twice on this).
+- Returning a view of a slice / pointer PARAMETER is allowed (the call site rejects a caller
+  that lets a local escape through it); returning a view of a LOCAL is not.
 
-**THE PLAN FOR THIS IS WRITTEN — read `docs/unified-oracle-proved-ZER.md` before doing any
-work on unification, oracles, or the per-class safety architecture.** 1100 lines, measured
-not recalled: why independent classes leak (every 2026-08 hole was one question answered at
-N sites), the Level A product spec, the shipped `handle_flow_lattice.v` template, the
-precondition trap that already cost two accept-unsafe holes, the AST->CFG migration table,
-and a phased sequence starting with the orphaned `vrp_ir.c`. Do NOT re-derive this.
+## MULTI-SITE SAFETY — the #1 recurring bug class
 
-**Builds on what exists — not a rewrite.** The per-class oracles
-(`param_lattice.v`, `handle_flow_lattice.v`, bounds/qualifier/capture/volatile)
-ARE the abstract domains X; `lambda_zer_concurrency` is the one worked
-operational instance (the prototype of the move). The endgame ADDS: the unified
-core semantics, the abstraction relation per class, and the simulation bridge.
-**Current gap:** the oracles prove the transfer is sound over the states LISTED,
-NOT that the listed states COVER the semantics — the coverage/simulation half is
-what's missing (it is why missing-state holes were red-team-found, not
-proof-found).
+The SAME semantic question is answered independently at N sites; a fix at one leaves the
+siblings broken, and a NEW site / node kind / value shape is silently missed. Every hole of
+this kind was red-team-found, never proof-found. **Before editing any analysis with this
+shape: (1) ENUMERATE the sibling set, (2) fix / verify EVERY member — a green test at one
+site proves nothing about the others, (3) add the new shape's cell to the class's gate IN
+THE SAME COMMIT.** The durable end-state is ONE query + a gate, never N call sites.
 
-**Sequencing — do NOT go Coq-first now.** Keep iterating the C checker until the
-design + memory model FREEZE (still finding holes ⇒ not frozen; Coq-first on a
-moving design freezes bugs into proofs). Build the core semantics + a **UAF
-vertical slice FIRST** (alloc/free/deref + the handle lattice + its simulation)
-to de-risk the whole architecture in one small proof; then generalize
-class-by-class over the same semantics; then compose into the single
-`accepted → safe` theorem. Oracle-driven always (spec against the SEMANTICS,
-never against current C).
+- **Choosing the gate.** Sites are a `switch` on an enum → `-Werror=switch`, no `default:`
+  (an if-chain over node kinds is invisible to both walker audits: convert it, do not
+  extend it). Scattered sinks → an audit-script baseline (`file:content`). "Do the listed
+  forms COVER the semantics?" → a Coq max-oracle.
+- **A gate that has only ever printed OK is a script, not a net.** Break the compiler on
+  purpose (or run the grid against a pre-fix build: `ZER_MATRIX_ZERC=<path> ./test_x_matrix`)
+  and watch it go RED — this applies to the gate's SCOPE as much as to its assertion.
+- **A stale gate is worse than none.** Remove the cell / baseline row when a site is unified
+  away; add one when a shape appears.
+- An EXEMPTION (`volatile`, `@once`, "scoped spawn is joined") is a multi-site class too:
+  grep every site granting it, and check each qualifier of its written rationale is TESTED.
 
-### Critical Compiler-Implementation Gotchas (avoid wasted-cycle rediscovery)
+**Index: class → the ONE query → gate.** The full row (the sites, the history, the traps)
+is in `docs/multi-site-classes.md` — READ THE ROW before touching the class. `pNN` = a
+SHAPE in `tools/sink_matrix.sh`; "conc" / "hw" = `tests/test_conc_matrix.c` /
+`tests/test_hw_matrix.c`.
 
-**Two emitter dispatch paths for intrinsics.** Every intrinsic needs a handler
-in BOTH `emitter.c` paths or the IR-rewriter falls through to a placeholder
-emission (typically `/* @intrinsic_name */ 0`) that segfaults at runtime:
-1. AST path — search `emitter.c` around line 2754 onward
-2. IR-rewritten path — search `emitter.c` around line 6451 onward
-
-When adding a new intrinsic, mirror the existing handler (e.g., `@ptrcast`,
-`@pun`) in both locations. Verify by searching `grep -n '"intrinsic_name"' emitter.c` and confirming TWO hits.
-
-**`type_name()` uses 2-buffer rotation (types.c:518-523).** Calling
-`type_name(t)` 3+ times in a single `printf`/`checker_error` overwrites
-earlier results because there are only TWO static buffers. Symptoms: error
-messages show the wrong type name in the third slot. Fix: capture each
-`type_name` result into a local `snprintf` buffer before formatting.
-Discovered in BUG-700 (session 2026-06-06); same hazard exists everywhere
-`type_name` is composed in a single expression.
-
-**STALE `src/safety/*.o` — the #1 phantom-bug trap (cost a full session 2026-06-19).**
-If a `make zerc`-built compiler spuriously rejects TRIVIAL valid programs
-(e.g. `error: expression nesting too deep` on `u32 main(){u32 x=5;return x;}`)
-but a `git archive HEAD | ... make zerc` or a single-`gcc *.c` build of the SAME
-source passes — **suspect a stale object file FIRST, do not debug the source.**
-Root cause that session: a corrupt `src/safety/comptime_rules.o` (from an
-OOM-interrupted build) whose `zer_expr_nesting_valid` read its arg from the
-wrong register (`%ecx` not `%edi`); its `.c` was older than the `.o`, so `make`
-never rebuilt it, and the OLD `make clean` removed only top-level `*.o` (now
-fixed to also `rm src/safety/*.o`). Diagnose in one step:
-`objdump -d src/safety/comptime_rules.o | grep -A4 zer_expr_nesting_valid:` —
-correct reads `%edi`. When testing a working tree in Docker, the `tar` includes
-these gitignored `.o`; **always `rm -f *.o src/safety/*.o` before a fresh
-build/test.** This class is invisible to valgrind/ASan/UBSan (arena/stale data
-reads "defined"; wild writes hit mapped memory) and vanishes under any
-instrumentation — sanitizers will NOT find it; an `objdump` ABI check will.
-
-**The SYSTEMIC form (found 2026-08-01): the Makefile has ZERO header dependencies.**
-`grep -cE '^\S+\.o:.*\.h' Makefile` returns **0** — no object rule names a header, so editing a
-header does NOT rebuild the units that include it. Harmless for a declaration-only edit; changing a
-STRUCT LAYOUT silently produces a MIXED-ABI binary (the edited `.c` sees the new layout, every stale
-`.o` sees the old). Symptom is identical to the stale-`.o` trap above: `make zerc` reports 0 errors,
-then SEGFAULTS on a test that passed a minute ago, while a `-O0` build of the same sources runs fine.
-**RULE: after touching ANY `.h` — especially `types.h`/`ast.h` — run `rm -f *.o src/safety/*.o` before
-`make zerc`.** (Cost a debug cycle adding a field to `struct Symbol`.)
-
-**Layout-fragile Heisenbug debugging (when sanitizers come up empty).** If a
-bug only appears in one exact build and disappears under prints/ASan/`-O0`: (1)
-env-gate suspect functions (`if(getenv("NK"))return;`) so you toggle code paths
-on the SAME binary (no layout change between tests); (2) `gdb` break at the
-error site + `bt` — a SHALLOW stack with a "deep recursion" error means a
-counter was corrupted, not real recursion; (3) `objdump`/`nm` the actual emitted
-code, don't trust the source. Full playbook: docs/compiler-internals.md
-"Layout-fragile bug debugging".
-
-**`make check` exit=2 is NOT always "just the CRLF artifact" — CRLF MASKS the
-audits (cost a debug cycle 2026-06-19e).** On a Windows checkout the `.sh` test
-runners have `#!/bin/bash^M` shebangs, so `tests/test_zer.sh` (Makefile line
-~166) fails Error 127 and `make` STOPS THERE — *before* reaching the audit gates
-that run last (`walker_default_audit.sh` ~182, `audit_type_dispatch.sh`,
-`audit_fixed_buffers.sh`). So a REAL audit failure (a new `default:` in a
-kind/op switch, a new raw `->kind == TYPE_` site, a new fixed buffer) is
-SILENTLY MASKED — the run dies at the CRLF script and never reaches the audit.
-The keep commit (856fbb0) shipped a walker-default violation this way. **Before
-trusting a green `make check`, normalize line endings so make reaches the
-audits:** `find . -name "*.sh" -exec sed -i 's/\r$//' {} +` (the Docker harness
-should always do this). A genuinely-green run shows `MAKE_CHECK_EXIT=0` AND the
-audit lines ("OK — no default: clauses…", "OK — no new raw type-dispatch
-sites"). exit=2 with those lines ABSENT means an earlier step (often CRLF)
-aborted make before the audits — investigate, don't wave it off.
-
-**A WHOLE-PROGRAM PASS MUST BE FED EVERY MODULE (2026-09-21, BUG-1037).** `checker_post_passes`
-took ONE AST and the driver handed it the main module's — so the deadlock check, `--stack-limit`,
-the Arena/Barrier init check and `*opaque` call provenance never looked at an imported module
-(measured: a two-shared-struct statement and a 1000-byte frame, both accepted once moved into a
-module). The sibling of the hook trap below, one level up: the pass was wired, and wired to the
-wrong SCOPE. `checker_post_passes_files` is the entry point now; a new post pass goes there.
-
-**A CHECKER HOOK MUST BE WIRED INTO `zerc_main.c`, NOT `checker_check` (cost a cycle
-2026-08-23).** `checker_check()` is NOT the compile-path entry point — `zerc_main.c`
-calls `checker_check_bodies()` + `check_keep_inference()` + `checker_post_passes()`
-directly. A new deferred pass added only to `checker_check` compiles, passes the C
-unit tests (which DO call `checker_check`), and never fires in `zerc`. This is the
-same "register in the always-run init" trap CLAUDE.md already records for
-`register_builtin_pair_types`; it recurs because the two entry points look
-interchangeable. Wire a cross-module deferred pass next to `check_keep_inference` in
-`zerc_main.c` AND in `checker_check` (for the LSP/test path). The one thing that
-exposed it was a one-line trace proving the predicate was never REACHED.
-
-**Ad-hoc Docker verify (binary-safe — binaries stay in-container, no Wacatac).**
-The Makefile `docker-*` targets are best, but for a quick targeted build+test of
-uncommitted edits use the read-only-mount + tar-to-`/build` pattern (NEVER a
-writable bind mount — that lands unsigned `.exe`s on the Windows FS = Defender
-`Wacatac`):
-```
-MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-check:latest bash -c '
-  mkdir -p /build && tar -C /src -cf - --exclude=.git --exclude=".git*" . | (cd /build && tar xf -)
-  cd /build && find . -name "*.sh" -exec sed -i "s/\r$//" {} + && rm -f *.o src/safety/*.o
-  make zerc >/tmp/b.log 2>&1 && make check >/tmp/mc.log 2>&1; echo "EXIT=$?"
-  grep -E "Passed:|FAIL|OK — no" /tmp/mc.log '
-```
-The `:ro` mount means the container can't write binaries to the host. Host-side
-source edits ARE picked up (the tar copies the edited tree in). **When running
-this via the Bash tool's `run_in_background`, invoke the `docker run …` DIRECTLY
-— do NOT also append a manual `& > "$OUT" 2>&1`.** Double-backgrounding orphans the
-docker child when the tool's shell exits → 0-byte output. Pick one: harness
-backgrounding (no `&`/redirect) OR a foreground redirect. (compiler-internals.md
-"Merge-back COMPLETE" lesson 3.) **Also: `test_modules/run_tests.sh` uses a
-RELATIVE `../zerc` — run it FROM `test_modules/` (`cd /build/test_modules && bash
-run_tests.sh`), NOT from `/build` (there `../zerc` = `/zerc`, missing → every test
-"zerc failed", a phantom regression). The other runners (`tests/test_zer.sh`,
-`rust_tests/`, `zig_tests/`) run fine from the repo root.**
-
-**Ad-hoc VST verify (Level-3 proofs — `zer-vst` image, non-root gotcha).** To
-check a `proofs/vst/verif_*.v` edit WITHOUT the full ~5-min `make check-vst`,
-targeted-run just that one predicate. Two traps: (a) the `zer-vst` image runs as
-NON-ROOT, so `mkdir /build` fails "Permission denied" — use `/tmp/build`; (b)
-`src/safety/*.v` is clightgen-GENERATED from the `.c` each run (never hand-edit
-it) — you edit `proofs/vst/verif_*.v` (the spec+proof):
-```
-MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-vst bash -c '
-  eval $(opam env)
-  mkdir -p /tmp/build && tar -C /src -cf - --exclude=.git --exclude=".git*" src proofs Makefile | (cd /tmp/build && tar xf -)
-  cd /tmp/build && clightgen -normalize src/safety/type_kind.c && cd proofs/vst &&
-  coqc -Q . zer_vst -Q ../../src/safety zer_safety ../../src/safety/type_kind.v &&
-  coqc -Q . zer_vst -Q ../../src/safety zer_safety verif_type_kind.v && echo VERIF_OK '
-```
-A `verif_X.v` importing only its own `zer_safety.X` is independent of the other
-~29 predicate files (`grep "Require.*zer_safety" proofs/vst/*.v` to confirm), so
-the targeted run is authoritative for that change. Full recipe (incl. adding a new
-TypeKind/enum value to a verified predicate): docs/proof-internals.md.
-
-**Ad-hoc lattice-oracle verify (Level-1 `*_lattice.v` — `zer-proofs` image).** A
-self-contained oracle (only `From stdpp Require Import base list.`, no other project
-`.v` — like `param_lattice.v` / `erased_ownership_lattice.v`) verifies standalone
-without the full ~10-min `make check-proofs`:
-```
-MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Users/andreas/ZER-LANG:/src:ro" zer-proofs bash -c '
-  eval $(opam env)
-  mkdir -p /tmp/build/lambda_zer_escape
-  cp /src/proofs/operational/lambda_zer_escape/erased_ownership_lattice.v /tmp/build/lambda_zer_escape/
-  cd /tmp/build && coqc -Q lambda_zer_escape zer_escape -w -notation-overridden lambda_zer_escape/erased_ownership_lattice.v && echo OK '
-```
-Same `-Q <dir> <ns>` mapping the full build uses ⇒ authoritative for that file.
-After it compiles, add the file to `proofs/operational/_CoqProject` (explicit list,
-not glob) so `make check-proofs` picks it up. **COQ COMMENT GOTCHA: Coq comments
-NEST**, so `(*opaque)` / `(*T)` / `(*Map` inside a `(* … *)` comment opens a NESTED
-comment → "Unterminated comment". Reword C-syntax examples in `.v` comments to drop
-the leading `(*<letter>` (write `opaque cast of &x`, `map_get(m,…)`). Cost 2 cycles.
-
-**Spawning agents (Agent/Workflow/Explore) for COMPILER work — two hazards
-(learned 2026-06-22, the hard way).** (1) Agents that compile **build NATIVELY on
-the host** (`gcc *.c -o zerc`, `./zerc /tmp/x.zer`) → create-execute-delete of
-unsigned `.exe` = triggers Defender Wacatac. If you must spawn them, tell them
-read-only / "do NOT compile or run" explicitly, or have them use the Docker pattern
-above. (2) A "map/design only" agent **may still EDIT source files** and leave them
-uncommitted — after any agent run on the repo, `git status` + `git diff` + `git
-blame` the touched lines (a 2026-06-22 design agent left an unnamed
-`root_is_shared_PROBE` edit in `ir_lower.c`). Verify + own anything an agent wrote
-before relying on it. For pure code-reading/design, the workflow IS efficient (keeps
-file content out of the parent context) — just gate it.
-
-**`zerc f.zer -o /dev/null` RUNS GCC (2026-09-21).** Only a `.c` suffix means emit-only;
-any other `-o` path — `/dev/null` included — builds an executable through GCC. So a
-negative probe spelled that way can be rejected by GCC and not by the checker (measured:
-an `interrupt` block accepted by the checker "failed" with GCC's *interrupt service
-routine can only have a pointer argument*). `tests/test_zer.sh` uses `-o /dev/null` for
-negatives and is saved by `// expect-error:` — the directive, not the exit code, is what
-proves the checker fired. For a checker-only probe by hand always use `-o out.c`.
-
-**`zerc -o <path>` gotchas when testing by hand.** (a) **CORRECTED 2026-08-17 —
-emit-C mode DOES return non-zero on checker errors** (measured: `zerc oob.zer -o
-out.c` exits 1). The old note here claimed exit 0 and is wrong. Prefer `-o out.c`
-for a negative probe: it isolates the CHECKER's verdict from GCC's, which matters
-because **GCC masks checker holes** — it refuses `__attribute__((interrupt))` on
-hosted x86-64, so EVERY test containing an `interrupt` block "rejects" regardless
-of what the checker did. Measured 2026-08-17: 11 ISR negatives and 3 sink-matrix
-cells passed for that reason alone. Still read the DIAGNOSTIC, never the exit code
-(see the `// expect-error:` rule). (b) `zerc f.zer -o /tmp/exe` for a non-`.c` path builds the
-exe **next to the source** (`f`), not at the `-o` path — to run, `cp f.zer /tmp/ &&
-zerc /tmp/f.zer && /tmp/f`, or just trust `make check`.
-
-**The type-dispatch audit (`audit_type_dispatch.sh`) greps `->kind == TYPE_` and
-matches inside COMMENTS too.** A doc-comment containing the literal `->kind ==
-TYPE_` trips it as a "NEW raw site" (cost a loop 2026-06-22). Reword comments to
-say "type-kind comparison", not the literal pattern. Real code: use
-`type_dispatch_kind(t) == TYPE_X` (no `->kind ==`, never trips).
-
-**Lock-completeness fixes must NEVER hold two different shared-struct locks at
-once** (the per-statement model's deadlock-freedom-by-construction). The whole Axis
-B family closed in place WITHOUT a global redesign by respecting this: read-locks
-compose (B1), copy-out-under-the-one-lock (B2), reject-don't-nest (B3), private
-once-flag not a struct mutex (B4). See compiler-internals.md "Axis B implementation".
-
-**Escape/keep analysis is a PER-SINK PATCHWORK — fixing one sink does NOT fix the
-others.** The "is this value frame-bound (local/arena-derived)?" question is
-re-implemented at every escape sink (store-to-global, return, keep-call-site,
-keep-inference, struct-field-store, spawn-arg), and several historically missed the
-same value shapes — a call-laundered local (`g = f(local[..])`), a slice-of-local
-arg, a pointer/slice FIELD of a local-derived struct, and (P9, 2026-06-24) a pointer
-FIELD of a non-keep by-value struct PARAM (`stash(Holder h){ g = h.p; }` — the keep-2a
-sink matched only a bare ident `g = h`, not `g = h.p`, so the launder compiled; fixed by
-descending the projection, certified by `param_lattice.v` T5). That single class produced
-BUG-760..763 + P9 (each a separate sink, same blind spot). **When editing escape analysis,
-re-run the FULL sink matrix** against those shapes; a green test at one sink proves
-nothing about the others. Shared proxy: `call_has_local_derived_arg` (checker.c ~880);
-flags: `is_local_derived` / `is_arena_derived` / `is_nonkeep_derived`; keep enforcement
-is a DEFERRED fixpoint (`check_keep_inference`, after all bodies). The durable fix
-(unify call-result provenance → one lattice query per sink, incl. the relational
-`PARAM(n)` = inferred `'a`) is tracked in limitations.md; **Stages 1+2 SHIPPED** —
-the per-function return summary `{Symbol.ret_summary_complete, Symbol.ret_param_mask}`
-(mask bit n = a return may be a view of param n), accumulated in the `NODE_RETURN`
-handler (`classify_return_root` → `Checker.cur_ret_*`), and the call-site query
-`call_result_static_given_args` (the substitution `resolve(R_f, argreg)`) gate the
-FOUR direct-call-result sinks: the call result is NOT tainted when the callee
-provably returns a global/static (`g = lookup(local)`) OR returns a SPECIFIC param
-whose actual arg is static (`g = second(local, global)`, returns param 1). Sound:
-defaults `{false,0}`; a param shadowing a same-named global is correctly ARParam(n)
-not static (`src == gsym` check — a fixed Stage 1 UAF). `arg_is_local_derived` is the
-extracted per-arg predicate (`call_has_local_derived_arg` loops over it). **Stages 1-3
-+ tail SHIPPED (subsystem RESOLVED).** The escape policy for all five call-result sinks
-(var-decl, assignment incl. struct-field-of-global, return, return-field, keep-call) is
-ONE function — **`call_result_escapes(c, call)`** (= `call_has_local_derived_arg` AND
-`!call_result_static_given_args`); use it, don't re-inline the predicate. keep-INFERENCE
-(**`keep_value_roots`**, BUG-1363 — the ONE "which non-keep params may this VALUE carry?"
-query, a bitmask read by every keep sink and every alias site: var-decl init, assignment
-incl. `*h =`, if/switch capture, spawn arg, keep-call edges) is a SEPARATE axis (it asks
-"does the value launder param p", not "is it static") with its OWN mask use: through a
-call it follows arg i only if the callee may return position i (an unresolvable callee:
-every arg). `Symbol.nonkeep_root_mask` holds the set — a single root dropped the others. Grounded by `param_lattice.v`. Full map + the read-only sink-enumeration workflow:
-compiler-internals.md "Escape & keep analysis". Returning a sub-slice/`&elem` of a
-slice/pointer PARAM is ALLOWED (BUG-764 relaxation); returning a view of a LOCAL is not.
-
-**The pointer-vs-scalar refinement (2026-08-06).** The rule below is right, but "reading a
-value" needs the FIELD TYPE. Reading a POINTER/slice/opaque field out of a tracked struct
-yields a REFERENCE and must alias (`*B vw = kk.p`); reading a SCALAR field yields a value and
-must not. Ungated, a summary arm treated `u32 verify(Token t){ return t.id; }` as a param view
-and re-broke `test_modules/move_user` — the SECOND time this exact class did so. Gate every
-new field-reading alias arm on the field being pointer-carrying.
-
-**FORMING a reference aliases; READING a value does not (2026-08-03e).** When widening any
-alias/escape rule to "view" expressions, the outermost node must be `&expr` or a SLICE. A bare
-`h.field` / `s[0]` READS a value out of the allocation and must NOT inherit its alias — peeling
-those propagated a move-struct's TRANSFERRED state and broke `test_modules/move_user`
-("use of transferred handle" on a freshly created token). Below a `&`/slice root, index/field
-steps are navigation within the same allocation and peel freely. `make check` caught this;
-reasoning about it did not.
-
-**MULTI-SITE SAFETY IS THE #1 RECURRING BUG CLASS — enumerate ALL sibling sites,
-never fix just the reported one, and gate the class so a new sibling can't silently
-regress.** The escape patchwork above is ONE instance of a GENERAL shape: the SAME
-semantic question is answered independently at N sites, so a fix at one site leaves the
-siblings broken AND a NEW site / node-kind / value-shape is silently missed (a "form →
-state coverage gap"). Every such hole to date was red-team-found, NOT proof-found — the
-two post-merge-back audit waves (40+ fixes) were almost entirely this class (escape ×N
-sinks, VRP-JOIN ×N node-kinds, array→slice coercion ×N value-flow sites, `?T`-hides-inner
-×N sinks, emitter AST+IR dual path). **Before editing ANY analysis with this shape:
-(1) ENUMERATE the full sibling set, (2) fix/verify EVERY member (a green test at one site
-proves NOTHING about the others), (3) wire/refresh a completeness gate.** Route the gate
-by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
-
-| Multi-site class | The N sites | Completeness gate (what to run / add) |
+| Class (the question) | The ONE query / helper | Gate |
 |---|---|---|
-| Escape / keep ("frame-bound?") | store-global, return, keep-call, keep-infer, struct-field-store, spawn-arg — and the DESTINATION side: `classify_escape_sink` asks whether ANY step of the target chain goes through a pointer / Handle / slice, not only the root (BUG-1309: `s[1] = &loc` via a slice param, `w.hp.p = &loc` via a pointer field of a local) | `tools/sink_matrix.sh` — **ADD A CELL per new shape** (a shape with no cell is INVISIBLE; yd5ajq grew it 32→41). `make check-sink-matrix` |
-| VRP range JOIN / POSITION (where an expression is evaluated vs where it is checked) | NODE_IF (§C#13 ✅), switch-arm, for-body, while/do-while body, do-while first-iter, goto/label — **the loop CONDITION** (BUG-1015: evaluated per iteration under the loop-carried range; all three drivers checked it under the pre-loop range) — **the for STEP** (BUG-1017: `for (k=0; k<8; k += a[k])` on a `u32[4]` proved `a[k]` against k in [0,0], emitted a bare `k += a[k];`, ASan stack-buffer-overflow, zero diagnostics) — **and the counter's LOWER bound** (BUG-1034: `[init, bound-1]` assumed the counter only goes UP; a SIGNED counter lowered in the body or by a decrementing step kept `[2,3]` while it went negative — a store BELOW the array. The upper bound is sound unconditionally (the condition is re-tested per entry); the lower bound is pushed only when the step is the counter's sole writer and a non-negative constant increment, via `ast_name_mutated_or_addrd`. Unsigned counters were safe by the clamp to 0, which is why every existing test passed). Only FIXED ARRAYS miscompile — a slice keeps its dynamic `.len` check, which is why no slice test could ever see any of the three | **`tests/test_vrp_position_matrix.c`** (11th matrix, in `make check`) — the checklist leaked THREE times so it is a gate. 20 cells (RUN it; the number drifts), construct x position: STALE cells must produce a bounds VERDICT (warning or error), PROVEN cells must produce SILENCE. Works because a proven fixed-array index emits literally nothing. Verified to FIRE: 4 silent holes against the pre-BUG-1017 build, 6 against the pre-BUG-1034 one. **A new control-flow kind, or a new POSITION an existing one evaluates, or a new way a counter can MOVE, needs its cell in the SAME commit** |
-| **VRP fact VALIDITY ("is the recorded range still TRUE of this variable here?")** | five routes, each a separate hole: IDENTITY (a shadow read the outer range — ranges were keyed by name), CONSTANT (untyped int64 fold vs the typed program; a plain assignment is rendered as bare-`int` C, a third reading), INVALIDATION (store through a pointer, call on a back edge, yield/await, an `&` that outlived its block), HOIST (the guard tested the index before the statement changed it), SUMMARY (return range read at body end) | **`tests/test_vrp_fact_matrix.c`** (12th matrix, RUNTIME oracle: exit 42 = the OOB access ran). ONE query each: `vrp_key_root` (identity), `vrp_const_value` / `vrp_const_value_untyped_render` (constants), `vrp_widen_global_like` + `Symbol.vrp_addr_taken` (invalidation), `vrp_guard_hoist_sound` + `checker_has_auto_guard` (hoist), `vrp_record_return_range` (summary). BUG-1090..1100. Verified to FIRE: 28 silent holes on the pre-fix build |
-| **"Is this NAME the global?" (identity, not existence)** | every frame-escape sink, keep/borrow recorders, block-lifetime roots — ~48 sites wrote `global_decl_lookup(name) != NULL` | ONE query **`name_is_global_here`** (BUG-1568: a local named like ANY global, imported ones too, was program storage to all seven frame sinks). A fact recorded BY NAME (borrow roots) is guarded by **`name_is_shadowed_here`** (BUG-1569). Whole-program SCANS over another function's body keep the name lookup (wrong scope chain there). Gate: **SHAPE p70 + p71 in `tools/sink_matrix.sh`** |
-| **Condition facts ("what does this TRUE / FALSE condition prove?")** | if then/else, the guard inverse after an if, `&&` / `||` RHS, while / for body entry | ONE helper **`vrp_push_cond_facts`** (BUG-1566), gated on **`vrp_cond_effect_free`** — a fact from a conjunct is stale if a later one writes the variable (the first draft proved `a[9]`). A VARIABLE bound reads that variable's current range (`i < n`, BUG-1607). Gate: the `&&`/`||`/`!`/relational cells in `tests/test_vrp_position_matrix.c` |
-| **Which CONTEXT runs a body ("is this helper main code or interrupt code?")** | the ISR global-sharing rule and the MMIO register-sharing rule | ONE reachability query **`isrref_body_isr_only`** over a whole-program reference walk (`isrref_compute`, BUG-1608): ISR-only = only DIRECT calls, all from handlers or ISR-only helpers, and not callable from C. Gate: the `isr-helper-*` / `isr-only-*` cells in `tests/test_hw_matrix.c` |
-| **A C function at the ZER boundary** | its prototype, every call site (two emitter paths), its module prefix | a bodyless function no module defines has NO prefix (`unprefix_c_externs`, BUG-1593); an `*opaque` in its signature goes through the `void *` bridge (`emit_c_extern_opaque_bridge`, BUG-1594 — a wrapper + function-like macro, so no call site changes); without a `cinclude` its prototype binds to the C symbol under a private name (`emit_c_extern_alias_decl`, `_ZER_CSYM`, BUG-1602) so it cannot conflict with a header; a VARIADIC argument must be a C scalar, a string literal crosses as `.ptr` (`variadic_arg_is_c_scalar`, BUG-1600); a slice / value-optional in a C function's signature is refused (`check_c_extern_signatures`, BUG-1606 — the alias had made it link silently). Gate: **`tests/test_lib.sh`** builds and runs `lib/` |
-| Node-kind walkers (any `switch` on `->kind`/`->op`) | every safety walker | `-Werror=switch` + `tools/walker_default_audit.sh` — NO `default:`; a new kind FAILS the build (strongest, free) |
-| Type-kind dispatch (`->kind == TYPE_X`) | 600+ sites | `type_dispatch_kind()` (unwraps distinct) + `tools/audit_type_dispatch.sh` baseline — a new raw site FAILS the gate |
-| Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
-| **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
-| **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
-| **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **Since BUG-1290 an UNRESOLVED funcptr at the spawn ARGUMENT falls back to every function of its signature (`funcptr_sig_racy_target`)** — the resolvers are now a precision layer, not the soundness boundary. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64). **Two more forms 2026-09-13 (BUG-994): a factory whose `return cb` sits in a SWITCH arm or a DO-WHILE body** — the two factory walks were if/else CHAINS one kind apart, a shape that BOTH walker audits are blind to; they are exhaustive switches now. And their NESTING cap (8, `return false`) was fail-open and reachable 9..63 — the BUG-976 enumeration had classified AST-nesting caps as safe; they are not. Now the parser's bound (64) with a report past it. **A twelfth form 2026-09-22 (BUG-1044): the `return cb` sits in an orelse-BLOCK fallback** — a statement body reachable only THROUGH an expression, which a walk over statement KINDS never enters. ONE helper `for_each_orelse_block` now opens every such block for the two factory walks, the forwarded-param walk, BOTH halves of the funcptr-field gate and (BUG-1047) the per-statement deadlock check; call it first in any new statement-shaped safety walk. **A thirteenth (BUG-1310, 2026-09-25): the binding lives in a GLOBAL's declaration initializer** (`const Ops ops = { .f = set }; ops.f()`, and every copy of `ops`) — no scan followed it, including the DEADLOCK summaries, where an indirect call was a call to nothing. ONE query: `global_bound_functions` (a read of a funcptr-carrying global) / `indirect_callee_functions` (any indirect callee), both ending at the signature set when the binding is not provable |
-| **The CARRIER of an incoming allocation** ("is this value a tracked allocation?") | the call-result registration in `zercheck_ir.c` AND `ir_type_is_ptrish` — and they must agree, because the second gates the first through `ret_is_borrow` | **SHAPE p26 in `tools/sink_matrix.sh`** (BUG-1023). Both sites listed POINTER/OPAQUE/HANDLE and NOT **SLICE**, so a heap slice arriving from a factory — the documented idiom for `alloc(T, n)`, which returns `?[*]T` — was never registered and UAF, double-free AND leak were all accepted (ASan: heap-use-after-free), while the DIRECT spelling of all three in one function was correctly rejected. **Fixing only the registration LOOKED like it worked and did not**: with SLICE still missing from `ir_type_is_ptrish`, a body calling `alloc(T,n)` was reported as making no allocation-capable call, so `ret_is_borrow` re-suppressed it — when a predicate GATES another, a missing carrier has to be added to BOTH. The p26 BOUNDARY cells (literal / param subslice / correct factory) are load-bearing: an ungated draft cost three corpus files |
-| **"Is this name ever written?" (trusting a declaration initializer)** | every caller of `global_name_never_mutated` (funcptr binding behind the deadlock / @critical / race / ISR scans, MMIO bound, stable aim, the pointer-word volatile) and every `ast_name_*` visitor | ONE walk `ast_name_writes_r` with a MODE (BUG-1609): a POINTER / slice / Handle name is written only by `name = v` / `&name` (a projection writes the pointee); anything else also by `name.f = v`, `name[i] = v`, a bit-slice store, `&name.f`, a view, a `\|*v\|` capture — `ast_name_part_mutated_or_addrd(…, scalar)`. A non-const global holding an ARRAY by value is never "unmutated". Measured pre-fix: `ops.f = sp;` left `ops.f()` resolving to its initializer — a two-lock statement and a spawn in @critical accepted. A new visitor must decide what `ANW_PART_*` / `ANW_CAPTURE` mean for it. Tests: `funcptr_global_*_bug1609` |
-| **Call-result VIEW ("which call is this value a view of?")** | the assignment, var-decl, return, keep-call sinks; field stores into a local carrier; a nested call argument | ONE peel **`value_escaping_call`** (BUG-1615): launders, `.f` / `[i]` / sub-slice, `&place`, both orelse arms. Five sinks peeled `.f` / `[i]` by hand. Gate: **SHAPE p74 in `tools/sink_matrix.sh`** (wrapper x sink) + p75 (union / optional-aggregate carriers at the var-decl sink) + p76 (the return summary reads the param SET) |
-| **A taint "kill" ("does this reassignment replace the value on EVERY path?")** | the assignment sink's flag clear | `bk_replaces` (BUG-1611..1613): not when the value mentions its own target (`t = t`, `t = id(t)`), not in a labelled function (`esc_fn_is_sticky`), not at a deeper `branch_depth` — and an orelse BLOCK and a `for` STEP are conditional bodies. Gates: **p72 + p73** |
-| **Assignment TARGET before VALUE** | THREE lowering sites: `lower_expr` NODE_ASSIGN, the statement-level `target = X orelse Y` (non-local target), the `for` STEP | `hoist_place_effects` + `hoist_target_indices` at each (BUG-1618); a bit-slice target is a place with parts (object indices + both bit positions). Symptom when one site lacks them: an UNCHECKED out-of-bounds store (the index was proven at the statement's start). Test: `tests/zer/assign_target_before_value_bug1618` |
-| **Allocation VIEW roots ("which slot does `&place` name?")** | `ir_view_set_of_value`, the ADDR-OF transfer, `ir_extract_compound_key`, `ir_global_projection_key`, the store sinks (G5), the freed-global note, the store summary (`ir_ps_target_rec`) | Roots that resolve: a local aggregate, a pointer holding ONE value (param / local bound once), a whole or nested global slot, a stable global pointer's aim (BUG-1620..1626). New roots are limited to places FIXED below the root (`ir_place_fixed_below_root`) — a variable-index view re-breaks the teardown loop. Summaries that read the AST ask **`ir_local_view_place`**. After teaching a key query a root, re-run store / reset / read / free / summary. Gate: **SHAPE p77** + `tests/zer/view_of_param_and_global_slot_teardown_bug1621` |
-| **Async re-entry ("can a callee run THIS task's body?")** | the emitted `_poll` / `_init`, and every analysis that assumed a callee might (VRP `vrp_widen_call_effects`, the hoist-soundness test) | BUG-1628: `_poll` wraps `_zer_pollrun_NAME` with a `_zer_running` flag and TRAPS on re-entry (so does `_init` of a running task); the BUG-1503 widening of every frame local at every call is REMOVED on that basis. A new way to name a frame field from outside the body re-opens BUG-1503. Tests: `zer_trap/async_reentrant_poll_*`, `tests/zer/async_call_keeps_frame_range_bug1628` |
-| **Funcptr REACH from a spawn ARGUMENT's type** | `funcptr_arg_sig_check` | `funcptr_first_reached` (BUG-1631) — by value AND through pointers / slices. `funcptr_first_carried` stays by-value (it decides which GLOBALS have an initializer binding) |
-| **ISR single writer (the tick-counter relaxation)** | `isr_rmw_regular_code_only_reads` | BUG-1610: a handler's RMW of a volatile single-word global is accepted only when one handler reaches it, no regular-code body assigns it, and its address is taken nowhere. Gate: the **SINGLE-WRITER grid in `tests/test_hw_matrix.c`** — one negative cell per conjunct |
-| **Launder peel ("does this wrapper preserve the value's provenance / allocation identity?")** | every escape/free sink in `checker.c` **AND** the alloc-identity sinks in `zercheck_ir.c` — the two files are ONE question, not two | `checker.c` → `unwrap_ptr_launder`; `zercheck_ir.c` → `ir_peel_launder`. Gate = **p15 (stack escape) + p15b (carrier x sink: heap/arena/keep) in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. **BUG-931 found EIGHT partial peelers, each knowing a different SUBSET of carriers** (`(*T)` / `@ptrcast` / `@pun` / `@bitcast` / `@cast` / `@container` / `@cstr`), so every carrier was rejected at some sinks and accepted at others — invisible to any single-sink test. When you add a launder-aware site, CALL the shared peeler; when you add a CARRIER, add its p15b cells. Two live constraints: `zercheck_ir`'s intrinsic set is an ALLOWLIST (peeling `@ptrtoint` would alias a scalar to an allocation), and a peel that yields a bare ARRAY is a decay only when the DESTINATION is a pointer (between two arrays it is a value COPY — that over-rejection broke `test_emit`'s volatile byte-loop case) |
-| **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the MAIN-side per-function summary (`func_rmw_param_mask`, a helper main calls) — three sites, and the third is not a body scan | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling). The SPELLING axis matters as much as the site axis: `g = @truncate(u32,g)+1`, `g = idfn(g)+1` and `g = maybe(g) orelse 0` were all accepted at BOTH sinks until BUG-841, because the underlying walker was an if-chain that returned "no" for unlisted node kinds. **The POSITION axis too (BUG-1043, 2026-09-22): `rmw_scan_body` was another if-chain, so `*p += 1` inside a switch arm / `@once` / orelse block / call argument / return value / if condition was invisible to the main-side summary ONLY** — the grid now crosses site x spelling x position with a `main` column, and its one positive cell (`spawn/param in @once`) pins the deliberate NODE_ONCE leaf in the spawn scan. **And the REACH axis (BUG-1046, same day): HOW the pointer to `g` gets to the helper** — a local alias as argument, a struct CARRIER (`h.p = &g; bump(h)`), a call through a funcptr local / global / field — three resolvers each knew one vehicle. ONE carrier fact (`carrier_value_global` -> the alias / carrier tables) + ONE barrier for an unresolvable callee (`callee_is_opaque_funcptr` -> a may-RMW with its own wording). The `carrier read-only` column is the boundary pin. **And the CALL axis (BUG-1561): either HALF of a split RMW done by a call** (`u32 t = rd(); wr(t + 1);`, the write through a pointer, a forwarding helper) — one lazy value-flow summary `vf_summary` (return carries global / param stored into global) read by `rmw_value_source_global`, `rmw_value_taints_global` and the two call sinks. **Since BUG-1564 every fact is a SET** — a local's taint holds several globals, a summary holds return sources and per-parameter destinations (incl. the object a pointer param points at), call cycles reach a fixpoint; the call sinks are ONE `call_rmw_globals`. **And the AIM axis (BUG-1124, 2026-09-23): a pointer RETARGETED after its declaration** (`void aim(){ gp = &g; }`, `p = &d; p = &g;`, a local COPY `r = gp`) — every resolver followed the declaration `&x` initializer alone. The set query is **`for_each_write_target`** (initializer + every `p = value` over every body for a global / the current body for a local, following `&x`, pointer copies and orelse arms; a visited set ends `p = q; q = p`), with `rmw_arg_targets` / `rmw_arg_targets_main` for arguments; the scans' alias table now holds several entries per name. Built on `ast_name_writes`, the visitor core of `ast_name_mutated_or_addrd`, so the two cannot disagree on coverage. A bare pointer name as a WRITE target (`gp = &h`) writes the POINTER — the `retarget-plain-store` boundary cell pins that |
-| **Value-flow compatibility ("may this value land in this destination?")** | var-decl init, assignment, call arg, return, spawn arg, struct-init field, orelse fallback, global init | ONE query **`value_flows_to`** (BUG-842). The GLOBAL init is the site most often forgotten: it lacked the designated-initializer typing (`validate_struct_init`) and the array -> slice EMISSION until BUG-1127, both masked because an older checker rule refused the shape first. The three-condition chain `!type_equals && !can_implicit_coerce && !is_literal_compatible` used to be written out at all EIGHT, which is exactly why a negative constant into an unsigned type was accepted at every one of them. Each site keeps its own wording; only the DECISION is shared |
-| **Two SPELLINGS of one operation ("does the assign form track like the var-decl form?")** | `x = pool.alloc()` vs `T x = pool.alloc()`; `b = a` vs `T b = a` for a `move struct` | ONE registration helper **`ir_register_alloc_result`** called by BOTH arms. The two spellings LOWER DIFFERENTLY — var-decl gives `IR_CALL` + `COPY`, assign gives ONE passthrough `%t = ASSIGN <NODE_ASSIGN>` in which **the target local is never any instruction's `dest_local`** — so every arm keying on `dest_local` silently saw a temp (BUG-933: UAF, double-free, leak and use-after-move all accepted). When you add tracking for an operation, write BOTH spellings as a test. Related: a walk over field types must include **ARRAY** as a carrier, and **exceeding a depth guard must return the CONSERVATIVE answer** — `ir_contains_move_struct_field_depth` returned "no move struct" past depth 32, so a 34-deep nest defeated tracking by being deep |
-| **A store / read THROUGH a pointer ("which object does `*p` name?")** | the store transfer, the store summary (`ir_ps_target_rec`), the local read, the global read mint — and a pointer FIELD one level down (`ss.s.p`) | ONE aim query **`ir_ptr_stable_aim`** (+ `ir_ptr_aim_set` for a weak store) and ONE field re-root **`ir_reroot_views`** (BUG-1366/1373). A key that stops at a pointer is a key under the WRONG root: the object's own name and the pointer's spelling were strangers, so a free through one was invisible through the other (single-function exit 99). Gates: **p53 + p55 in `tools/sink_matrix.sh`**. Validity comes from `checker_global_never_mutated`, which must see GLOBAL INITIALIZERS too (BUG-1367). **A VIEW is a (local, path) SLOT — or a candidate SET of them — bound by ONE resolver, `ir_view_set_of_value`** (`&place`, a viewing pointer, a call returning an argument) at every binding site (BUG-1395..1397): `*S p = &w.inner`, re-aims through calls / copies, a join of two branches, `pick(&s,&t,c)`. A store through a multi-candidate view is a WEAK store into every candidate. A new way to BIND a pointer needs the resolver, not a new arm. Gate: **p57** |
-| **Lock order ACROSS A CALL ("does the callee lock ANOTHER instance of a type this statement holds?")** | the statement's direct locks and every callee, transitively | the per-function shared-types summary records WHICH instance (`FuncSharedTypes.inst_*`: global / pointer param mapped through the call / any) and `lockchk_check_call` compares it with the statement's roots (BUG-1398). The same instance is the recursive re-entry and stays legal. Gate: **p58** |
-| **The ASSIGN spelling of a CALL** (`x = f(a);` vs `T x = f(a);` vs `f(a);`) | the passthrough `IR_ASSIGN <NODE_ASSIGN>` carries the call with NO IR_CALL | `ir_assign_call_value` runs the IR_CALL transfer on it (no dest) after the store (BUG-1371). Every call effect lives in the IR_CALL transfer; a lowering that keeps a call inside another instruction must route it there. Gate: **p54** |
-| **An allocation stored into a SLOT ("which entry tracks it?")** | the bare `slot = alloc(T)` spelling, the orelse spelling, a designated init, a NESTED init, a struct VALUE into a slot, a slot-to-slot copy — crossed with the slot's root (local field / local index / GLOBAL) | **SHAPE p25 in `tools/sink_matrix.sh`** (BUG-981/982/983, from `3sdup9`). Three mechanisms, each ONE query: `ir_register_alloc_result_compound` (the slot sibling of BUG-933's bare arm — `h.p = alloc(T);` was tracked NOWHERE while `h.p = alloc(T) orelse return;` was); `ir_global_projection_key` (G5 registered `(IR_GLOBAL_ROOT_ID,"g.p")` at the store and NO other sink could resolve it, so `free(g.p); g.p.v` was clean); `ir_carry_compounds` (a struct VALUE carries its allocations at FOUR sites — `H b = a`, `{.inner = i}`, the nested literal, `h.inner = i` — and only the first knew). Pre-fix the UAF RAN and returned a different live object's value; ASan cannot see it because `alloc(T)` recycles. **A plain `=` into a tracked slot is a RESET, not a use** — otherwise the diagnostic's own prescription (`g.p = null;`) is rejected |
-| **What a CALLEE FREES through a pointer-to-reference param** (`free(*s)` with `*?*T s` / `**T` / `*[*]T`) | the callee's slot `(param, "*")`, the summary, the caller's `&x` / forwarded param / stable-aim pointer | `ir_param_deref_slot` (entry mint, id disjoint from the param's own) + `FuncSummary.frees_param_deref` + ONE applier `ir_apply_param_deref_frees` (BUG-1548). Gate: **SHAPE p68** |
-| **Block lifetime ("does the destination outlive the BLOCK the value's storage lives in?")** | every assignment whose destination can hold a reference | `check_block_lifetime_escape` = `value_block_local` (value's storage root, via the BUG-969 borrow root) vs `storage_root_local` (destination), compared by `local_lifetime_level` (param scope + body top = one level, `Checker.fn_param_scope`) (BUG-1554). The frame sinks never asked this. Gate: **SHAPE p69** |
-| **What a CALLEE STORES of its params ("where did the argument go?")** | a field chain, an ELEMENT (literal / variable index / container push), the WHOLE object (`*s =`), an aggregate VALUE carrying the param, a GLOBAL (bare / element / literal) — crossed with the argument (reference vs aggregate) | ONE collector **`ir_ps_scan`** → `FuncSummary.param_store` (dst -1 = a global by its full key; `[*]` = an unnameable index) + ONE applier `ir_apply_param_stores` (BUG-1361/1352; BUG-1241 had recorded field chains only). Gate: **SHAPE p50 in `tools/sink_matrix.sh`**. A new store spelling is a case in the scan, never a second collector. **The APPLIER resolves the destination argument by key, and a slice has none** (BUG-1633): `link(hs, a)` is `hs[..]`, a sub-slice, a slice local bound once — each must be peeled to the array (`ir_stable_slice_local_def`), and a view of a slice param's element is nameable by a summary (`ir_place_summary_nameable`), not by a state key. The same three argument spellings apply to EVERY summary applier (`frees_param_elems` BUG-1632, `frees_param_field` across a second hop BUG-1634 — a place under the outer function's param or under a global must be re-recorded against that root) |
-| **A call argument that is ITSELF a call result** (`id(id(a))`, `unwrap(wrap(a))`, `wrap(a).p`) | the view query, the aliased-argument query, the funcptr barrier, the field-free widening, the free sink | ONE resolver **`ir_resolve_returned_arg`** (BUG-1360) — the inner call is a temp in the IR but the sinks read the ORIGINAL AST, where it had no key. Gate: **SHAPE p49** |
-| **Keep inference: which non-keep params does this VALUE carry?** | var-decl init, assignment (incl. `*h =`), if/switch capture, the persist sink, spawn arg, keep-call edges | ONE query **`keep_value_roots`** (a bitmask; `Symbol.nonkeep_root_mask`) + ONE taint `taint_nonkeep_from_value` (BUG-1363 — the alias sites stopped at any call / literal / orelse). Gate: **SHAPE p51** |
-| **A construct modelled as a FLAG rather than a node kind** | every rule the real node kind carries — for `orelse return`: the defer ban, the @critical ban, AND the return-type check | `orelse.fallback_is_return` reaches NO NODE_RETURN handler, so each rule must be RE-STATED beside the flag. Two were (defer, @critical); the third was not, and a bare `orelse return` in a `*T` function emitted `return 0;` — NULL from a type that promises non-null (BUG-974). **When you see a flag standing in for a statement, enumerate what the statement's handler does and check the list is complete.** The same shape covers `orelse break` / `orelse continue`. Gate: **p24 in `tools/sink_matrix.sh`** |
-| **Two shared structs in ONE spawn argument ("which mutex is held?")** | the STATEMENT collector (bare `spawn w(…)`) and the EXPRESSION collector (scoped `ThreadHandle th = spawn w(…)`, which arrives as a var-decl init) | ONE helper **`collect_shared_in_spawn_args`** at both (BUG-973). `NODE_SPAWN` was explicitly classified as "reads no shared struct" — the exhaustive switch forced the answer to be written down and the answer was WRONG. **The boundary is PER-ARGUMENT**: the emitter locks one shared root per ARGUMENT, so `spawn w(a.x, b.y)` is two correctly-held locks; only two shared types INSIDE one argument is the hazard (a first draft accumulated across args and rejected valid code). Gate: **p23 in `tools/sink_matrix.sh`** |
-| **Misaligned view into a packed struct ("can an access through this fault?")** | TWO operations, not one: address-of (`&p.w[0]`) and a SLICE VIEW (`p.w[0..]`, `[*]u32 s = p.w`, `fill(p.w)`) | `addr_of_is_packed_field` (peels INDEX — the gate demanded a DIRECT field access) + **`packed_array_field_view`** at the seven value-flow sinks (BUG-972). No `&` appears in the slice spellings at all, so ONE predicate could never cover both. Measured: `offsetof(w)==1`, so the emitted `uint32_t*` is at an ODD byte — hard fault on ARM/RISC-V, **merely slow on x86, so no hosted test can catch it**. **The slice rule keys on `type_alignment_bytes(elem)`, not on `packed` alone** — a `u8[]` field is safe to view and that idiom is what packed exists for. Gate: **p22 in `tools/sink_matrix.sh`** |
-| **Forming a slice over an ARRAY ("what does the view drop?")** | every value-flow sink: var-decl, assign, call arg, return, struct field, orelse fallback, spawn arg, global init | ONE `reject_array_view_hazards` (packed misalignment + `reject_array_view_qualifier_drop`, BUG-1057). **Since BUG-1516 the implicit coercion is made EXPLICIT in the AST** — `value_flows_to` (and the assignment / var-decl sinks, early) rewrite the value in place into `arr[..]` (`make_array_view_explicit`), so every reference-forming analysis (zercheck_ir views, escape, borrow roots) sees ONE spelling; the implicit spelling had been a plain READ to all of them (UAF exit 99, stack-use-after-return). The qualifier walk (`array_view_qualifiers`) must see a FIELD / pointer step: `kick(u.fifo)` on a `volatile *Uart` was coerced to a plain `[*]u32` and GCC deleted a FIFO store. The old rules keyed on a bare IDENT's Symbol at three sinks; the assign sink never called the packed reporter at all |
-| **Trusting a GLOBAL's declaration initializer ("is it still that value?")** | MMIO index bound (`@inttoptr` init), funcptr stack resolution (`*() gfp = leaf;`), ISR pointee (`*u32 gp = &g;`) | ONE whole-program query **`global_name_never_mutated`** (cached, walks `Checker.reg_files`, BUG-1056/1059e). A local asks the same of its own body (`mmio_bound_name_stable_in`, also requiring ONE binding). A per-statement update is never enough: a reassignment later in a loop reaches an earlier use on the back edge. The ISR pointee sink does not ask yet — limitations.md |
-| **Synthesized AST naming an IR local ("does it have a TYPE?")** | every ir_lower site that builds an identifier for a temp | ONE `make_local_ident` (BUG-1051). An untyped synthesized ident makes every `checker_get_type` consumer take its untyped fallback — `g = f() orelse return;` into an optional global emitted `T` into `?T` |
-| **A `shared(rw)` lock held across a CALL ("does the callee take it again?")** | the statement's DIRECT accesses and its callees' transitive ones — ONE question needing TWO collection modes | **RE-ENTRY GRID in `tests/test_conc_matrix.c`** (callee form x lock kind — the PLAIN column is what proves the rule is scoped). Implementation: `lockchk_direct_only` and its new mirror **`lockchk_callee_only`**, INTERSECTED (BUG-980). A COUNT can never see same-type re-entry: the full pass DEDUPES the callee's copy of a type the statement already touches, so `n` stays 1 and the `id0 != id1` guard excludes the case by construction. **A `pthread_rwlock` is NOT recursive** — a plain `shared` mutex is (`PTHREAD_MUTEX_RECURSIVE`), which is why the whole deadlock model assumed two DIFFERENT locks were needed. Measured: write-lock re-entry gives exit 0 and SILENT CORRUPTION (second `wrlock` = EDEADLK unchecked, callee runs unlocked, its unlock releases the CALLER's lock); read-then-write HANGS. Both modes run the SAME exhaustive collector, so a node kind cannot go missing in one of them. **A bare-name callee is not necessarily a function** (`fp()` where `fp` is a funcptr local is a `NODE_IDENT`) and **a bodyless extern is not opaque for this question** (C cannot name a ZER rwlock) |
-| **When a plain access is CONCURRENT ("is a thread running right now?")** | the fire-and-forget spawn, the scoped spawn, the join — and WHEN the code runs: a `defer` body runs at scope exit, after any detach in the function (BUG-1629) | **CONCURRENT-WINDOW GRID in `tests/test_conc_matrix.c`** (position x spawn-kind x access-kind). `after_spawn_in_func` was LATCHED by a fire-and-forget spawn and set by NOTHING for a scoped one, so the spawn..join window was exempt and the same race was accepted purely for its spelling (BUG-979). It is now REFCOUNTED — the join closes the window, but only the LAST live one, and never when a fire-and-forget spawn also ran. A new way to start or await a thread needs a cell |
-| **A window fact kept in TEXT ORDER ("is the thread running HERE?")** | the scoped borrow, `after_spawn_in_func`, the lent-param mask, lent globals, the atomic-downgrade phases — every fact set at a spawn and cleared at a join | BUG-1648/1651: text order is not execution order (goto; a `break` out of the window; another handle's join). A window is CLOSED only if no path leaves its interior with the thread running (`win_exits_live`) — then the textual rule is exact; otherwise OPEN, released only by its own handle's TAIL JOIN (`zer_window_join_releases`), borrowed from the entry in a labelled function. Proven: **`lambda_zer_concurrency/window_cfg.v`** (`window_sound` over any CFG). A new per-function window fact must be opened in `esc_latch_enter` and released only at the join. Gate: **jump x spawn-window grid in `tests/test_conc_matrix.c`** (the closed-pair and exit-after-join positives are load-bearing) |
-| **A copy of a volatile global held in MEMORY (split read-modify-write)** | a named local (BUG-1010), a global carrier, the object behind a local pointer, a callee's out-parameter, a loop back edge | BUG-1650: `mem_edge_add` / `check_mem_split_rmw` (whole program), `rmw_taint_maintain` (pointer + borrow root), `VfSummary.gin` + `main_call_gin`, `EscState.rmw`. Gate: **"RMW split through memory" in `tests/test_hw_matrix.c`** |
-| **Static locals in a race scan ("is this shared state?")** | the spawn scan (`scan_unsafe_global_access`) and the ISR scan (`record_isr_globals`) — their NODE_VAR_DECL arms were BYTE-IDENTICAL | ONE scan-scoped table + `static_local_record` at both (BUG-971). A `static u32 c` inside a function is ONE object for every thread AND for main-vs-ISR, but has no global-scope Symbol, and both scans resolve via `scope_lookup(c->global_scope, …)` — so NEITHER saw it. Table, not a threaded body root: the scan has SEVEN entry points. `check_interrupt_safety` also had to stop `continue`-ing on a name with no global Symbol. Exemptions match a global's (`const`, single-word `volatile`). Gate: **STATIC-LOCAL GRID in `tests/test_hw_matrix.c`** (SITE x SHAPE, so disagreement fails). ~~`test_hw_matrix` AUTO-DETECTS `./zerc` from the CWD and IGNORES argv[1]~~ — since BUG-1010 (2026-09-13) EVERY `tests/test_*_matrix.c` grid honours **`ZER_MATRIX_ZERC=<path>`**; that is how a new cell is shown to FIRE against a pre-fix build (`ZER_MATRIX_ZERC=/tmp/headb/zerc ./test_hw_matrix`) |
-| **Unique-resource COPY ("does this make a second owner of one buffer?")** | the seven value-flow sinks: var-decl init, global init, call arg, orelse fallback, struct-init field, spawn arg, return | ONE predicate **`unique_resource_name`** (recurses struct/union FIELDS + array elements) + ONE reporter **`reject_unique_resource_copy`** (BUG-970). Arena/Barrier/Semaphore were refused NOWHERE; Pool/Ring/Slab at ONE site only. `Arena b = a;` then one alloc from each returned the SAME BYTES. **Test the VALUE, not the target type** — `Arena.over(buf)` is FRESH, not a copy, which is why the old rule could only live at one site. **The RETURN sink is narrower on purpose**: returning a LOCAL is a MOVE (the idiomatic factory), returning a GLOBAL is a copy. **The remedy differs by type — MEASURE it**: `*Barrier`/`*Semaphore` params work, `*Arena`/`*Pool`/`*Slab`/`*Ring` do NOT (no methods through a pointer). Gate: **p21 in `tools/sink_matrix.sh`** |
-| **Scoped-spawn borrow ("what does this argument LEND to the thread?")** | the spawn-arg gate, and the three declaration sites that record what a pointer/slice/carrier points into | ONE recorded fact — **`Symbol.borrow_root_name`** (BUG-969), set at the DECLARATION (var-decl `&…`, slice-of-a-local, `h.p = &v` carrier) and read by the spawn sink. The gate used to require a LITERAL `&v`, so a pointer local, a struct carrier, a slice view, a pointer PARAM and a threadlocal alias lent NOTHING. **`is_local_derived` cannot answer this** — it is a boolean ("points into SOME local"), which is all the ESCAPE sinks need; the race is a write to the ROOT (`v = 3`), so the root must be NAMED. Two names are lent per argument — the root AND the argument itself (the only one available for a param, whose root is in the caller). Boundary matters as much: a SCALAR is copied. A lent GLOBAL (BUG-1118) is also refused to the parent's CALLEES in the window (BUG-1125) — through **`walk_callee_globals`**, the ONE "which globals does this code reach, through its calls?" walk the atomic-cell rule (G3) also uses; a second walker for it would be the two-coverage drift. Gates: **p20 + p32 in `tools/sink_matrix.sh`** |
-| **View into an allocation ("what does this view point into?")** | the interior-pointer alias, the slice-view alias, and the keep sink | ONE query per file — **`ir_view_root_ident`** (zercheck_ir.c) and **`keep_view_root_ident`** (checker.c), both peeling FIELD/INDEX/**SLICE** and seeing THROUGH a Pool/Slab `.get(h)` to the handle (BUG-968). Two holes lived in the old walk: `pool.get(h)` landed on a NODE_CALL so `&p.get(h).v` aliased nothing while `&h.v` worked; and a SLICE was never admitted as reference-forming, so `t.arr[0..]` aliased nothing **even on a heap pointer**. Cost: a stale view wrote into a recycled slot and corrupted a LIVE object (returned 99). **ASan cannot see it — `alloc(T)` is an auto-Slab, so `free()` recycles rather than returning to libc; demonstrate with slot REUSE and an observable wrong value.** DO NOT wire the checker twin into `arg_is_local_derived` — that asks "is this STACK memory?", and a slot is in the global Pool. Gate: **p19 in `tools/sink_matrix.sh`**. **The dual question — "which ROOT does a projection THROUGH a pointer view name?" — is BUG-984**: `*H hp = &h;` made `hp.p` and `h.p` two roots for one slot, so a free through one was invisible through the other (and a union `switch` capture reads through exactly such a hoisted `&u`, so a variant freed through its capture was a false leak). ONE fact (`IRHandleInfo.view_root_local`, joined as same-or-AMBIGUOUS) and ONE re-rooting in `ir_extract_compound_key`, so all ~36 sinks agree by construction |
-| **View-header write ("does this forge a bound?")** | the NODE_ASSIGN target (plain AND compound — one handler, one `assign.op`) and `&` | ONE query **`view_header_field`** (BUG-967). `[*]T` bounds safety is entirely the `{ptr,len}` header, so a writable `.len` forges any bound in one line — `s.len = 100; s[50] = 1;` compiled clean, RAN clean, wrote 46 bytes past a 4-byte array. **17 spellings measured before implementing; all 17 fall to the one query** (both fields, both assign forms, `&`, and through a struct field / nested struct / array element / pointer auto-deref / global / `orelse` unwrap / sub-slice / defer body). KEY ON THE OBJECT'S TYPE, NEVER THE FIELD NAME — user structs legitimately have `len` / `ptr` fields (`JString.len`, `Box.ptr`) |
-| **Defer-body statement coverage ("does this rule reach inside a `defer`?")** | was TWO statement emitters — `lower_stmt` (53 node kinds) and `emit_defer_stmt` (11) | Refactor L (BUG-959..966) lowers the body to IR so there is ONE path. A function WITHOUT a label splices it into the CFG; a function WITH one (`IRInst.defer_fire_emit_ast`, set by the sole constructor `make_defer_fire`) keeps the fire in C for the goto guard/ARMED flags and the emitter emits the body's IR TEMPLATE (`IRInst.defer_tpl`) inline there and at every C-level early exit — `emit_defer_body` (BUG-1298). zercheck_ir still checks a labelled function's body from its AST (`ir_defer_scan_uses` / `_frees`, both raw-AST checks at every position). Before it: `switch` / `do-while` / `@critical` in a defer body became a `_zer_trap`, and a shared read in a defer-body CONDITION took no mutex (B5 covered `NODE_EXPR_STMT` only) |
-| **Use-before-init ("did this resource ever receive its state?")** | Arena backing store, Barrier target | ONE deferred pass **`check_resource_init`** + `Symbol.resource_initialized`, run beside `check_keep_inference` so it sees every module. Both resources zero-initialise into a state that is USABLE but INERT (capacity 0 / target 0), which is why the failure is silent |
-| **Indirect call through a possibly-NULL funcptr** | THREE call emitters, not two: the decomposed `IR_CALL` (array element / struct field), `emit_rewritten_node` NODE_CALL (defer bodies), and `emit_expr` NODE_CALL (spawn args) | **`tools/emit_audit.sh` REQUIRED-FINGERPRINT case** (BUG-1019) — asserts the guard is PRESENT at all three and ABSENT on a direct call. A required-PRESENT gate, because the failure is a silent DROP: without the guard, hosted still faults into ZER's SIGSEGV handler and looks handled while bare metal jumps to address 0 with nothing to notice. Verified RED (3 missing) against the pre-fix build. Fix by calling `call_needs_null_funcptr_guard` + `emit_ir_call_callee`, never by re-deciding per site. **The rule is "guard unless the callee resolves to a function symbol" — NOT an enumeration of the null-producing carriers**: `B f = tbl[1]; f();` launders an array element's NULL into a bare name through a type-correct assignment |
-| **A privileged instruction chosen by target macros** (`@critical`'s interrupt-disable cascade) | one `#if` arm per target, crossed with bare-metal vs hosted — and a wrong arm is invisible to every host test: the hosted-ARM arms did not BUILD at all (so no ZER test could reach them) and hosted RISC-V built clean and faulted at run time on a machine-mode CSR | **per-TARGET required-fingerprint case in `tools/emit_audit.sh`** (BUG-1020). The choice is made entirely by the preprocessor, so defining a target's own macros and asking `gcc -E` which arm survives tests the real cascade with NO cross-toolchain (checked against real aarch64/armhf/riscv64 GCC; the simulation agreed). Verified RED on exactly the three broken targets. **Gate by the PRECISE fact, not by hosted-ness**: PRIMASK exists only on ARM M-profile, so that arm keys on `__ARM_ARCH_PROFILE == 'M'`; and AVR is deliberately NOT gated, because avr-gcc reports `__STDC_HOSTED__ == 1` and gating it would downgrade every AVR build to a fence |
-| **A forgeable scalar ("can this conversion yield a value outside the type's closed set?")** | enum, bool, value-optional presence byte — through `@bitcast` / `@truncate` / `@saturate`, carried at any depth or array size, at both emitter paths; asm outputs | the emitter's forgeable-scalar guard walk (BUG-1448/1449, UNCAPPED — a type walk needs no depth cap) + `bitcast_target_mints` (BUG-1432: no `@bitcast` INTO a pointer carrier / task frame) + unknown width refused (BUG-1406) + asm output must be integer or `?*T` (BUG-1408). A new conversion door or scalar with a closed value set needs the guard |
-| **The C NAME of a user identifier ("can it collide with C, libc, the runtime, or another scope?")** | a C keyword / header macro / libc function the runtime calls (`c_reserved_ident`, BUG-1446); a local shadowing a global (`local_avoid_global_name`, BUG-1409); names the emitter generates in user scope (`self`, `_b`, `_sa` — the fix_mod round renames them into `_zer_`) | a new emitter-generated identifier that can share a C scope with user code MUST be `_zer_`-prefixed; a new declaration class must be routed through `c_reserved_ident` |
-| **Escape taint POSITION ("does the sink see a taint set LATER in the text?")** | a loop back edge, any goto (forward too), a defer body — at every escape sink | **the escape fixpoint** in `check_func_body` (BUG-1402): per-loop gained facts, flow-insensitive under a label, "ever" facts for a defer body, re-walk only on an `event`. Gate: **p61 in `tools/sink_matrix.sh`**. A new realloc'd `Checker` table or a new body-created DEFINITION must be listed in `esc_restore` — the table half is GATED by `tools/audit_esc_restore.sh` (in `make check`, verified to go RED) |
-| **A value LOADED out of memory that auto-zero may have forged ("can this load yield a NULL `*T` / a 0 that is no enum variant?")** | every load of a field / element / `*pp`: the `emit_expr` and `emit_rewritten_node` entries (both now thin wrappers over `*_impl`) and the IR's own IR_FIELD_READ / IR_INDEX_READ / IR_UNOP-deref | ONE predicate **`load_guard_kind`** (BUG-1152/1175) + `nn_guard_wanted`. Guard the LOAD, never the dereference: locals/params are non-null by construction, so the loads are the only entry points and no launder exists. The assignment TARGET and the `&` operand are exempt via `Emitter.nn_lvalue` (set by the wrapper from `nn_lvalue_of`). `*opaque` is a struct — its test reads `.ptr` (`nn_null_member`). Tests: `tests/zer_trap/nonnull_*`, `enum_no_zero_variant_*` |
-| **A struct LITERAL's field value ("is it frame-bound?")** | var-decl, assign (global AND local target), return, call arg (keep), spawn arg, Ring push | `struct_init_has_local_derived` gates each field on the DESTINATION field type and asks **`arg_is_local_derived`**, which now handles NODE_STRUCT_INIT itself (BUG-1158..1160). A literal has NO type of its own (`check_expr` returns void) — type it against the target BEFORE any gate reads it (the spawn and assignment sinks used to type it after). Gate: **p35 in `tools/sink_matrix.sh`** |
-| **A write INTO a union variant that is not the whole variant by `=`** | compound op on a variant, sub-field / element write, the uN store intercept, both emitter paths | ONE detector **`union_partial_write_target`** + **`emit_union_reset_prefix`** (BUG-1161): reset the union to zero when the write changes the active variant. Tracked, not banned — a ban broke `m.a.x = 1` on a fresh union. The checker refuses only a path with a side effect (`union_path_has_side_effect`), because the reset evaluates it twice |
-| **The runtime type tag a `*opaque` carries** | every `*T -> *opaque` wrap and `*opaque -> *T` unwrap (ptrcast, C-cast, IR_CAST) vs `@pun` | **`opaque_type_id`** (scalars get a reserved high-bit id, BUG-1166) vs **`opaque_type_id_nominal`** for `@pun`, whose advertised check is struct/enum/union only and is mirrored by the checker's `pun_type_id_check_can_fire`. Do not re-inline the struct/enum/union triple — it was seven copies |
-| **An async TASK ("what does the task hold, and who runs while it is suspended?")** | `_init` (stores every argument), `_poll` (runs the body), `yield`/`await` (the poller runs), the task VALUE (self-referential), the whole-program scans | Five mechanisms, one per site (BUG-1231..1243): per-call keep sig `async_init_keep_sig` (checker); carried entries + poll free-summary replay `ir_async_task_call` / `FuncSummary.polls` (zercheck_ir); `ir_suspend_barrier` at IR_YIELD/IR_AWAIT; `unique_resource_name` + a `*` deref names an existing task; the `_poll` Symbol's `func_node` IS the async decl so every scan that descends a callee follows a poll. Gate: **p40 in `tools/sink_matrix.sh`**. A new way to START, RESUME or HAND AROUND a task needs a cell. `_init` deliberately has NO `func_node` (it runs none of the body) |
-| **Which FRAME holds an array that becomes a view?** | array→`[*]T` coercion at every value-flow sink, a sub-slice, a slice-binding taint, the return-array sink, `arg_is_local_derived` | ONE query **`array_storage_frame_root` / `array_view_frame_root`** (BUG-1354). Every site walked to the ROOT ident and asked whether the ROOT was an array, so an array FIELD of a local struct (`[*]u32 s = w.a; return s;`) was "not local" and a BY-VALUE struct PARAMETER was exempted as caller memory with the array params. The storage is someone else's only through a pointer/slice step or at a global / static / array-pointer-slice PARAMETER root. Gate: **SHAPE p60 in `tools/sink_matrix.sh`** |
-| **User mode vs bare metal in emitted `#if` cascades** | `@critical` begin/end arms (and any future privileged-instruction arm) | the preamble macro **`_ZER_USER_MODE`** = hosted C library AND an OS macro (BUG-1342). `__STDC_HOSTED__` alone is wrong: newlib bare-metal toolchains report 1. Gate: the newlib rows in `tools/emit_audit.sh`'s per-target `@critical` table |
-| Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
-| **Enum-forge doors** ("can this conversion produce a non-variant?") | `@bitcast`, `@truncate`, `@saturate` — and `@cast` verified NOT to be one | the three `tests/zer_trap/*_enum_forged_*.zer`. Patched THREE times across three sessions before the door set was written down; each fix closed one door and left the siblings |
-| **Rendering a `double` into emitted C** | every float-literal emission site (was FIVE: AST float lit, AST comptime-float call, IR float lit, IR comptime-float call, IR_LITERAL) | ONE helper `emit_double_lit` + **`tools/audit_float_literal.sh`** (BUG-991, in `make check`). `%.17g` is exact for FINITE doubles and prints the non-C tokens `inf`/`-inf`/`nan` for the other three, so `f64 x = 1e400;` emitted `x = inf;` and GCC blamed the user's `.zer` line. The gate greps for any float conversion specifier outside the helper and was verified to go RED. Sibling: the float->int saturation LIMITS are now one `f2i_limits` shared by the statement form and the new CONSTANT form `emit_f2i_const` (BUG-990 — a global `u32 g = (u32)1e20;` emitted a statement expression at file scope, illegal C) |
-| **A constant MMIO address ("what address does this `@inttoptr` designate?")** | the `@inttoptr` range/alignment gate, the direct `[N]` index bound, the local var-decl `mmio_bound`, the global var-decl one | ONE query **`mmio_const_addr`** (BUG-996). All four called plain `eval_const_expr`, which folds LITERALS and not a `const` ident — and real firmware ALWAYS names its base addresses, so the common shape was over-rejected on the bound side and DEFERRED to a runtime trap on the gate side. Do not re-inline `eval_const_expr` at a new MMIO site |
-| **"Does this expression mention name X?" (the RMW read side)** | was `expr_mentions_name` AND `expr_mentions_global` — two if/else chains with DIFFERENT coverage | ONE no-`default:` walker (BUG-999). Neither listed NODE_STRUCT_INIT, so `g = pick({ .a = g }).a + 1` was a plain store at both race sinks. **The if-chain form is invisible to BOTH walker audits** — BUG-856 wrote that down, BUG-994 hit it again on the factory walks, BUG-999 on this pair. When you meet an `if (n->kind == ...)` chain in a safety walker, convert it; do not extend it |
-| **An intrinsic's ADVERTISED runtime check** ("does the trap the docs promise actually get emitted for THESE operand types?") | `@pun` type_id (BUG-988), `@inttoptr` enum reads (BUG-989), `@container` provenance (BUG-987) — all from `qo0mm9`/`ef9cao` | NO auto-gate — a checklist question. For each intrinsic that promises a runtime check, ask **for which operand types is the emitted check a compile-time constant, or absent entirely?** `@pun`'s was `type_id != TGT && type_id != 0` where only struct/enum/union pointees carry an id, so ANY primitive operand folded it to false — `@pun(*P, u64ptr)` turned an integer into a working pointer with no `@inttoptr` and no `mmio` declaration (wrote 42 through it), a forged enum dispatched to an arm, a forged slice `len` was trusted by every bounds check. And a struct-to-struct pun between DIFFERENT structs always traps (the ids differ statically), so "runtime-checked" there means "runtime-refused". The tell is a comment that already NAMES the mechanism as broken while fixing only one consequence of it (BH-18 #4 closed the WIDENING half and wrote down that the trap is skipped for primitives). Fix: `type_carries_forgeable` (exhaustive, no `default:`) + `pun_type_id_check_can_fire`, which MIRRORS the emitter and must change with it. `@container` had a two-valued domain for a three-valued fact (`&i` of a whole object folded into "unknown, allow" and read BEFORE the object — ASan stack-buffer-underflow); `Symbol.is_whole_object_addr` is the missing state, written only through `set_container_prov_*`, and BOTH sinks (ident and direct `&`) resolve through one `classify_amp_operand` |
-| **Naming a SLICE typedef ("which C type is `[*]E`?")** | emit_type TYPE_SLICE, emit_type `?[*]T`, the NODE_SLICE literal, the array->slice cast, `alloc(T,n)` | ONE query **`emit_slice_name`** + the exotic-element registry (`collect_exotic_slices` / `flush_exotic_slices`) + **`emit_ptr_to_elem`** for the `ptr` declarator (BUG-1027). Three switches each listed primitive/struct/union and let EVERY other element kind fall through an exhaustive case list into the `TYPE_UINT` arm — `[*]State`, `[*]?*T`, `[*]Handle(T)`, `[*]?u32`, `[*]Op` were all `_zer_slice_u128` (16-byte stride, silent wrong reads). **An exhaustive case list with a shared fall-through arm is the same defect as a `default:`** — the walker audits are blind to it. Gate: `slice_elem_*_bug1027` positives (one per element kind); a new element KIND is one arm in `xslice_suffix_append` (`-Werror=switch`) |
-| **Raw-AST argument positions in zercheck_ir ("did the UAF walker see this expression?")** | builtin method args, `free(...)`, SPAWN args, asm operands, orelse subject, AWAIT condition, and every callee FORM of NODE_CALL | every raw-AST position calls BOTH `ir_check_expr_uaf` and `ir_check_expr_wrong_pool` (BUG-1025 added spawn args, the await condition, and the NODE_INDEX callee). Gate: `tools/audit_walker_fields.sh` baseline (a new unvisited field is a baseline change you must justify) + the `*_bug1025` negatives |
-| **Documented examples** ("does the reference still compile?") | every ```zer block in `docs/reference.md` | `tools/audit_reference_examples.sh` + `tools/reference_example_baseline.txt` — IN `make check` (the 8th gate). Twice the docs asserted a feature the parser did not have (funcptr arrays, bit-extract through a pointer). Since 2026-09-23 a block with its own `main` is also BUILT and RUN (must exit 0 — two doc programs had been returning 1 and 159), and `<!-- audit: expect-error: TEXT -->` / `expect-trap: TEXT` / `compile-only: REASON` are ENFORCED (expect-error had been written five times and checked zero times). A first-line `// zerc-flags:` passes flags. `ZER_REF_RUN=0` checks only. **A block that is not RUN is still GCC-syntax-checked** (2026-09-23, BUG-1127) — a `@pun` example at global scope had "compiled" for months while emitting a statement expression at file scope; only `interrupt` / `cinclude` blocks are exempt (a hosted GCC cannot judge them) |
-| New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
-| **A whole-program POST PASS ("does this rule see EVERY module?")** | `check_call_provenance`, `check_stack_depth`, `check_lock_ordering`, `check_builtin_init` — all four ran on the MAIN module's AST only (BUG-1037): a two-shared-struct statement in an imported function was never a deadlock, an imported callee's 1000-byte frame counted as 0 under `--stack-limit` | ONE entry point **`checker_post_passes_files(c, files, n)`** fed every module in topo order by `zerc_main.c`; `checker_post_passes(c, f)` is its one-file wrapper for `checker_check` / the LSP. A NEW post pass goes inside `checker_post_passes_files` (per-file passes under `ZER_ENTER_FILE`, whole-program passes once) — never a second call site in the driver. Gate: `test_modules/{deadlock_user_negative,stack_user_negative,arena_user}` |
-| **The C NAME of a container GLOBAL declared in a module** (`Pool`/`Ring`/`Slab`/`Arena`) | its declaration arm in `emit_global_var_inner`, the IR builtin-method RECEIVER (`emit_builtin_inline`), the THREE Handle auto-deref sites (`h.field` → `pool.get(h)`), the AST-path receiver (still unprefixed — limitations.md) | `emit_module_global_name` + `emit_alloc_sym_cname` (BUG-1040). The general global path has mangled `mod__name` since BUG-218; these arms bypassed it, so a module's `Arena scratch` was `scratch` at its declaration and `arena_lib__scratch` from main. Gate: `test_modules/arena_user` |
-| **The return-range summary's REACH ("which `return`s did `find_return_range` union?")** | every statement kind AND every expression POSITION that can hold an orelse-block: if/while/do-while COND, for init/cond/step, switch subject, await cond, spawn args (BUG-1035 — the conditions were skipped, a `return 9` in `if ((mb(x) orelse { return 9; }) > 0)` was dropped and `arr[pick(k)]` lost its check) | ONE scanner `scan_expr_orelse_returns` at every position; giving up (false) on an underivable buried return keeps it conservative. A new expression position needs the call. Gate: the three `tests/zer_trap/return_range_orelse_in_*_bug1035.zer` |
+| Escape / keep: is this value frame-bound? (source AND destination side) | `call_result_escapes`, `arg_is_local_derived`, `classify_escape_sink` | sink matrix — a shape with no cell is invisible |
+| VRP: where an expression is evaluated vs checked (loop cond, for step, counter lower bound) | loop-carried ranges; `ast_name_mutated_or_addrd` | `tests/test_vrp_position_matrix.c` |
+| VRP: is the recorded range still TRUE here? (identity, constant, invalidation, hoist, summary) | `vrp_key_root`, `vrp_const_value`, `vrp_widen_global_like`, `vrp_guard_hoist_sound`, `vrp_record_return_range` | `tests/test_vrp_fact_matrix.c` (runtime oracle) |
+| Condition facts: what does a true / false condition prove? | `vrp_push_cond_facts` gated on `vrp_cond_effect_free` | vrp-position matrix |
+| Return-range summary: which `return`s were unioned? | `scan_expr_orelse_returns` at every expression position | `zer_trap/return_range_orelse_in_*` |
+| Is this NAME the global? (identity, not existence) | `name_is_global_here`, `name_is_shadowed_here` | p70, p71 |
+| Is this name ever written? (trusting an initializer) | `ast_name_writes_r` (mode), `global_name_never_mutated` | `funcptr_global_*_bug1609` |
+| Which context runs a body: main or interrupt? | `isrref_body_isr_only` | hw `isr-helper-*` / `isr-only-*` |
+| A C function at the ZER boundary (prefix, `*opaque` bridge, alias, variadic, signature) | `unprefix_c_externs`, `emit_c_extern_opaque_bridge`, `emit_c_extern_alias_decl`, `variadic_arg_is_c_scalar`, `check_c_extern_signatures` | `tests/test_lib.sh` |
+| Node-kind walkers | exhaustive `switch`, no `default:` | `-Werror=switch`, `walker_default_audit.sh`, `audit_walker_fields.sh` |
+| Type-kind dispatch | `type_dispatch_kind()` | `audit_type_dispatch.sh` |
+| A wrapper hides the inner kind (`?T`, distinct, array, struct carrying a pointer) | `type_carries_data_pointer`, `type_can_carry_pointer`, `escape_type_carries_ref` | `audit_carrier_dispatch.sh` (emitter.c excluded on purpose) |
+| `volatile` race-check exemption | `volatile_global_exempt_from_race_check` | hw SITE x SHAPE volatile grid |
+| Spawn-arg gates: does this arg let the child reach my memory? | `type_carries_handle`, `type_carries_nonshared_pointer` | conc CARRIER grid |
+| Funcptr REACH: which function does this callback run? (spawn AND ISR sinks) | `scan_funcname_binding`, `scan_returned_funcname`, `func_forwards_param_to_spawn`, `funcptr_sig_racy_target`, `global_bound_functions`, `indirect_callee_functions`, `for_each_orelse_block`; from an argument's type: `funcptr_first_reached` | conc REACH grid + ISR sub-grid |
+| Non-atomic RMW on a shared global (site x spelling x position x reach x call x aim) | `resolve_write_target_global`, `assign_reads_own_target`, `for_each_write_target`, `vf_summary`, `call_rmw_globals`, `carrier_value_global` | hw RMW FORM grid |
+| A copy of a volatile global held in MEMORY (split RMW) | `mem_edge_add` / `check_mem_split_rmw`, `rmw_taint_maintain`, `VfSummary.gin` | hw "RMW split through memory" |
+| ISR single writer (tick-counter relaxation) | `isr_rmw_regular_code_only_reads` | hw SINGLE-WRITER grid |
+| Static locals in a race scan | `static_local_record` | hw STATIC-LOCAL grid |
+| When is a plain access CONCURRENT? | refcounted `after_spawn_in_func` | conc CONCURRENT-WINDOW grid |
+| A window fact kept in TEXT ORDER (is the thread running HERE?) | `win_exits_live` (closed vs open), `zer_window_join_releases`, `esc_latch_enter`; proven: `lambda_zer_concurrency/window_cfg.v` | conc jump x spawn-window grid |
+| Scoped-spawn borrow: what does this argument LEND? | `Symbol.borrow_root_name`, `walk_callee_globals` | p20, p32 |
+| A `shared(rw)` lock held across a call | `lockchk_direct_only` ∩ `lockchk_callee_only` | conc RE-ENTRY grid |
+| Lock order across a call (another INSTANCE of a held type) | `FuncSharedTypes.inst_*`, `lockchk_check_call` | p58 |
+| Two shared structs in ONE spawn argument | `collect_shared_in_spawn_args` | p23 |
+| An async task: what it holds, who runs while it is suspended | `async_init_keep_sig`, `ir_async_task_call`, `ir_suspend_barrier`; re-entry traps (`_zer_running`) | p40, `zer_trap/async_reentrant_poll_*` |
+| Launder peel: does this wrapper keep provenance / allocation identity? | `unwrap_ptr_launder` (checker), `ir_peel_launder` (zercheck_ir); `orelse` is a JOIN → `value_frame_bound_symbol` | p15, p15b |
+| Call-result VIEW: which call is this value a view of? | `value_escaping_call` | p74, p75, p76 |
+| A taint "kill": does the reassignment replace the value on EVERY path? | `bk_replaces` | p72, p73 |
+| Escape taint POSITION (back edge, goto, defer body) | the escape fixpoint in `check_func_body`; `esc_restore` | p61, `audit_esc_restore.sh` |
+| Block lifetime: does the destination outlive the block? | `check_block_lifetime_escape` | p69 |
+| A struct LITERAL's field value | `struct_init_has_local_derived` → `arg_is_local_derived` | p35 |
+| Which FRAME holds an array that becomes a view? | `array_storage_frame_root`, `array_view_frame_root` | p60 |
+| Forming a slice over an ARRAY (qualifiers, packed) | `reject_array_view_hazards`, `make_array_view_explicit` | — |
+| Misaligned view into a packed struct | `addr_of_is_packed_field`, `packed_array_field_view` | p22 |
+| View-header write (`s.len = …`) | `view_header_field` | — |
+| Unique-resource COPY (Arena / Pool / Ring / Barrier …) | `unique_resource_name`, `reject_unique_resource_copy` | p21 |
+| Keep inference: which non-keep params does this VALUE carry? | `keep_value_roots`, `taint_nonkeep_from_value` | p51 |
+| Value-flow compatibility (8 sites; the global init is the forgotten one) | `value_flows_to` | — |
+| The carrier of an incoming allocation (SLICE too) | call-result registration AND `ir_type_is_ptrish` — they must agree | p26 |
+| Two SPELLINGS of one operation (`x = alloc()` vs `T x = alloc()`) | `ir_register_alloc_result` | write both spellings |
+| A CALL kept inside a passthrough instruction (the assign spelling, an orelse fallback, an intrinsic argument) | `ir_passthrough_calls`, `ir_apply_passthrough_calls` | p54 |
+| An allocation stored into a SLOT | `ir_register_alloc_result_compound`, `ir_global_projection_key`, `ir_carry_compounds` | p25 |
+| A store / read THROUGH a pointer: which object does `*p` name? | `ir_ptr_stable_aim`, `ir_reroot_views`, `ir_view_set_of_value` | p53, p55, p57 |
+| Allocation VIEW roots: which slot does `&place` name? | `ir_view_set_of_value`, `ir_place_fixed_below_root`, `ir_local_view_place` | p77 |
+| View into an allocation: what does this view point into? | `ir_view_root_ident`, `keep_view_root_ident` | p19 |
+| What a callee STORES of its params | `ir_ps_scan` → `ir_apply_param_stores` | p50 |
+| What a callee FREES through a pointer-to-reference param | `ir_param_deref_slot`, `ir_apply_param_deref_frees` | p68 |
+| A call argument that is itself a call result | `ir_resolve_returned_arg` | p49 |
+| Raw-AST argument positions in zercheck_ir | call BOTH `ir_check_expr_uaf` and `ir_check_expr_wrong_pool` | `audit_walker_fields.sh` |
+| A construct modelled as a FLAG (`orelse return` / `break` / `continue`) | restate every rule of the real statement beside the flag | p24 |
+| Assignment TARGET before VALUE (three lowering sites) | `hoist_place_effects`, `hoist_target_indices` | `assign_target_before_value_bug1618` |
+| Synthesized AST naming an IR local | `make_local_ident` | — |
+| Defer-body statement coverage | ONE lowering path (`emit_defer_body`, `IRInst.defer_tpl`) | defer-goto matrix |
+| Use-before-init of a resource (Arena, Barrier) | `check_resource_init` | — |
+| A whole-program POST PASS sees every module | `checker_post_passes_files` | `test_modules/*_user_negative.zer` |
+| Trusting a GLOBAL's declaration initializer | `global_name_never_mutated` | — |
+| A constant MMIO address | `mmio_const_addr` | — |
+| Does this expression mention name X? | one no-`default:` walker | — |
+| Emitter dual dispatch (AST + IR) | two handlers | two `grep` hits; `emit_audit.sh` |
+| Indirect call through a possibly-NULL funcptr (three call emitters) | `call_needs_null_funcptr_guard`, `emit_ir_call_callee` | `emit_audit.sh` required fingerprint |
+| A value LOADED out of memory that auto-zero may have forged | `load_guard_kind`, `nn_guard_wanted` | `zer_trap/nonnull_*` |
+| A forgeable scalar / enum-forge doors (exactly three guarded: `@bitcast`, `@truncate`, `@saturate`) | the emitter's forgeable-scalar guard walk, `bitcast_target_mints`, `type_carries_forgeable` | `zer_trap/*_enum_forged_*` |
+| An intrinsic's ADVERTISED runtime check: for which operand types is it constant or absent? | `pun_type_id_check_can_fire` (mirrors the emitter) | checklist |
+| The runtime type tag a `*opaque` carries | `opaque_type_id`, `opaque_type_id_nominal` | — |
+| A write INTO a union variant that is not the whole variant | `union_partial_write_target`, `emit_union_reset_prefix` | — |
+| A new value-producing op (uN / iN mask) | `emit_intn_mask` at every op | `tests/zer/uN_width_wrap_all_forms.zer` |
+| Rendering a `double` into C | `emit_double_lit` | `audit_float_literal.sh` |
+| Naming a slice typedef: which C type is `[*]E`? | `emit_slice_name`, `emit_ptr_to_elem` | `slice_elem_*_bug1027` |
+| The C NAME of a user identifier / a module's container global | `c_reserved_ident`, `local_avoid_global_name`, `emit_module_global_name`, `emit_alloc_sym_cname`; generated names are `_zer_`-prefixed | `test_modules/arena_user.zer` |
+| A privileged instruction chosen by target macros; user mode vs bare metal | the precise target macro; `_ZER_USER_MODE` | `emit_audit.sh` per-target; `tools/cross_target_sweep.sh` (by hand) |
+| Documented examples still compile and run | — | `audit_reference_examples.sh` |
 
-**THIS TABLE IS A REMINDER THAT THE GATE EXISTS — IT IS NOT THE SOURCE OF TRUTH FOR ITS
-CONTENTS.** Cell counts, per-cell history and the current site set live in the gate itself
-(`tests/test_*_matrix.c`, `tools/*.sh` baselines) and in `docs/compiler-internals.md`. Numbers
-quoted in these rows are illustrative and WILL drift — the funcptr REACH count was wrong twice
-in one day (2026-08-10) as forms were added. **Never cite a number from this table; RUN the
-gate.** What this table is for: when you touch a class listed here, you are reminded (a) the
-question is answered at N sites, (b) a gate exists and which mechanism it uses, (c) a new
-site/form needs its cell in the SAME commit. That content is durable; the numbers are not.
+## What a green `make check` covers
 
-**Why the carrier class-kill is a LINTER, not a blanket accessor (2026-08-01).** `type_dispatch_kind()`
-works for `distinct` because distinct NEVER changes representation — unwrapping is always right. `?T`
-DOES change it (`.has_value`), and ~93 `emitter.c` sites legitimately dispatch on `TYPE_OPTIONAL` to
-pick an emission form. A blanket `type_optional_kind()` would fix the safety sinks and BREAK emission.
-So `emitter.c` is EXCLUDED from the gate and the linter forces a per-site choice instead of a rewrite.
-When two class-kills look alike, check whether the wrapper is representation-preserving first.
+`MAKE_CHECK_EXIT=0` AND each verdict line present — grep the SPECIFIC line:
 
-**A matrix can assert a RUNTIME VALUE, not just accept/reject — use that when the defect class is a
-silent MISCOMPILE.** Eight of the nine grids check a diagnostic; `tests/test_defer_goto_matrix.c`
-(2026-08-02) instead compiles, RUNS, and checks an acquire/release BALANCE, because the class it
-guards (a `defer` firing on a path whose registration never executed) produces no diagnostic at all —
-just an unbalanced lock/close/free. Two rules that made it work: pick a measurement that is INVARIANT
-across the axes (balance is identical for every defer position, so the expected value is trivially
-derivable rather than hand-tabulated per cell), and give each failure mode its own exit code so the
-report names the defect ("an UNARMED defer fired") instead of "wrong value". **Verify a new grid
-CATCHES its bug** by running it against a pre-fix build — a grid that has only ever passed is a
-script, not a net. GOTCHA: `zerc f.zer -o /tmp/x.exe` builds the exe NEXT TO THE SOURCE, not at the
-`-o` path (CLAUDE.md "zerc -o gotchas") — getting this wrong yields exit 127 on every cell and looks
-like a compiler failure.
-
-**WHAT A GREEN `make check` ACTUALLY COVERS (verified from a run, 2026-08-27 — do not quote from
-memory, the census in this file was once wrong by 2x).** ELEVEN gates, each printing its own verdict
-line, plus TEN axis-crossed matrices:
-
-| gate | verdict line it prints |
+| gate | its verdict line |
 |---|---|
 | `walker_audit.sh` | `OK — no gaps. IR emitter covers every node kind the AST emitter does.` |
 | `walker_default_audit.sh` | `OK — no default: clauses remain in node-kind / op-kind switches.` |
-| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (684 baselined)` |
+| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps` |
 | `audit_fixed_buffers.sh` | `OK — no new fixed-size buffer declarations.` |
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
-| `emit_audit.sh` | `OK — no dead-stub markers in emitted C across 5 samples.` |
-| `sink_matrix.sh` | `SINK MATRIX CLEAN` (169 cells as of 2026-09-13 — this number drifts, RUN the gate) |
+| `audit_esc_restore.sh` | `OK — every realloc'd Checker buffer is kept by esc_restore` |
+| `emit_audit.sh` | `OK — no dead-stub markers in emitted C` |
+| `sink_matrix.sh` | `SINK MATRIX CLEAN` |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
-| `audit_float_literal.sh` | `OK — every emitted float literal goes through emit_double_lit.` (10th gate, 2026-09-13, BUG-991) |
-| `audit_matrix.sh` | `OK — every construct x context verdict holds.` (11th gate, 2026-09-25 — the flag-handler matrix, now behavioural) |
+| `audit_float_literal.sh` | `OK — every emitted float literal goes through emit_double_lit.` |
+| `audit_matrix.sh` | `OK — every construct x context verdict holds.` |
 
-Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto / **vrp-position** (11th, 2026-09-15, BUG-1017) / **vrp-fact** (12th, 2026-09-23, BUG-1090..1100). Plus **`tests/test_lib.sh`** (2026-10-12): the standard library in `lib/` must build and run — it had silently rotted for weeks because nothing compiled it. (The conc
-matrix prints its own `=== conc-matrix: N/N cells correct ===` line — 124 as of 2026-09-13, and like
-every count in this file that number drifts: RUN it.)
+Plus the axis-crossed grids `tests/test_*_matrix.c` (shape, escape, keep, cflow, conc,
+view-alias, hw, async, asm, defer-goto, vrp-position, vrp-fact), each printing
+`=== <name>-matrix: N/N cells correct ===`, and `tests/test_lib.sh` (the standard library
+in `lib/` builds and runs). A grid may assert a RUNTIME VALUE, not just accept / reject —
+use that when the defect is a silent miscompile. Grids are safe to run concurrently (each
+uses `ZT()` from `tests/zer_tmp.h`; a new grid must too).
 
-**Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
-loose grep reports an EARLIER gate's success as your own (this is how a four-commit run of
-`MAKE_CHECK_EXIT=2` was reported green). And these are the gates; `tools/ubsan_sweep.sh`,
-`tools/ub_sweep.sh`, `tools/grammar_closure_probe.sh`, `tools/qualifier_closure_probe.sh` and
-`tools/cross_target_sweep.sh` are MEASUREMENT SWEEPS, run by hand, NOT in `make check` — do not
-count them as coverage.
-
-**NOTHING in `make check` COMPILES THE EMITTED C FOR ANY TARGET BUT THE HOST (2026-09-15).** The
-emitter has per-arch `#if` cascades for `@critical`, the `@cpu_*` intrinsics, the barriers and the
-trap, and a wrong arm in one of them is invisible to every gate above: the host takes a different
-branch and the suite stays green. Measured on exactly such a green tree — `@critical` could not be
-compiled AT ALL for hosted or bare-metal aarch64 (BUG-1020), and four more intrinsic arms had the
-same defect (BUG-1021). **After touching any per-arch emission, run
-`bash tools/cross_target_sweep.sh`** (`apt-get install gcc-aarch64-linux-gnu
-gcc-arm-linux-gnueabihf gcc-riscv64-linux-gnu`; absent toolchains SKIP). The `emit_audit.sh`
-per-target fingerprint case is its complement and runs in `make check`: that one proves the right
-arm is CHOSEN (via the preprocessor, no toolchain), this one proves the chosen arm ASSEMBLES —
-which is the half that failed in every one of those bugs.
-
-**AN AST NODE REWRITTEN BY ir_lower MUST SURVIVE A SECOND LOWERING (2026-09-27, BUG-1372).**
-The zercheck shim (`zercheck_run`, used by the LSP and `test_firmware`) lowers every function,
-then the emitter lowers it AGAIN from the same AST. A node overwritten in place with the name
-of a temp (`hoist_place_effects`) names a DIFFERENT local in the second lowering — the emitted
-C read `_zer_t2 = (_zer_t2->fd = 42U)`. In-place rewrites are recorded on the Checker
-(`hoist_undo`) and restored by `hoist_restore` at the start of the next lowering of that
-function. A new in-place rewrite in ir_lower must go through the same record. `zerc` itself
-lowers once, so only `test_firmware` could see this — run it after touching ir_lower.
-
-**AN EXHAUSTIVE SWITCH PROVES EVERY KIND WAS CONSIDERED, NOT THAT EACH WAS CONSIDERED
-CORRECTLY (2026-09-10, BUG-973).** The same-statement shared-lock collector listed
-`NODE_SPAWN` explicitly in its "returns 0" arm — the no-default discipline forced the
-classification to be written down — and the classification was simply WRONG: a spawn's
-arguments ARE parent-evaluated expressions of that statement, and `spawn w(a.x + b.y)`
-read `b.y` with the wrong mutex held. The gate still did its job (it turned "silently
-missed" into "visibly wrong"), but do not read these switches as proofs of coverage.
-**When you add a kind to a no-op arm, write WHY it is a no-op** — a bare name in a list
-is where a wrong answer hides.
-
-**Choosing the mechanism (the rule of thumb):** sites are a `switch` on an enum →
-**`-Werror=switch`** (build-time, free, strongest). Sites are scattered dispatch/sinks →
-**an audit-script baseline** (`file:content`, line-number-agnostic — `sink_matrix.sh` /
-`audit_type_dispatch.sh` / `fixed_buffer_baseline.txt` are the templates; a new site must
-be a conscious add-or-justify). The question is "do the enumerated forms COVER the
-semantics?" (not "is each transfer sound?") → **a Coq/stdpp MAX-oracle** (`param_lattice.v`
-template) — this is the COVERAGE half the audits can't prove; it turns a missing form into
-a STUCK PROOF instead of a silent accept (the endgame direction). The durable end-state
-for ANY patchwork is **ONE query + a gate**, not N call sites (the `call_result_escapes` /
-`type_dispatch_kind` class-kills are the model).
-
-**A GATE CAN ITSELF BE BROKEN — verify membership, not just the verdict (2026-08-26, two instances).**
-`audit_walker_fields.sh` decided which functions it audited by counting the function's own name in
-PROSE — comments and strings included — so editing a COMMENT moved a walker in or out of the audited
-set (baseline 758 -> 684 once membership became structural). And a qualifier probe's first oracle used
-`-Wdiscarded-qualifiers`, which an EXPLICIT cast silences by design — and ZER's emitter writes explicit
-casts, so it printed OK against a deliberately broken compiler. `-Wcast-qual` is the warning that asks
-the question being asked. Both were caught the same way: **break the compiler on purpose and check the
-gate goes RED.** A gate that has only ever printed OK is a script, not a net — and that applies to the
-gate's SCOPE as much as to its assertion.
-
-**Keep the gates CURRENT — a stale matrix is worse than none (false confidence).** When a
-sink/site is unified away, REMOVE its cell/baseline row; when a new shape/site/node-kind is
-added, ADD its cell/case in the SAME commit. Baselines are `file:content`
-(line-number-agnostic) so they survive unrelated edits but MUST be updated when the SITE
-SET itself changes. A green gate over an obsolete site set is the trap this rule exists to
-prevent.
-
----
+**NOT in `make check` — run by hand:** `tools/ubsan_sweep.sh`, `tools/ub_sweep.sh`,
+`tools/grammar_closure_probe.sh`, `tools/qualifier_closure_probe.sh`,
+`tools/cross_target_sweep.sh`, the firmware examples. **Nothing in `make check` compiles
+the emitted C for any target but the host**: after touching per-arch emission (`@critical`,
+`@cpu_*`, barriers, the trap) run `bash tools/cross_target_sweep.sh`.
 
 ## ZER Language — Complete Quick Reference
 
@@ -894,188 +584,34 @@ Ordering parameter (relaxed/acquire/release/acq_rel/seq_cst) deferred to later b
 ```
 All use GCC builtins — auto-port to x86-64/ARM64/RISC-V without per-arch work.
 
-### Carry Primitives + native uN/iN (2026-07 — commits e7ea2bcb / d91d0742 / 80183261)
+### Carry primitives + native uN / iN
 ```
-@addc(a, b, carry_in)  -> AddCarry64  { u64 sum;  u8 carry;  }   __builtin_add_overflow
-@subb(a, b, borrow_in) -> SubBorrow64 { u64 diff; u8 borrow; }   __builtin_sub_overflow
-@mulw(a, b)            -> MulWide64   { u64 lo;   u64 hi;     }   __int128 (portable fallback)
+@addc(a, b, carry_in)  -> AddCarry64  { u64 sum;  u8 carry;  }
+@subb(a, b, borrow_in) -> SubBorrow64 { u64 diff; u8 borrow; }
+@mulw(a, b)            -> MulWide64   { u64 lo;   u64 hi;     }
 ```
-Safe value ops (no asm, no memory surface) — the building blocks for big ints.
-Result types are spellable builtin structs (registered in `checker_init`; both
-emitter dispatch paths). Plain `a + b` on u64 == `@addc(a,b,0).sum`. Companion
-feature: NATIVE arbitrary-width integers `uN`/`iN` (u21, i48, u3, N=1..128) —
-`resolve_type` maps `u<N>`/`i<N>` → `type_uint`/`type_sint`; carrier = smallest
-native int ≥ N; `emit_intn_mask` (emitter, IR_BINOP + IR_UNOP) masks arithmetic to
-N bits (uN bitmask / iN sign-extend) so odd widths wrap at 2^N; `src/safety/type_kind.*`
-predicates recognise TYPE_UINT/TYPE_SINT. Over-width bit-slice write `reg[hi..lo]=LIT`
-is now a compile error (was silent truncation). uN/iN type-kind predicates are
-VST-verified (Level-3, `make check-vst`, verif_type_kind.v). Global-scope uN
-arithmetic needs no mask — verified safe by rejection (u32→uN narrowing + fits-check
-+ C constant-initializer requirement all reject over-width global inits; only a
-fitting literal is a valid global uN init, which can't overflow). Open follow-ups
-(docs/limitations.md): VRP mask-elision (deferred — Rice-bounded perf); single-bit
-`reg[5]` shorthand (use `reg[5..5]`).
+`uN` / `iN` (N = 1..128) are native: the carrier is the smallest native int ≥ N and
+arithmetic is masked to N bits (`emit_intn_mask`), so odd widths wrap at 2^N. An over-width
+bit-slice write `reg[hi..lo] = LIT` is a compile error. Single-bit: `reg[5..5]`.
 
-### Interrupt Control Intrinsics (D-Alpha-3, privileged — kernel mode only)
-```
-@cpu_disable_int()              disable interrupts globally
-@cpu_enable_int()               enable interrupts globally
-@cpu_wait_int()                 halt until next interrupt (hlt/wfi)
-@cpu_save_int_state() -> u64    read current interrupt flag state
-@cpu_restore_int_state(u64)     restore saved flag state
-```
-Per-arch inline asm emission (x86 cli/sti/hlt, ARM cpsid/cpsie/wfi, RISC-V csrci/csrsi/wfi).
-SIGSEGV in user mode — use for kernel code only. Test pattern: place in dead branch with
-`volatile u32 never_true = 0; if (never_true == 42) { ... }` to verify compilation without
-executing privileged asm.
+### CPU / privileged intrinsics (130 in all — catalog: `docs/reference.md`; signatures by batch: playbook)
+Interrupt control (`@cpu_disable_int`, `@cpu_enable_int`, `@cpu_wait_int`,
+`@cpu_save_int_state`, `@cpu_restore_int_state`), context switch (`@cpu_save_context`,
+`@cpu_restore_context`, `@cpu_save_fpu`, `@cpu_restore_fpu` — a `*u8` or `u8[N]` buffer),
+MSR / CR / XCR0 (`@cpu_read_msr`, `@cpu_write_msr`, `@cpu_read_cr3`, …), inspection
+(`@cpu_read_sp`, `@cpu_cpuid`, `@cpu_vendor_id`, …), power (`@cpu_deep_sleep`, …), mode
+transitions (`@cpu_syscall`, `@cpu_iret`, …), port I/O (`@port_in8` … `@port_out32`), cache /
+non-temporal (`@cache_flushopt`, `@nt_store`), FPU state (`@cpu_fxsave`, `@cpu_xsave`).
+Privileged ones fault in user mode — test them in a DEAD BRANCH so they compile without
+executing: `volatile u32 never_true = 0; if (never_true == 42) { @cpu_disable_int(); }`.
 
-### Context Switch Intrinsics (D-Alpha-4, scheduler primitives)
-```
-@cpu_save_context(*u8 buf)       save callee-saved GPRs     (128+ byte buffer)
-@cpu_restore_context(*u8 buf)    restore callee-saved GPRs
-@cpu_save_fpu(*u8 buf)           save SIMD/FP state         (512+ byte buffer, 16-byte aligned)
-@cpu_restore_fpu(*u8 buf)        restore SIMD/FP state
-```
-Callee-saved only (rbx/r12-r15 on x86, x19-x28 on ARM64, s0-s11 on RISC-V).
-Full RSP/RIP save requires naked functions — kernel-integration scope.
-Buffer arg can be `*u8` or `u8[N]` — checker accepts both. Test via dead-branch pattern.
-
-### MSR/CR/XCR0 Access Intrinsics (D-Alpha-9, x86 privileged — kernel mode only)
-```
-@cpu_read_msr(u32 msr) -> u64       RDMSR — Model-Specific Register read
-@cpu_write_msr(u32 msr, u64 val)    WRMSR — Model-Specific Register write
-@cpu_read_cr0() -> u64              CR0 (paging, WP, etc.)
-@cpu_write_cr0(u64)
-@cpu_read_cr3() -> u64              Page directory base
-@cpu_write_cr3(u64)                 Switches address space (flushes non-global TLB)
-@cpu_read_cr4() -> u64              Feature enable bits (SSE, PAE, SMEP, etc.)
-@cpu_write_cr4(u64)
-@cpu_read_xcr0() -> u64             XSAVE feature mask
-@cpu_write_xcr0(u64)                XSETBV — XSAVE feature mask write
-```
-All privileged (CPL=0). SIGSEGV in user mode. Non-x86 archs get no-op fallback.
-Test via dead-branch pattern.
-
-### Inspection Intrinsics (D-Alpha-10, non-privileged CPU state reads)
-```
-@cpu_read_sp() -> u64               stack pointer
-@cpu_read_tp() -> u64               thread pointer / TLS base (via __builtin_thread_pointer)
-@cpu_read_flags() -> u64            RFLAGS / NZCV
-@cpu_vendor_id() -> u64             CPUID leaf 0 EBX (first 4 chars of vendor)
-@cpu_feature_bits() -> u64          CPUID leaf 1 ECX:EDX packed
-@cpu_model_id() -> u32              CPUID leaf 1 EAX (family/model/stepping)
-@cpu_core_id() -> u32               physical core ID (stub 0)
-@cpu_current_mode() -> u32          privilege mode (stub 0 = user)
-@cpu_cache_line_size() -> u32       L1 cache line bytes (stub 64 = common default)
-@cpu_num_cores() -> u32             logical core count (stub 1)
-```
-All non-privileged — run in user mode directly (no dead-branch needed).
-
-### Power Management Intrinsics (D-Alpha-11)
-```
-@cpu_reset()              safe halt-forever fallback (real reset = platform-specific)
-@cpu_deep_sleep()         enter deepest idle state (WFI / HLT)
-@cpu_idle_hint()          non-blocking low-power hint (distinct from cpu_pause)
-@cpu_monitor_addr(*u8)    x86 MONITOR — setup address watch (pairs with mwait)
-@cpu_mwait()              x86 MWAIT — wait for monitored write or interrupt
-```
-Most privileged — dead-branch pattern. cpu_idle_hint is non-blocking (safe to call).
-
-### Privileged Mode Transitions (D-Alpha-12, ALL privileged)
-```
-@cpu_syscall()                    user→kernel trap (syscall / svc #0 / ecall)
-@cpu_sysret()                     kernel→user return (sysretq / eret / sret)
-@cpu_iret()                       interrupt return (iretq / eret / mret)
-@cpu_set_priv_stack(u64 sp)       set kernel stack for syscall entry
-@cpu_get_priv_level() -> u32      query privilege (0=user, higher=privileged)
-@cpu_hypercall()                  guest→hypervisor (vmcall / hvc #0 / ecall)
-```
-All require correctly-set system register context (CS/RIP/RFLAGS on x86; ELR/SPSR on
-ARM; sepc/sstatus on RISC-V) before the transition instruction. Dead-branch pattern.
-
-### Linux-Scale x86 Essentials (D-Alpha-13, 20 intrinsics)
-```
-/* FS/GS segment bases — requires FSGSBASE feature (CR4.FSGSBASE=1) */
-@cpu_read_fsbase() -> u64
-@cpu_read_gsbase() -> u64
-@cpu_write_fsbase(u64 val)
-@cpu_write_gsbase(u64 val)
-
-/* Port I/O — x86 privileged (CPL <= IOPL) */
-@port_in8(u16 port) -> u8
-@port_in16(u16 port) -> u16
-@port_in32(u16 port) -> u32
-@port_out8(u16 port, u8 val)
-@port_out16(u16 port, u16 val)
-@port_out32(u16 port, u32 val)
-
-/* XSAVE/XRSTOR — extended processor state (AVX/AVX-512) */
-@cpu_xsave(*u8 buf, u64 mask)
-@cpu_xrstor(*u8 buf, u64 mask)
-
-/* Debug registers — DR0-DR3, DR6, DR7 via runtime switch */
-@cpu_read_dr(u32 idx) -> u64
-@cpu_write_dr(u32 idx, u64 val)
-
-/* Firmware calls */
-@cpu_sbi_call()                   RISC-V ecall to M-mode firmware
-@cpu_smc_call()                   ARM TrustZone smc #0
-
-/* Persistent memory cache ops */
-@cache_flushopt(*u8 addr)         CLFLUSHOPT (ordered alternative to CLFLUSH)
-@cache_writeback(*u8 addr)        CLWB (writeback without invalidate — NVDIMM)
-
-/* Non-temporal store — bypass cache */
-@nt_store(*u8 addr, u64 val)      MOVNTI
-
-/* Performance counter — requires CR4.PCE=1 for user access */
-@cpu_read_pmc(u32 idx) -> u64     RDPMC
-```
-
-### Final Misc Intrinsics (D-Alpha-14, 12 intrinsics — reaches 130/130)
-```
-/* CPUID — combined pair returns all 4 registers */
-@cpu_cpuid(u32 leaf, u32 subleaf) -> u64       (EBX << 32) | EAX
-@cpu_cpuid_ecx(u32 leaf, u32 subleaf) -> u64   (EDX << 32) | ECX
-
-/* Interrupt lifecycle + fault info */
-@cpu_eoi()                        end-of-interrupt to LAPIC/GICv3
-@cpu_read_cr2() -> u64            page fault address (x86)
-
-/* Cache control — uses BTR/BTS to avoid 32-bit-imm-with-64-bit-reg bug */
-@cpu_cache_disable()              CR0.CD=1 + WBINVD (privileged)
-@cpu_cache_enable()               CR0.CD=0 (privileged)
-
-/* Legacy FPU (pre-XSAVE) */
-@cpu_fxsave(*u8 buf)              512-byte buffer, 16-byte aligned
-@cpu_fxrstor(*u8 buf)
-@cpu_fpu_init()                   FNINIT
-
-/* User-mode wait — requires WAITPKG feature */
-@cpu_umwait(u32 hint, u64 deadline)  hint: 0=C0.2 (optimized), 1=C0.1 (fast)
-@cpu_umonitor(*u8 addr)              pair with UMWAIT (non-privileged)
-
-/* Control-flow integrity — CET-IBT */
-@cpu_endbr()                      ENDBR64 — multi-byte NOP if CET-IBT absent
-```
-
-**All 14 D-Alpha intrinsic batches complete (130/130).** Next work: D-Alpha-7.5 Phase 1
-(hardened `asm`) then Phase 2 (strict mode implementation with 8 categories +
-13 Z-rules + new System #30).
-
-### `asm` safety — current state + direction
-
-Two orthogonal dimensions (NOT a continuum): **language safety** (operand-
-boundary tracking — UAF/bounds/move/escape/provenance/MMIO/qualifier kept
-active through asm bindings; same scope as every safe language) vs
-**algorithm correctness** (`@verified_spec` Vale-tier — v2.x+ specialty, NOT
-critical-path, deprioritized 2026-04-26). Layer split: Z1/Z2 live in
-`zercheck_ir.c` (CFG state machines); Z3-Z13 in `checker.c` (AST NODE_ASM);
-`zercheck.c` is a shim — never add safety code there. Z9/Z10/Z13 never
-shipped (were blocked on S1 relaxation; superseded by the Option E pivot).
-History + research: `docs/asm_plan.md`, `docs/asm_preconditions_research.md`,
-`docs/compiler-internals.md` Z-Rules section. Direction:
-`docs/asm_lang_zer_safe.md` (Option E) + `docs/option_e_plan.md` (Phase 1).
+### `asm`
+Bare `asm(...)`, only inside a `naked` function; the structured form's `safety:` string
+(≥ 30 chars) is mandatory; max 16 instructions, no labels. Operand-boundary tracking (UAF,
+move, VRP, provenance, escape, qualifier, MMIO) stays active through asm operands. Z1 / Z2
+live in `zercheck_ir.c`, Z3..Z13 in `checker.c`. **Direction is LOCKED (Option E): read
+`docs/asm_lang_zer_safe.md` + `docs/option_e_plan.md` before touching asm safety; do not grow
+per-instruction tables.** Mnemonics may contain dots (`lr.w`).
 
 ### mmio Declaration (MANDATORY for @inttoptr)
 ```
@@ -1236,80 +772,13 @@ b.y = 2; a.x = 1;          // OK — separate statements, locks released between
 a.x = b.y;                 // ERROR — same statement accesses both A and B
 ```
 
-> **CONCURRENCY MEMORY-SAFETY STATUS (audited 2026-06-20; implementation phase 2
-> IN PROGRESS 2026-06-21b — NOT closed) — READ BEFORE touching/claiming anything
-> about ZER concurrency safety.** All concurrency PRIMITIVES are implemented
-> (shared/spawn/atomics/Semaphore/Barrier/condvar/Ring/async/move). Three
-> adversarial sweeps found **~25 verified cross-thread MEMORY-safety holes** (data
-> races + cross-thread UAF) mapping to **four architectural axes** (A
-> reachability/exclusion-list scanner, B single-root auto-lock incompleteness, C
-> per-function CFG lattice that never merged `threads[]`, D cinclude/emitter-runtime
-> capture). **Most holes are now CLOSED** (BUG-743..756; full `make check` GREEN),
-> each verified + regression negative test in `tests/zer_fail/` running in `make check`):
-> Axis C `ir_merge_states` now merges `threads[]` (the false-green scoped-spawn
-> stack-UAF — the most-actionable bug — is fixed); A1 exhaustive spawn-arg dispatch
-> (slice/opaque); C2 fire-and-forget stack-pointer lifetime arm; A3 volatile-RMW in
-> spawn; A4 Arena exclusion; D2 `@probe` `__thread`; **A6-full atomic-cell inclusion
-> taint** (scalar write/read/launder + struct-field, concurrency-aware, BUG-752);
-> and **AXIS B COMPLETE** — B1 multi-root lock (BUG-753), B2 shared union-switch
-> copy-out (BUG-754), B3 `@cond_wait` foreign-shared reject (BUG-755), B4 `@once`
-> loser-wait (BUG-756), B5 defer-body lock (BUG-749); plus the TAIL — A5 threadlocal
-> `&`-escape (BUG-757), A6 micro-residuals (struct-field read/launder, BUG-758),
-> scoped-borrow read-side (BUG-759). **CLOSED 2026-08-03 — the CARRIER class at the
-> spawn-ARG sink:** three arms of the gate tested the BARE argument kind, so a
-> by-value struct (or nested struct) carrying a `Handle` / `*T` / `?*T` / `[*]T`
-> slipped ALL of them at BOTH sinks — 13 hazard cells accepted, verified
-> non-vacuous. Fixed with two carrier predicates (`type_carries_handle`,
-> `type_carries_nonshared_pointer`) + a compound-rooted transfer marking, and
-> gated by the CARRIER GRID in `tests/test_conc_matrix.c` (verified to fire: 13
-> false negatives pre-fix, 0 after). See primitives-data-races.md §24.5b.
-> **CLOSED 2026-08-03 — the scoped-borrow CROSS-BLOCK case** (spawn and access in
-> different CFG blocks). The long-standing sketch ("a zercheck_ir borrow-set merge
-> like the `threads[]` merge, subsystem-scale") named the WRONG SUBSYSTEM: the
-> borrow is a linear statement-order approximation in `checker.c`
-> (`Symbol.is_borrowed_by_thread`), not IR state, so an IR merge would have edited
-> a component that never held it. The real defect was that `th.join()` nested in a
-> branch cleared the borrow for code AFTER the branch, on paths that never joined.
-> Fix = `Checker.branch_depth` + `Symbol.th_spawn_branch_depth`: a join releases
-> the borrow only when it is no deeper in runtime-conditional nesting than the
-> spawn. ~40 lines, not subsystem-scale. **Residual (precision, not safety):** a
-> join on EVERY arm is now over-rejected — hoist the join out of the branch; see
-> `docs/limitations.md`. **Still do NOT claim ZER is fully data-race-safe** — the
-> §24.5 residue (emitter-runtime globals, the `IRPathState` merged-vs-first_live
-> audit, cross-module spawn, NODE_STRUCT_INIT global read in a spawn body) is
-> **PROBED CLEAN 2026-08-03** (~40 shapes, crossed with the carrier axis) — see
-> primitives-data-races.md §24.5c. Only cinclude/FFI is a floor. The sweep found
-> ONE hole, and it was in an EXEMPTION rather than a scan: the `volatile` spawn
-> exclusion exists for the **single-word** flag idiom but never tested width, so a
-> `volatile u64` store from a thread was accepted on a 32-bit target (two stores,
-> tearable). Now width-limited to `target_ptr_bits`.
->
-> **Corollary learned the hard way the same day:** an EXEMPTION is a multi-site
-> class like any other. `volatile` exempts at TWO sites (spawn scan, ISR check);
-> the spawn one was fixed and the ISR one missed, shipping a tearing bare-metal
-> access. When you fix an exemption, `grep` for every place that same keyword
-> grants an exemption BEFORE claiming the class closed.
->
-> **Generalizable, worth probing for directly: an EXEMPTION whose written
-> rationale is narrower than its code.** (Hit AGAIN 2026-09-11, BUG-979: the
-> atomic-cell rule's NODE_SPAWN comment read "a SCOPED spawn is joined, so post-join
-> access is safe" — true — and the code set NOTHING for a scoped spawn, so the
-> spawn..JOIN WINDOW was exempt too and the same race was accepted purely for its
-> spelling. The qualifier that was never tested is the word "post-join". The fix is a
-> REFCOUNT, not a flag: the window closes at the LAST join, and never when a
-> fire-and-forget spawn also ran.) Every other probe asked "does the scan
-> reach this form?"; this one was a gate that correctly skipped a case its own
-> comment had already qualified ("single-word") without the code enforcing the
-> qualifier. For each exemption in a safety gate, read its stated justification and
-> check every qualifier in that sentence is actually tested.
-> **D1 (cinclude thread-capture) is a named FLOOR, not a hole** — C-domain behavior,
-> out of scope; the safe path exists today (hand capturing externs long-lived data —
-> global / `shared struct` instance / Pool/Slab — never `&stack_local`). Full
-> CLOSED/OPEN ledger + fix sketches: **`docs/limitations.md` "## OPEN — Concurrency
-> memory-safety"**; design + Rust mapping: **`docs/primitives-data-races.md` §24**;
-> Coq/Iris closure proof (sufficiency, zero-admit):
-> `proofs/operational/lambda_zer_concurrency/`. Liveness (deadlock/livelock) is the
-> named floor — out of scope for ZER *and* Rust. See also [[project_concurrency_audit]].
+
+> **Concurrency safety status — read before claiming anything.** Do NOT claim ZER is fully
+> data-race-free. The known cross-thread holes are closed and gated (`tests/test_conc_matrix.c`,
+> `tests/test_hw_matrix.c`); the open ones — and exactly what is and is not PROVEN — are in
+> `docs/limitations.md` (section B / B2). Floors: `cinclude` code; liveness. Design + Rust
+> mapping: `docs/primitives-data-races.md` §24. Proofs: `proofs/operational/lambda_zer_concurrency/`.
+> History of the audit: playbook "CONCURRENCY MEMORY-SAFETY STATUS".
 
 ### Move Struct — Ownership Transfer
 ```
@@ -1366,2079 +835,274 @@ When considering new features, apply the **primitives test**: if the use case ca
 - **Whole-program analysis** — BANNED from architecture. zercheck is per-file with summaries. Heuristics cover callbacks. See design decisions.
 - **Partial moves** — DON'T ADD. Copy field value before consuming whole struct. Adds 200 lines of per-field tracking for a one-line workaround.
 
-### Safety Guarantees
-| Bug Class | Prevention |
+### Safety guarantees (mechanism per class — per-bug notes: playbook "Safety Guarantees")
+| Class | Prevention |
 |---|---|
-| Buffer overflow | Inline bounds check on every array/slice access; proven-safe indices skip check (range propagation); unsafe indices get auto-guard (silent if-return inserted). **A counted loop whose counter PROVABLY runs past a fixed array's end is a compile ERROR, not a guard** (BUG-992, 2026-09-13) — the guard's silent early return had made the canonical off-by-N overflow invisible at compile time AND run time (`main` exited 0 with half the loop never run). Licensed by the loop's WILL-hold fact (`Checker.cert_loop_*`: constant init/step/bound, straight-line body, access at the body's own branch depth), never by the MAY-hold VRP range alone. `loop_body_straight_line` is a PROOF-OF-DANGER walk: no `default:`, answers NO for anything untaught, so an incomplete walk can only fail to report |
-| Use-after-free | Handle generation counter + ZER-CHECK (MAYBE_FREED + leak detection + loop pass + cross-function summaries) + Level 1-5 *opaque tracking (compile-time zercheck + poison-after-free + inline header + global malloc interception) |
-| Null dereference | `*T` non-null by default, `?T` requires unwrapping, local function pointer requires initializer. A `*T` FIELD / ELEMENT is zero until assigned (auto-zero), so every LOAD of a `*T` out of memory is null-checked and traps — hosted and bare metal (BUG-1152); an indirect call through a funcptr is guarded the same way (BUG-1019) |
-| Uninitialized memory | Everything auto-zeroed |
-| Integer overflow | Wraps (defined), never UB |
-| Float -> int out of range | **SATURATES** (defined 2026-08-26, BUG-883, matching Rust `as`). `(u32)1e20` = 4294967295, `(u32)-1.5` = 0, **NaN -> 0** (tested FIRST — every comparison against NaN is false, so without an explicit `v != v` it falls through to the raw cast, which is the UB being removed). Identical at -O0 and -O2; the same program gave 4294967295 and 0 before. Every width saturates, u65..u128 / i65..i128 included (BUG-1064 — they used to keep a NaN trap and then a RAW cast, undefined for inf / out of range). `@saturate(T, x)` on a float source is the same operation (BUG-1061). The MIN/MAX of any width is spelled by ONE emitter helper, `int_limit_text`. |
-| Silent truncation | Must `@truncate` or `@saturate` explicitly |
-| Missing switch case | Exhaustive check for enums and bools |
-| Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
-| Union type confusion | Cannot mutate union variant during mutable switch capture |
-| Enum forging (a value outside the variant set) | Runtime variant guard at the point of forgery — TRACKED, not banned, so reading an enum from a register still works (as `@bitcast(State, *u32reg)`). The GUARDED doors are EXACTLY THREE: `@bitcast` (BUG-843), `@truncate` (BUG-891), `@saturate` (BUG-910). `@cast` is NOT a door — it requires a distinct typedef and cannot name a bare enum. **Two more routes were found 2026-09-13 and are REJECTED rather than guarded, keeping the guarded set at three:** `@inttoptr` to an enum-carrying pointee (BUG-989: `volatile *State reg = @inttoptr(*State, a); switch (*reg)` returned an arm on a register holding 200, zero guards emitted — guarding it would mean firing at every READ through the pointer, a new N-sink surface; the rejection routes users to the guarded `@bitcast` idiom) and `@pun` into an enum-carrying target from a type_id-less source (BUG-988, below). The guard recurses struct fields, optional payloads and array elements, and each door wires it at BOTH emitter dispatch paths. **Adding a new value-producing conversion? It is a fourth door — wire the guard. Adding a new way to POINT AT foreign memory? Ask whether an enum can be read through it.** Why every one of these reads as severe: the exhaustive-switch lowering emits the LAST arm as an unconditional `else`, so a non-variant value *takes an arm* instead of falling through — limitations.md "the last-arm elision is the amplifier". |
-| Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables (ALL arenas, including global — `is_from_arena` flag) |
-| Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
-| Invalid MMIO address | `mmio` declarations (compile-time) + alignment check + **MMIO index bounds from range** (compile-time) + startup @probe validation (boot-time) + `--no-strict-mmio` relaxes RANGE checks only (runtime alignment trap always emitted for variable addresses, BUG-736) |
-| Unsafe pointer indexing | Indexing a non-volatile single `*T` (`ptr[i]`) is a COMPILE ERROR — `*T` has no length to bounds-check; use `[*]T` (slice) for a collection, or `*ptr`/`ptr.field` to read the single pointee. Volatile `*T` from `@inttoptr` bounds-checked against `mmio` range. |
-| Slab alloc in ISR | `slab.alloc()` in interrupt handler → compile error (calloc may deadlock). Use Pool instead. |
-| Slab/Pool/Ring from spawn | Global Pool/Slab/Ring accessed from spawned thread → compile error (non-atomic metadata). Use shared struct wrapper or single-threaded access. |
-| Container infinite recursion | `container Node(T) { ?*Node(T) next; }` → compile error (depth 32). Prevents compiler hang from self-referential monomorphization. |
-| Naked non-asm code | Non-asm/non-return statements in naked function → compile error (stack not allocated without prologue). |
-| Comptime loop DoS | Nested comptime loops exceeding 1M total operations → compile error (global instruction budget). |
-| Move struct capture copy | `if (opt) \|k\|` value capture of move struct → compile error. Must use `\|*k\|` pointer capture. |
-| Async shared struct | Shared access in a statement CONTAINING yield/await → compile error (the lock would be held across the suspend). NOT a blanket ban on shared access inside an async fn: locking is PER-STATEMENT, so `x = g.v; yield;` releases before the suspend and is correctly ACCEPTED. Verified 2026-08-10 — the old wording overstated this and would have sent a session hunting a non-bug. |
-| Ghost handle (leaked alloc) | `pool.alloc()` / `slab.alloc()` as bare expression → compile error (handle discarded) |
-| Wrong pointer cast | 4-layer: Symbol + compound key + array-level + whole-program param provenance. Runtime `_zer_opaque{ptr, type_id}` for cinclude only |
-| Handle leak | zercheck: ALIVE/MAYBE_FREED at function exit = error. Overwrite alive handle = error. Allocation coloring: arena wrappers (chained, type-punned) excluded via source_color + param color inference |
-| Wrong container_of | `@container` field validation + provenance tracking from `&struct.field` |
-| Volatile/const strip | `@ptrcast`, `@bitcast`, `@cast` all check qualifier preservation |
-| ISR data race | Shared global without volatile → error. Compound assign on shared volatile → error (non-atomic read-modify-write) |
-| Stack overflow | Recursion detection via call graph DFS → warning. `--stack-limit N` → error when per-function frame or entry-point call chain exceeds N bytes |
-| Misaligned MMIO | `@inttoptr` alignment check — address must match target type alignment (u32=4, u16=2, u64=8) |
-| @critical escape | `return`/`break`/`continue`/`goto` inside `@critical` → compile error (would skip interrupt re-enable) |
-| Interior pointer UAF | `*u32 p = &b.field; free(b); p[0]` → compile error. Field-derived pointers share alloc_id with parent. NODE_INDEX UAF check. |
-| Thread data race | `shared struct` auto-locked. Non-shared pointer to `spawn` → compile error (unless scoped with ThreadHandle+join). Handle to `spawn` → compile error. Spawn target body scanned for non-shared global access: error (no sync) or warning (has @atomic/@barrier) — but two thread instances (two spawns, a loop / twice-run spawn, or the spawner's own spawn..join window) touching one global, one writing, with no common CAS lock and no release/acquire flag hand-off, are an error even then (BUG-1562/1563, ATOMIC-DOWNGRADE grid in `tests/test_conc_matrix.c`). BUG-1565 widened the instances: a fire-and-forget thread vs its spawner's CALLERS, accesses through pointers handed to a thread (`sync_descend` bindings), a function with no ZER caller as repeated, and a hand-off flag any other instance stores is forged. Transitive through callees (8 levels). Escape: volatile, shared, threadlocal, @atomic_*. |
-| Deadlock | Same-statement multi-shared-type access → compile error. Emitter does lock-per-statement (no nested locks), so cross-statement ordering is safe. Only same-statement access to 2+ shared types is a real deadlock risk. |
-| Ownership transfer | `spawn` with non-shared pointer marks variable HS_TRANSFERRED — use after transfer → compile error. |
-| Move semantics | `move struct` — pass to function or assign transfers ownership, use after transfer → compile error. Compile-time via zercheck. |
-| Thread not joined | Scoped spawn `ThreadHandle` not joined before function exit → zercheck compile error. |
-| Spawn in ISR | `spawn` inside `@critical` block → compile error (thread creation with interrupts disabled). |
-| Pointer through channel | Ring.push with pointer element type → compile warning (pointer may be invalid in receiver). |
+| Buffer overflow | bounds check on every index; a PROVEN index elides it (range propagation); an unproven one gets an auto-guard; a counted loop that provably runs past a fixed array is a compile error |
+| Use-after-free, double free, leak | handle generation counter + zercheck_ir (ALIVE / FREED / MAYBE_FREED, alloc-id groups, cross-function summaries, interior pointers share the parent's id). Leaks are compile errors |
+| Null dereference | `*T` is non-null, `?T` must be unwrapped; every LOAD of a `*T` field / element is null-checked (auto-zero could have forged it); an indirect call through a funcptr is guarded |
+| Uninitialized memory | everything is auto-zeroed |
+| Integer overflow, shifts | wraps (defined); a shift ≥ width is 0 |
+| Float → int out of range | saturates; NaN → 0 |
+| Silent truncation / sign change | must be explicit (`@truncate`, `@saturate`, a cast) |
+| Division by zero | the divisor must be proven nonzero |
+| Dangling pointer | escape analysis at every sink (return, global store, keep, struct field, spawn arg, orelse fallback) + block lifetimes; arena pointers cannot reach a global |
+| Enum forging | a runtime variant guard at exactly three doors (`@bitcast`, `@truncate`, `@saturate`); `@inttoptr` / `@pun` into an enum-carrying target are rejected |
+| Wrong pointer cast | provenance tracking at compile time; `_zer_opaque` type id at run time; `@container` field validation |
+| MMIO | `mmio` ranges (mandatory for `@inttoptr`), alignment, index bounds from the range; a plain `*T` is not indexable |
+| Qualifier strip | `volatile` / `const` are preserved through every cast and view |
+| Data races | `shared struct` auto-lock; spawn-arg gates; the spawn-target body scan; the scoped-spawn borrow window; the atomic-cell rule; ISR / main sharing rules (missing `volatile`, non-atomic RMW) |
+| Lock-order deadlock | two shared types in one statement is an error; locking is per statement |
+| Ownership | `move struct`: use after transfer is an error; a `ThreadHandle` must be joined |
+| Context | `return` / `break` / `continue` / `goto` in `@critical` or `defer`; alloc in an ISR; spawn in `@critical` / ISR; yield in `defer` / `@critical`; a shared access in a statement that suspends — all errors |
+| Stack | recursion warning; `--stack-limit N` makes frame / chain size an error |
 
-### Implementation Status
+### Pitfalls when WRITING ZER (stdlib lessons)
+- `orelse return` is bare (no value); for a `bool` function restructure with an if-unwrap.
+- A string literal is read-only: bind it to `const [*]u8`. `.ptr` of a const slice is
+  `const *u8` — cast to `const *opaque`.
+- `cinclude` only emits the `#include`: declare every C function you call as a ZER signature.
+  C MACROS (`stderr`) are not visible — wrap them in a C helper.
+- The `_zer_` prefix is reserved for the compiler.
+- Returning a sub-slice / `&elem` of a slice or pointer PARAM is allowed; of a LOCAL is not.
+- `pool.get(h)` is non-storable (use it inline, or `h.field`); a `const Handle` is a const
+  KEY — the data stays writable. After freeing a pointer held in a global, reset the global.
 
-All language features (primitives, pointers, optionals, structs/enums/unions, containers, concurrency, async, defer, goto, comptime, intrinsics, MMIO, move struct, IR pipeline, etc.) are **complete on both Checker and Emitter paths**. Feature-level detail, per-feature status, and recent additions are tracked in:
-- `BUGS-FIXED.md` for recent fixes and session entries
-- `docs/compiler-internals.md` for implementation patterns and invariants
-- `docs/reference.md` for user-facing feature documentation
+## Project map
 
-IR pipeline is load-bearing since 2026-04-17 (commit `82335c3`). No AST fallback for function bodies. IR data structures in `ir.c`/`ir.h`, lowering in `ir_lower.c`, C emission from IR in `emitter.c`. See `docs/compiler-internals.md` "AST→IR emission safety invariant" for rules when touching IR emitter handlers.
+Pipeline: `lexer.c` → `parser.c` → `ast.c` → `checker.c` (types, escape / keep, VRP,
+concurrency, ISR) → `ir_lower.c` → `zercheck_ir.c` (handles, moves, threads on the CFG) →
+`emitter.c` → GCC. Also `types.c`, `ir.c` (IR + `ir_validate`), `vrp_ir.c`, `src/safety/*.c`
+(pure predicates: linked into zerc AND VST-verified from the same file), `zerc_main.c`
+(driver), `zer_lsp.c`, `tools/zer-convert.c` / `zer-upgrade.c` (C → ZER).
+- **`zercheck_ir.c` is the sole safety analyzer; `zercheck.c` is a shim — never add safety
+  code there.** `IR_POOL_ALLOC` and friends are never emitted by design (method detection is
+  `ir_classify_method_call_ex`).
+- **Emit-C via GCC is permanent.** Never suggest LLVM, QBE or a native backend. The compiler
+  is developed in C; self-hosting (`zerc.zer` compiles itself identically) is the v1.0
+  proof, not the development path.
+- Function bodies are IR-only. Before touching `ir_lower.c`, `ir.c` or an `IR_*` handler in
+  `emitter.c`, read compiler-internals.md "IR Path Validation" (the invariants each came
+  from a miscompile).
+- Flags: `--run`, `--emit-c`, `--emit-ir`, `--lib`, `--no-strict-mmio`, `--target-bits N`,
+  `--gcc PATH`, `--stack-limit N`, `--target-arch=`, `--target-features=`. Emitted C needs
+  `-fwrapv` and GCC extensions. User type names emit as-is; internal names are `_zer_`.
+- Navigate with `make tags` + grep; never read a source file end to end.
 
-<!-- Historical per-feature table removed 2026-04-19 — 90+ Done/Done rows
-     that rotted as features landed. Above summary replaces them; git log,
-     BUGS-FIXED.md, and docs/compiler-internals.md (IR invariants section)
-     have authoritative history. -->
+## Building & testing
 
-### Architecture Decision: Emit-C Permanently (decided 2026-03-25)
+`make zerc` · `make check` (everything) · `make docker-check` (the Windows host) ·
+`make check-proofs` (Coq / Iris + the admit gate) · `make check-vst` (VST on `src/safety/*.c`).
 
-ZER will **NOT** have native backends, IR, or QBE. Emit-C via GCC is the permanent architecture.
-- GCC handles all embedded targets, provides decades of optimization, acts as a second validation layer
-- No IR layer planned — emit-C → GCC is the only compilation path
-- **Never suggest IR, LLVM, QBE, or native code generation in this project**
-
-### Self-Hosting Strategy (decided 2026-03-27)
-
-**Develop in C, prove in ZER.** The compiler is always written in C (`.c` files). LLMs assist development. Fast iteration.
-
-Self-hosting means zerc can emit a working copy of itself in ZER (`zerc.zer`), compile that copy, and the result is an identical compiler. The ZER mirror is the ultimate integration test — NOT the primary development codebase.
-
-```
-src/                ← active C development (LLM-assisted, fast)
-  lexer.c, parser.c, checker.c, emitter.c, ...
-zer-src/            ← ZER mirror (proof of self-hosting)
-  lexer.zer, parser.zer, checker.zer, emitter.zer, ...
-bootstrap/          ← frozen C snapshot (insurance, never touched)
-  lexer.c, parser.c, ...
-```
-
-**Build chain:**
-```
-gcc src/*.c -o zerc              ← build from C (primary)
-./zerc zer-src/main.zer -o zerc_zer.c  ← compile ZER mirror
-gcc zerc_zer.c -o zerc2          ← build from emitted C
-diff zerc zerc2                  ← identical = v1.0 proven
-```
-
-**Why not develop in `.zer` directly:**
-- LLMs have zero ZER training data — they write C syntax and call it ZER
-- C development is faster with LLM assistance today
-- ZER development becomes viable when users post real ZER code online (trains future models)
-- The C codebase is the productive path; the ZER mirror is the correctness proof
-
-**v1.0 definition:** `zerc.zer` compiles itself and produces an identical compiler.
-
-**Migration to `.zer`-primary happens when:** ZER has enough public code (GitHub repos, blog posts, Stack Overflow) that LLMs learn the syntax natively. Until then, C is the development language.
-
-**Roadmap:** per-release changelogs (v0.2 → v0.4 feature lists) moved to
-`docs/compiler-internals.md` "Release history" (2026-06-10). Current: v0.3.0
-shipped; v0.4 MIR-inspired IR is DONE and load-bearing (since 2026-04-17);
-**v1.0 = self-hosting proof** (zerc.zer compiles itself identically).
-
-
-### C-to-ZER Conversion Tools (implemented v0.2)
-
-`tools/zer-convert.c` (Phase 1: C syntax → ZER syntax, token-level) +
-`tools/zer-upgrade.c` (Phase 2: compat builtins → safe ZER, source-to-source).
-Pipeline: `input.c → zer-convert → input.zer → zer-upgrade → input_safe.zer`.
-139 regression tests in `tests/test_convert.sh` (`make docker-test-convert`).
-Full transform catalog + architecture: `docs/compiler-internals.md`
-(zer-convert / zer-upgrade sections).
-
-### Compiler Internals — MANDATORY READING
-
-**Harvesting a `claude/*` audit branch? Read `docs/compiler-internals.md` "Harvesting an audit
-branch" FIRST** — fork-point triage, the cherry-pick loop, and the five traps (the big one:
-a CLEAN APPLY IS NOT EVIDENCE OF NO CONFLICT — two implementations of one rule merge without
-git noticing, which happened twice). Ten branches are already fully consumed; nothing remains
-to harvest from any `vigilant-tesla-*`.
-
-**MANDATORY — read `docs/compiler-internals.md` BEFORE modifying any compiler source file** (parser.c, checker.c, emitter.c, types.c, zercheck.c). It documents every emission pattern, optional handling, builtin method interception, scope system, type resolution flow, and common bug patterns. Skipping this and discovering patterns by reading source files wastes 20+ tool calls. The document exists specifically to prevent this.
-
-### Proof Internals — MANDATORY for Coq/Iris work
-
-**MANDATORY — read `docs/proof-internals.md` BEFORE modifying any
-`proofs/**/*.v` or `src/safety/*.c` file.** It has the fresh-session reading
-order, the Phase 1 extraction recipe, the VST common-errors table, spec/proof
-patterns that work, and (moved from this file 2026-06-10) the full 8-phase
-verification roadmap + the theory↔implementation CI-gate chain.
-
-Current state: 47 Iris/Coq files, ~330 axiom-free theorems across 7 subsets,
-zero admits; all 203 safety_list.md rows have real proofs. Phase 1 extraction
-COMPLETE (85/85 predicates in `src/safety/`, linked into zerc AND VST-verified
-by `make check-vst` — same .c file, no divergence possible). Phase 2 (decision
-extraction) 4/60. `make check-proofs` verifies zero admits.
-NEW 8th subset (2026-06-21): `lambda_zer_concurrency/` (10 files, zero admits) —
-the FIRST WP-using + threadpool subset; proves the four-condition concurrency
-closure (SUFFICIENCY). The WP-atomic-lifting RECIPE for ZER's flat languages + the
-per-file iteration build command + Iris-version gotchas (↦ notation absent, unit
-`tt` not `()`, `congruence`-fails-on-lookups, `done`-can't-close-iProp) are in
-`docs/proof-internals.md` "λZER-Concurrency subset" — READ before any concurrency
-proof work. Remaining: operational adequacy (generic plumbing) + wp_store/shared
-specs + formal necessity. Compiler implementation of the closure NOT started.
-NEW oracle subsets (2026-06-23): `lambda_zer_{bounds,qualifier,capture,volatile}/`
-— 4 self-contained `param_lattice.v`-style oracles (18 thms, zero admits, in the
-admit-gate, now 47 files) that CERTIFY THE FINITE-STATE DOMAIN for the four
-safety classes that previously had NO oracle (so their state sets were red-team-
-discovered — the root of BH-18 #2 bounds-OOB + #6 capture-UAF). bounds_lattice.v
-also pins the merge=JOIN rule #2 breaks; capture_lattice.v witnesses #6's reset
-as unsound. These are the SPEC (Level 1); writing the C against them (the
-`param_lattice.v → call_result_static_given_args` pattern) + VST-extracting the
-pure predicates is the follow-on — for bounds that means wiring the orphaned
-`vrp_ir.c`. The oracle-backed classes are now 11 (was 7).
-RICH-oracle rungs (2026-06-23, driving over-rejection DOWN via richer abstractions,
-theorem-first): `lambda_zer_escape/join_lattice.v` (the n-ary JOIN return summary —
-refines the flat `ret_param_mask` so a disjunctive return `pick(){if c return
-&local; return p}` keeps the ARParam fact instead of collapsing to UNKNOWN;
-saturate-toward-LOCAL keeps it sound; impl = mask→member-set behind the SAME
-`call_result_escapes` gate, NOT a re-architecture) and `lambda_zer_disjoint/
-disjoint_lattice.v` (the EXCEEDS-Rust prize — accept aliased mutation Rust rejects
-by rule when disjointness is PROVEN; disjointness is ADDITIVE, structurally unable
-to suppress UAF/OOB (the BH-18 #1 defense); impl needs a relational VRP layer = a
-re-architecture, deferred). admit-gate now 49 files.
-HANDLE flow-lattice oracle (2026-06-24): `lambda_zer_handle/handle_flow_lattice.v` (8 thms,
-zero admits, admit-gate now 50 files) — the MAX oracle for the use-after-free / MAYBE_FREED
-class (the #1 safety class, previously the WEAKEST-proven: operational track unproved +
-excluded, gated Iris track flat 2-state + placeholders). Level A certifies the soundness
-lattice the compiler ALREADY runs ({HUninit,HAlive,HFreed,HMaybe}, merge=JOIN,
-use-requires-ALIVE; `join_freed_blocks_use` = the MAYBE_FREED conservatism CERTIFIED). Level B
-specs the GUARDED refinement that recovers the idiomatic over-rejection `if(c){free}
-if(!c){use}` (`maybe_freed_correlation_recovered` — a use under guard `!c` is safe when the
-free is under the disjoint guard `c`; `guarded_not_disjoint_rejects` = no under-rejection).
-Level B's IMPLEMENTATION **SHIPPED 2026-06-27** (zercheck_ir.c): per-block immutable-bool
-guard sets + per-handle `free_block`/`freed_all_paths` recover `if(c){free} if(!c){use}` at
-the use site, the double-free site, AND the leak check, all gated on provable guard
-disjointness; soundness gate = `ir_local_is_immutable_bool` via a no-default exhaustive AST
-walk (`ast_name_mutated_or_addrd`) that rejects any reassigned/address-taken condition (two
-accept-unsafe holes — reassigned param, `&c` in a call arg — were found+closed during the
-build; 6 negatives in `tests/zer_fail/guarded_*` pin them). So the handle DOMAIN is now
-certified AND the precision recovered; the proof-track admits/placeholders are a separate
-cleanup. The oracle-backed classes are now 12. See BUGS-FIXED.md 2026-06-27.
-
-The three levels (keep straight in any claim):
-- **Level 1** (typing.v + operational subsets) — the abstract safety spec is correct.
-- **Level 2** (tests/zer_proof/) — the compiler empirically rejects known violations.
-- **Level 3** (VST on extracted `src/safety/*.c`) — real compiler code matches
-  the spec for EVERY input. Catches what 1+2 miss (`if (x = 1)` typo class).
-
-THE ONE RULE that must survive any summary: **write Coq specs against the
-Level 1 ORACLE (typing.v / operational subset / safety_list.md), NEVER against
-the current C behavior.** A code-driven spec is a tautology that freezes bugs
-into CI forever; an oracle-driven spec makes VST failure EXPOSE compiler bugs.
-If no Level 1 oracle exists for the subsystem → audit first (can't write
-oracle-driven specs without an oracle).
-
-**MAX-ORACLE STANDARD (MANDATORY — the DEFAULT, not an upgrade you wait to be asked
-for).** When writing ANY oracle (the Coq/Iris Level-1 spec for a safety class) write
-the MAXIMAL one — the richest sound, decidable abstraction — NEVER the coarsest that
-merely certifies soundness. A coarse oracle is a RUNG to climb, not a destination; a
-fresh session that writes the simple version and stops has under-delivered. The whole
-point of an oracle is "all finite variables, fully, none missing" — the most precise,
-maximally-inferring abstraction the class admits. The bar:
-1. **Finite-state COMPLETENESS — every distinguishable variable, none missing.** The
-   abstract domain must capture EVERY state the concrete semantics can be in for that
-   property, DERIVED from the operational semantics (not guessed). A missing state is
-   over-approximation (over-reject) or — worse — an un-representable bad state = a
-   SOUNDNESS HOLE: every BH-18 🔴 hole IS a missing finite variable. The `∀ r` proof
-   certifies the states; an incomplete state set = a sound proof the C still can't
-   classify a form against → hole.
-2. **MAX PRECISION — richest abstraction, minimize over-rejection.** Prefer relational
-   over flat (n-ary JOIN over a bitmask; a Tofte–Talpin outlives partial order over a
-   flat lattice; interval-relational `i<j` over plain intervals; reduced-product
-   refinement where two domains feed each other). Drive over-rejection toward minimal;
-   stop ONLY at diminishing returns. Soundness is a HARD WALL (zero under-rejection,
-   non-negotiable); over-rejection is a SOFT gradient (minimize, never zero — Rice).
-   "Least false positive is fine; allowing unsafe never is."
-3. **The 4-theorem contract per oracle (`param_lattice.v` is the template):** T1
-   transfer/decision soundness; T3 a PRECISION WITNESS (name the exact over-rejection
-   it closes — proves the gain is real); T4 NO-UNDER-REJECTION (the crown jewel — a
-   true-dangerous state is FORCED to reject). Plus MERGE = JOIN/LUB with the UNSAFE
-   classification as the conservative default (saturate-toward-LOCAL / widen-toward-
-   FREED / TOP-never-elides) so a missed or unclassifiable form can ONLY over-reject.
-   `bounds_lattice.v`'s `elide_on_join_sound` is the merge template.
-4. **Zero admits, in the `make check-proofs` admit-gate, oracle-driven, honest LIMIT
-   named** (the Rice/decidability fallback to conservative). Self-contained
-   `param_lattice.v`-style files; templates: `lambda_zer_escape/{param_lattice,join_lattice}.v`,
-   `lambda_zer_disjoint/disjoint_lattice.v`, `lambda_zer_{bounds,qualifier,capture,volatile}/`.
-Accuracy of a class = completeness of its finite-state set × completeness of its
-transfer matrix × reduced-product refinement across classes — the MAX oracle maxes all
-three while the soundness floor never moves. Writing the oracle is pure spec work (no C,
-no re-architecture, doesn't worsen soundness) so it goes FIRST; the implementation against
-it is mechanical afterward.
-
-**THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
-precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by
-Rice: the true set "memory-safe on every execution" is undecidable, so no sound,
-terminating analysis can match it; every one must over-reject SOME safe program. Decompose
-the over-rejection into two parts and design only against the second:
-- **FORCED (semantic, UNPAYABLE).** Any FINITE sound abstraction of the infinite concrete
-  space must LOSE information — at control-flow joins, at operations the domain can't
-  represent exactly, at cross-class interactions — and at every loss point soundness forces
-  rounding TOWARD reject. Over-rejection and soundness are the SAME coin: you cannot have
-  "finite + sound" without "rounds-toward-reject somewhere." This floor cannot be removed;
-  chasing it is wasted effort.
-- **PAYABLE (engineering, RECOVERABLE).** Extra over-rejection from a cheaper-than-necessary
-  abstraction or a not-yet-built refinement. THIS is the entire design target. Two levers
-  recover it: REDUCED PRODUCT (combine class theorems so domains feed each other — recovers
-  the cross-class loss) and RELATIONAL domains (octagon/outlives `i<j`/region-order — recover
-  the within-class join loss). "Infer more / combine theorems" pays this down, moving toward
-  the wall without reaching it. Cost: each richer abstraction is a NEW soundness-proof surface
-  (the MAX-oracle burden) — bounded by "prove each increment," not free.
-NOT a mapping limit: the oracle is finite-state BY CONSTRUCTION, which is exactly what makes
-it map to C and VST-verify (the Level-1→3 extraction IS that mapping, and it works); state
-count is bounded, tracking is polynomial for most domains (only the richest relational
-domains — octagon O(n³), polyhedra exponential — cost enough to trade precision for speed, a
-payable choice, not a wall). The theorem maps into C perfectly; what doesn't map is the gap
-between the FINITE theorem and the INFINITE truth it approximates — non-zero for any finite
-theorem, by Rice, no matter how many elements are tracked. So: spend design effort on the
-payable side (reduced product + relational refinement, each proven), accept the rare forced
-tail, never chase the hard wall.
-
-**OPERATIONAL PRECONDITIONS ARE FINITE VARIABLES — model them in the oracle, not just the
-states (the Level B lesson, 2026-06-27).** A MAX oracle must model not only the abstract
-STATES + transfer + decision, but every OPERATIONAL PRECONDITION the decision silently relies
-on. Concrete case that proved this: the handle Level B oracle
-(`lambda_zer_handle/handle_flow_lattice.v`) proved "DISJOINT guards → safe use" with guards
-as abstract `world -> bool`. Sound *for that model* — but it OMITTED one finite variable:
-**guard STABILITY** (that `c` at the free and `c` at the use are the SAME value — the
-condition is not reassigned or address-taken between the two program points). The free and
-the use happen at DIFFERENT points; if the guard's underlying value can change between them,
-"disjoint" is a lie (`if(c){free} c=e; if(!c){use}` with `c` reassigned is a real UAF). The
-oracle modeled the LOGIC (disjoint → safe) but not the PRECONDITION (same stable value), so
-the abstract domain did not CONTAIN the variable that distinguishes safe from unsafe.
-Consequence — the textbook missing-variable symptom: the implementation's two accept-unsafe
-holes (a reassigned param looked immutable; `&c` in a call arg looked immutable) were found
-by RED-TEAM, **not by a failing proof** — because the proof's model had no variable to fail
-on. The rules this adds to the standard:
-- **"All finite variables, none missing" INCLUDES preconditions.** A relaxation `P → accept`
-  is a MAX oracle only if `P` carries EVERY condition reality requires (here: disjoint AND
-  stable). Enumerate the operational preconditions of every decision and make each an explicit
-  hypothesis in the oracle.
-- **The tell you missed one: a soundness hole found by testing/red-team rather than by a
-  failing proof.** That means the abstract domain lacked the distinguishing variable. The fix
-  is to ADD it to the oracle (climb the oracle), NOT just patch the C — a C patch leaves the
-  oracle still certifying the wrong thing and the next form of the same hole still un-modeled.
-- **Where the oracle can't yet model it, the C must DISCHARGE it with a complete gate, and
-  that gap must be written down.** Level B's stability precondition is discharged by
-  `ir_local_is_immutable_bool` (a no-default exhaustive AST walk); the oracle file now records
-  that its `world->bool` abstraction PRESUMES stability, discharged there. That note is the
-  honest bridge until the oracle is strengthened to model the temporal/mutation dimension.
-
-**IMPLEMENTING A RELAXATION (any reject→accept change) — the accept-unsafe discipline.** A
-relaxation is the ONE change class where a bug = a SHIPPED use-after-free (everything else
-this codebase does TIGHTENS, where a bug only over-rejects = safe). Treat it accordingly. Full
-methodology + the Level B worked case study (the three accuracy layers, decision-layer vs
-state-layer recovery, the two holes and how each was a missed mutation form, the incremental
-no-behavior-change build): `docs/compiler-internals.md` "Sound relaxation (reject→accept)".
-The four load-bearing rules:
-1. **Diagnose the LAYER first.** Over-rejection is almost always a COARSE DOMAIN (theorem
-   sound, C faithful, the lattice lost info at a JOIN — e.g. MAYBE_FREED collapses
-   freed-under-c / alive-under-!c into one blob), NOT "theorem wrong" or "C inference bug." The
-   fix is a RICHER abstraction proven sound, never an ad-hoc C patch.
-2. **The soundness gate must be a COMPLETE exhaustive walk, not IR-field inspection.** Writes
-   and address-takes (and other "is this safe to relax?" facts) hide in AST exprs the flat IR
-   does not expose (`c = e` → `IR_ASSIGN`-in-expr; `flip(&c)` → a call-arg expr). Use a
-   no-default exhaustive AST walk (under `-Werror=switch`), conservative-on-unknown. An
-   IR-field scan is structurally incomplete → accept-unsafe holes.
-3. **Prefer decision-layer recovery over state-layer when the state layer is the fixpoint.**
-   Overriding the accept/reject decision via a read-only side channel (Level B's guard sets)
-   leaves the lattice state coarse but keeps the CFG fixpoint/convergence untouched and
-   concentrates the risk in ONE predicate. Refining the state itself (truly-truthful, richer
-   lattice) is higher precision but touches convergence — the higher-risk endgame, not the
-   default.
-4. **Build incrementally with a no-behavior-change checkpoint:** foundation + tracking → verify
-   `make check` GREEN (proves convergence/no regression) → THEN flip the relaxation + the full
-   negative matrix. Isolates the one risky bit; the negatives are the safety net.
-
-New extraction → follow proof-internals.md "Phase 1 extraction recipe" +
-Makefile/.gitignore checklist. VST-friendly C style: flat cascade of
-early-return ifs, NO nesting, NO compound conditions (split predicates and
-AND at the call site).
-
-Contents of `docs/compiler-internals.md`:
-
-**Emitter Critical Patterns (causes of most bugs):**
-- `?*T` → plain C pointer (NULL sentinel). `?T` (value) → struct with `.has_value`/`.value`. `?void` → NO `.value` field.
-- Bounds checks: simple index uses comma operator (lvalue), side-effect index uses GCC statement expression (single-eval).
-- Slice types: named typedefs `_zer_slice_T` for all types. `?[]T` → `_zer_opt_slice_T`.
-- Builtin methods: Pool/Ring/Slab/Arena intercepted in emitter NODE_CALL handler.
-- Function pointer syntax: name inside `(*)` — handled by `emit_type_and_name`.
-
-**Critical Bug Fix Patterns (1-181):**
-All numbered patterns from BUG-042 through BUG-337. Key themes:
-- `?void` has ONE field (has_value), everything else has TWO — check at every optional null emission site
-- `TYPE_DISTINCT` must be unwrapped before ANY type dispatch — use `type_unwrap_distinct()`. **This was the #1 bug class: 35+ sites fixed in one session.** Every `->kind == TYPE_X` on a type from `checker_get_type()` / `check_expr()` needs unwrap. The helpers `type_is_optional()`, `type_is_integer()`, `type_width()` unwrap internally. `type_is_optional()` and `type_unwrap_optional()` also unwrap distinct now.
-- `is_null_sentinel()` function (not macro) unwraps distinct before checking pointer/func_ptr
-- Named typedefs required for EVERY compound type — prevents anonymous struct duplication
-- `__typeof__` instead of `__auto_type` for captures/orelse temps — preserves volatile/const
-- Module mangling uses `__` (double underscore) separator — 8 sites in checker + emitter
-- Scope escape checks cover return, assignment, keep params, orelse fallback, @ptrcast
-- Union variant lock walks ALL deref/field/index levels and detects pointer-type aliases
-
-**Structural Refactors (RF1-RF12):**
-- RF1: Typemap in Checker struct (not globals). RF2: Unified `emit_top_level_decl()`.
-- RF3: `resolve_type()` caches in typemap. RF4: Arena-allocated mangled names.
-- RF5: Lightweight parser lookahead. RF8: `CONST_EVAL_FAIL` sentinel.
-- RF9: Dynamic parser arrays. RF10: `is_func_ptr_start()` consolidated.
-- RF11: Shared `expr_is_volatile()` / `expr_root_symbol()` helpers.
-- RF12: `build_expr_key_a()` arena-allocated expr keys (no fixed `char[128]` buffers). Dynamic `ComptimeParam` arrays (stack-first `[8]` with arena overflow).
-- RF13 (2026-05-28): Shared `expr_has_side_effects(Node *)` helper in emitter.c — exhaustive `switch` on `NodeKind` (no `default:`, enforced by walker_default_audit.sh). Used by: NODE_INDEX single-eval emission for slices, compound shift target hoist, compound div target hoist. Pre-RF13 each call site had its own partial walker that descended `NODE_INDEX.object` but skipped `.index`, silently double-evaluating `arr[fn()] <<= n` style code (BUG-661/662/663). Any new emission site that must single-evaluate a target lvalue should use this helper rather than rolling its own walker.
-
-**Design Decisions (intentional, NOT bugs):**
-- `@inttoptr(*T, 0)` allowed (MMIO address 0x0), shift widening spec-correct, `[]T → *T` coercion removed
-- `HS_MAYBE_FREED` conservatism: if handle freed in one branch of if-without-else → MAYBE_FREED → compile error on subsequent use. Fix: add `return;` after free. This forces better code structure. NOT a borrow checker — ZER's Handle model is simpler (indices, not references). Borrow checking would add lifetime annotations for zero additional safety since Handle+zercheck already covers all cases.
-- Type ID 0 for `*opaque` provenance: extern/cinclude pointers get type_id=0 (unknown). `@ptrcast` check skips type_id==0 to allow C interop. Not a security hole — C code is outside ZER's safety boundary. Future `--strict-interop` flag could force explicit type assignment.
-- No pointer arithmetic: `ptr + N` deliberately rejected. Use `ptr[N]` for pointer indexing, `@ptrtoint` + math + `@inttoptr` for MMIO. Safety feature, not a gap.
-- Atomic width validation: `@atomic_*` on 64-bit targets warns about libatomic requirement on 32-bit platforms (AVR, Cortex-M0). Width must be 1/2/4/8 bytes.
-- `pool.get(h)` is intentionally verbose — Handle is `u64` (index+gen), carries no pool reference. BUT `h.field` now works via Handle auto-deref (compiler finds the unique Slab/Pool in scope, auto-inserts `.get(h)`). If multiple allocators for same type exist, uses `slab_source` provenance or unique-allocator fallback. Ambiguous = compile error.
-- `alloc_ptr()` / `free_ptr()` — alternative to Handle that returns `*T` directly. Same zercheck tracking (ALIVE/FREED/MAYBE_FREED). 100% compile-time safe for pure ZER code. For C interop (`*opaque` boundary), Level 2+3+5 runtime backup. Both Handle and alloc_ptr can be used on the same Slab/Pool. `free_ptr()` type-checks argument — `*Motor` to `Task` pool is a compile error.
-- zercheck `*opaque` coverage: 9a (struct field `ctx.data` after free = compile error), 9b (cross-function free via FuncSummary — `destroy(t)` marks `t` FREED at call site), 9c (returning freed pointer = compile error). Coverage ~98% compile-time for `*opaque`, remaining ~2% is runtime (dynamic array index, C library boundary) at ~1ns inline header check.
-- Handle auto-deref safety: const Handle mutation blocked, allocator existence verified at check time (no silent `0` emission), ghost handle check covers `alloc_ptr()`.
-- goto + defer interaction: goto fires all pending defers before jumping (same as return/break/continue). goto/label validation covers switch arms, defer bodies, @critical bodies.
-- **Known limitation (partially resolved):** zercheck is linear (not CFG-based). Same-block backward goto UAF now caught via 2-pass re-walk (2026-04-06). Cross-block backward goto (goto from nested if-body to parent label) still falls back to runtime gen check.
-- **Interior pointer UAF tracking (2026-04-07):** `*u32 p = &b.field; free_ptr(b); p[0]` — field-derived pointer shares alloc_id with parent. When parent freed, all interior pointers marked FREED. NODE_INDEX added to zercheck UAF checks (was missing — only NODE_FIELD and NODE_UNARY/deref were checked). Remaining gap: `@ptrtoint` + math + `@inttoptr` — guarded by mmio declaration requirement, not pointer tracking.
-- `Task.alloc()` / `Task.free()` — auto-creates a global `Slab(T)` per struct type. No Slab declaration needed. Returns `?Handle(T)`. `Task.alloc_ptr()` returns `?*T`. `Task.free_ptr()` type-checks argument. Auto-slabs emitted after struct declarations, before function bodies (two-pass emission). One auto-Slab per struct type, program-wide.
-- **Emitter two-pass:** `emit_file` now emits struct/enum/union/typedef declarations first (pass 1), then auto-slab globals, then functions/globals (pass 2). This ensures auto-slabs can use `sizeof(StructType)`.
-- **CRITICAL BUG (fixed):** orelse block path (`orelse { return; }`) emitted `0` as final statement expression value for null-sentinel `?*T`. This made ALL `*T = alloc_ptr() orelse { return; }` assign 0 instead of the pointer. The bare form (`orelse return`) was correct — only the block form was broken. Fixed: emit `_zer_tmp` for null-sentinel, `_zer_tmp.value` for struct optional.
-- **Real code finds real bugs:** Writing a 60-line HTTP server in ZER found this orelse bug that 1,700+ tests missed. All tests used bare `orelse return`, none used block `orelse { return; }`. Lesson: write real programs in ZER, not just tests.
-- zercheck now scans defer bodies for free/delete calls — `defer pool.free(h)` no longer triggers false "never freed" warning. Also: if-branch that always exits (return/break/continue) doesn't cause MAYBE_FREED — `if (err) { free(h); return; } use(h);` is correctly seen as safe.
-- **CRITICAL BUG (fixed):** Auto-slab initializer used positional `{sizeof(T), 0, 0, ...}` which put sizeof into wrong field (`pages` instead of `slot_size`). Fix: designated initializer `{ .slot_size = sizeof(T) }`. Same pattern as normal Slab emission. All `Task.alloc()` was broken until this fix.
-- **Lesson: always use designated initializers for emitted struct init.** Positional initializers are fragile — field order in `_zer_slab` doesn't match naive assumption. Future emitter code MUST use `.field = value` syntax, never positional.
-- `const Handle(Task)` allows data mutation through auto-deref. Handle is a KEY (like `const int fd`), not a pointer. const key ≠ const data. Assignment checker sets `through_pointer = true` for TYPE_HANDLE in field chain. This also fixes if-unwrap `|t|` + Handle auto-deref (capture is const but data mutation is allowed).
-- zercheck recognizes `Task.free()` / `Task.free_ptr()` as free calls (TYPE_STRUCT method detection). Also `Task.alloc()` / `Task.alloc_ptr()` as alloc calls. ISR ban applied to Task.alloc/new_ptr same as slab.alloc.
-- Pool/Slab/Arena are NOT the same thing with different names — Pool (fixed, ISR-safe, no malloc), Slab (dynamic, grows via calloc, NOT ISR-safe), Arena (bump allocator, bulk reset). Don't rename or unify them.
-- `pool.get()` is non-storable — `*Task t = pool.get(h)` is a checker error. Must use inline: `pool.get(h).field`. BUT scalar field values CAN be stored: `u32 v = h.value;` works (Handle auto-deref reads the value, not the pointer). Only pointer/slice/struct/union results from get() are blocked.
-- Array→slice auto-coercion at call sites already works: `process(arr)` where `process([]u8 data)` auto-converts `u8[N]` to `[]u8 {ptr, len}`.
-
-**Known Technical Debt:**
-- **Qualified module call syntax supported:** `config.func()` rewrites to unqualified `func()` with mangled lookup. Works for regular functions and comptime functions. Unqualified calls still work as before.
-- checker.c is 6700+ lines (monolith) — works but large to navigate. Split not urgent.
-- zercheck was NOT integrated into zerc until 2026-04-03. Now runs in pipeline: checker → zercheck → emitter. **Leaks are compile ERRORS** (since 2026-04-06 alloc_id redesign). alloc_id grouping eliminates false positives from `?Handle`/`Handle` pairs. Escape detection covers return, global store, param field store, and untrackable array assignment. UAF, double-free, and leaks are all compile errors.
-
-**Internal Quality Invariants (permanent — applies to all sessions):**
-- Static globals (`_comptime_global_scope`, `_comptime_call_depth`) are safe — LSP is single-threaded, no concurrency
-- Parser arrays are already dynamic (RF9) — stack-first `[32]` with arena overflow doubling
-- Checker key buffers are now arena-allocated (RF12) — no fixed `char[128]` limits remain
-- Symbol lookup is `memcmp`-based — standard for C compilers (GCC/TCC do the same)
-- ZER does NOT need: lifetime/borrow tracking (memory model too simple for it), generics (`*opaque`+provenance covers it), incremental compilation (emit-C + Makefile handles it), closures (function pointers + `*opaque` context is the C pattern)
-- **Bounds safety philosophy: prove, don't guard.** When array index can't be proven safe, prefer extending range propagation to make it provable (zero overhead) over adding auto-guard/bounds-check (runtime overhead). `arr[func()]` with proven return range = zero overhead. Auto-guard is the fallback, not the goal. For loop conditions (while/for), auto-guard can't work (value changes each iteration) — instead extend `find_return_range` to prove more call chains. Inline `_zer_bounds_check` trap is correct for genuinely unprovable cases (external input).
-- **`find_return_range` chains:** `get_slot()` → `raw_hash()` → `% N` — return range propagates through call chains.
-- **Leak detection: track ALLOCATIONS not variable names.** `alloc_id` on HandleInfo groups `?Handle mh` and `Handle h` as the same allocation. When any alias is freed/escaped, the whole group is covered. Previous approach (tracking variable names independently) caused false positives — `mh` and `h` were "strangers" even though they're the same allocation. The alloc_id redesign eliminated ALL false positives and enabled upgrading leaks from warnings to compile errors. Constant returns (`return 0`), `% N`, `& MASK`, and chained calls all handled. Order-dependent: callee checked before caller (declaration order). Cross-module: topological order ensures imported function ranges available.
-
-**Error Display:**
-- Errors show source line + caret underline: `3 | arr[10] = 1;` / `  | ^^^^^^^^^^^^`
-- `Checker.source` and `Parser.source` fields hold source text (NULL = skip display)
-- `print_source_line()` in checker.c, `print_source_line_p()` in parser.c (same logic, separate to avoid shared header)
-- `zerc_main.c` passes `Module.source` to both parser and checker, switches `checker.source`/`checker.file_name` when checking imported module bodies
-- Tests and LSP set source=NULL (memset zero) — source line display silently skipped
-- Carets underline from first non-whitespace to end of line (max 60 chars)
-
-**Benchmark Baseline (Docker x86, gcc -O2 — reference when adding runtime checks):**
-- Bounds check: ~0-4% overhead (branch predictor eliminates always-false check)
-- Division guard: ~0-5% overhead (single branch, always predicted not-taken)
-- Shift safety: ~0% overhead (ternary compiles to cmov, no branch)
-- Handle gen check: ~60-130% in synthetic microbenchmark (tight loop doing nothing but pool.get), <5% in real code with actual computation per access
-- Benchmarks in `benchmarks/` directory (not committed — local only)
-
-**Proven bug patterns — found by real-code testing:**
-- `const u32 MAP_SIZE = 16; h % MAP_SIZE` → false "not proven nonzero". Root cause: `eval_const_expr` doesn't resolve `NODE_IDENT`, and `sym->func_node` was never set for `NODE_GLOBAL_VAR` in `register_decl`. Fix: (1) add const symbol init lookup in division guard path, (2) set `sym->func_node = node` for global vars. Both `/` `%` and `/=` `%=` paths fixed.
-- `#line` directive emitted on same line as `{` in orelse-return defer path → GCC "stray #" error. All `emit(e, "{ "); emit_defers(e);` sites changed to `emit(e, "{\n"); emit_defers(e);` (var-decl orelse return, auto-guard return, orelse break/continue).
-- Windows `zerc --run`: quoting `"gcc"` in `system()` breaks `cmd.exe`. Fix: only quote gcc path if it contains spaces (bundled path vs system PATH).
-- `pool.get()` is non-storable — `*Task t = pool.get(h)` is a checker error. Must use inline: `pool.get(h).field`.
-- `[]T → *T` auto-coerce at call sites for extern C functions only. `puts("hello")` works without `.ptr` when `puts` is forward-declared with no body. ZER-to-ZER calls still require explicit `.ptr`. Emitter already had `.ptr` emission (line ~1265), checker was blocking it.
-- Range propagation now derives bounds from `x % N` → `[0, N-1]` and `x & MASK` → `[0, MASK]`. Resolves const symbol init values. Eliminates false "index not proven" warnings for hash map `slot = hash % TABLE_SIZE; arr[slot]` pattern. `derive_expr_range()` helper used at both var-decl init and assignment paths.
-
-**ZER Integration Tests (`tests/zer/`):**
-- Real `.zer` files compiled with `zerc --run`, must exit 0
-- Runner: `tests/test_zer.sh`, added to `make check`
-- COUNT FROM THE TREE, never from this file: `ls tests/zer/*.zer | wc -l` (the numbers here have been
-  wrong by 2x before — a census written from memory rots silently).
-- Positives: compile + run + exit 0. Negatives (`tests/zer_fail/`): must FAIL to compile AND, when the
-  file carries `// expect-error: <substring>`, fail for THAT reason.
-- Runtime-trap tests: `ls tests/zer_trap/*.zer` (compile clean, trap at runtime — slice bounds, signed div overflow, @inttoptr safety)
-- Module tests: `ls test_modules/*.zer` (~28 including diamond imports, shared cross-module, opaque wrappers)
-- Examples (not in automated tests): `examples/http_server.zer` — minimal HTTP server, needs network
-- Add new tests by dropping `.zer` files in `tests/zer/` — runner picks them up automatically
-
-### Test Locations Summary
-| Directory | What | Count | Runner |
-|---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 1002 (2026-11-13) | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 1795 (2026-11-13) | `tests/test_zer.sh` |
-| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 109 (2026-11-13) | `tests/test_zer.sh` |
-| `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 1 (2026-11-13) | `tests/test_zer.sh` |
-| `test_modules/` | Multi-file module tests | 115 files (2026-11-13) | `test_modules/run_tests.sh` |
-| `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |
-| `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |
-| `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
-| `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/**view-alias**/hw/async/asm/defer-goto) | 10 grids | `make check` |
-| `examples/qemu-cortex-m3/` | Real firmware examples (QEMU Cortex-M3 + hosted) | 8 | Manual (`make qemu` or `zerc --run`) |
-
-All runners auto-detect positive vs negative tests. `make check` runs everything.
-
-**Firmware examples (v0.3 feature coverage):**
-- `hello.zer` — MMIO, UART, enum, orelse, bounds check (v0.2)
-- `rtos.zer` — Pool, Ring, Arena, Handle, spawn, union, defer (v0.2)
-- `shell.zer` — Pool, Ring, Arena, spawn, switch (v0.2)
-- `ringbuf_protocol.zer` — Ring, Arena, Handle, enum (v0.2)
-- `stress_test.zer` — Arena, Handle, union, defer (v0.2)
-- `async_sensor.zer` — async/yield, comptime, container(T), move struct, designated init (v0.3)
-- `concurrency_demo.zer` — shared struct, Semaphore, @once, @critical, spawn+join (v0.3)
-- `slab_registry.zer` — Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch (v0.3)
-
-### VACUOUS TESTS — the #1 way this suite lies to you (both forms found 2026-08-03)
-
-**The name.** A test whose PASS CONDITION IS WEAKER THAN ITS CLAIM. Two forms, one root
-cause: *the verdict did not depend on the thing under test.* Both were live here, under
-~500 tests, and both are now gated.
-
-| Form | What it looks like | Found here |
+| Directory | Expectation | Runner |
 |---|---|---|
-| **Weak oracle** — passes for the WRONG reason | negative test asserts only "compiler exited non-zero" | 476 negatives; diagnostic went to `/dev/null` |
-| **Unexecuted** — never runs at all | a test directory no runner globs | `tests/zer_gaps/`, 43 files, wired to NOTHING |
-
-**Why the weak-oracle form is structural here, not sloppiness.** ZER has MANY INDEPENDENT
-SAFETY RULES OVER THE SAME PROGRAMS. When N rules can reject one file, "exit != 0" tests
-whichever fires FIRST, which is usually not yours. Measured instances: a branch condition
-mentioning the borrowed variable tripped the READ check; a conditionally-joined
-ThreadHandle tripped the LEAK check; the 2026-08-02 I1 unbounded-index rule now masks TWO
-older mmio/alignment gaps.
-
-**THIS GETS WORSE AS THE COMPILER GETS BETTER.** Every rule added increases the masking
-surface. The §A–§J sweep measurably made it worse — one of my own fixes masked two gaps.
-So the discipline has to tighten as coverage grows, not relax.
-
-**Why the unexecuted form happens.** A directory created with "documentation" semantics
-drifts into being TREATED as coverage. `tests/zer_gaps/` was a genuine convention
-(compile-clean = the gap) and still rotted: of 43 files, **18 had silently CLOSED** (a
-safety rule fixed with no regression test proving it), **5 were MASKED** (gap still open
-but invisible), **1 no longer parsed**. Nobody knew, because nothing ran it.
-
-**The generalization worth keeping: an un-executed test artifact decays to ZERO value, then
-to NEGATIVE value once people believe it covers something.** This is the same principle
-this file already states for GATES ("a stale matrix is worse than none — false
-confidence"), applied to TESTS. Treat them identically.
-
-**THE RULES.**
-1. A negative test states WHY: `// expect-error: <substring>` (first 5 lines). Assert the
-   reason the rule is SUPPOSED to give — never paste what it currently prints, or you
-   freeze a wrong reason into the suite.
-2. Every test directory is executed by a runner. If you add one, wire it in the SAME
-   commit, or it is documentation — label it as such and do not count it as coverage.
-3. `tests/zer_gaps/` runs with the expectation INVERTED (compile-clean = the gap holds).
-   A gap that closes FAILS LOUDLY telling you to promote it; a gap that becomes masked
-   needs `// gap-masked-by: <substring>` — the justification, same shape as an audit
-   baseline row.
-4. Same for hand probes: `zerc f.zer -o /dev/null` returning non-zero does NOT mean your
-   rule fired. Read the message.
-5. Verify a new test gate FIRES before trusting it (inject a wrong expectation / a fake
-   closure). A gate that has only ever passed is a script, not a net.
-
-### A NEGATIVE TEST PROVES NOTHING UNTIL YOU READ THE DIAGNOSTIC — use `// expect-error:`
-
-`tests/zer_fail/` passes a test on ANY non-zero exit. Until 2026-08-03 the diagnostic went
-to `/dev/null`, so **an entire safety rule could be deleted and its negatives would keep
-passing**, as long as some OTHER rule happened to reject the same file. That is a
-silent-green generator sitting under ~476 negative tests — the same shape as a false-green
-checker hole, one level up in the harness.
-
-It was measured twice on ONE entry (cross-block scoped borrow): first a branch condition
-mentioning the borrowed variable tripped the READ check, then a conditionally-joined
-ThreadHandle tripped the LEAK check — both masking the borrow rule under test.
-
-**Put `// expect-error: <substring>` in the first 5 lines of a negative test.** The runner
-asserts the compiler's stderr contains it and reports the ACTUAL diagnostic on mismatch.
-The directive is OPTIONAL (a file without one keeps exit-code-only behaviour), so backfill
-highest-value-first. Assert the reason the rule is SUPPOSED to give, never paste whatever
-it currently prints — otherwise you freeze a wrong reason into the suite.
-
-Corollary for any hand-run probe: `zerc f.zer -o /dev/null` returning non-zero does NOT
-mean your rule fired. Read the message, or you will "confirm" a fix that is another rule
-masking the hole.
-
-### Test-authoring constraints that are NOT obvious (cost real loops 2026-08-02)
-
-A `tests/zer/` positive must compile AND run AND exit 0 on a HOSTED x86-64 host. Three shapes cannot
-satisfy that, and each looks like a compiler bug until you know why:
-
-- **An `interrupt` block cannot appear in a runnable positive.** GCC refuses it on hosted x86-64
-  ("sorry, unimplemented: SSE instructions aren't allowed in interrupt service routine"). No existing
-  `tests/zer` positive contains one. Verify such a case COMPILE-ONLY (`zerc f.zer -o f.c`) and say so
-  in the test/commit; put the negative in `tests/zer_fail/` as usual (it fails at the CHECKER, before
-  gcc, so it works fine).
-- **An MMIO positive must never actually touch the address.** Follow `mmio_var_idx_guard.zer`: pass an
-  OUT-OF-BOUNDS index so the auto-guard fires and returns 0. A draft that indexed IN bounds SIGTRAPped
-  133/133. That the guard fires is itself the proof the bound was derived.
-- **A defect that is about OUTPUT SIZE or compile TIME has no home** in either harness (positive =
-  exit 0, negative = must-not-compile). Record the measurement + reproduction recipe in BUGS-FIXED.md
-  instead of forcing a test (see §H2, the quadratic error-echo DoS).
-
-**Sweeping for regressions: `rust_tests/` contains NEGATIVES too.** They are not all named
-`reject_*` — some carry `// EXPECTED: compile error` in the header (e.g. `gen_goto_002.zer`). A sweep
-that treats the whole directory as positives reports false regressions. Filter on BOTH the name and
-that marker. And ALWAYS baseline an apparent regression against a from-HEAD `git archive` build before
-believing it: on 2026-08-02 eight "regressions" plus all 8 firmware examples were identical pre and
-post (they need qemu/asm-flag/cross-compile invocation).
-
-**The firmware examples are NOT in `make check`** and do not run on the host (bare-metal Cortex-M3).
-`zerc examples/qemu-cortex-m3/hello.zer -o /tmp/h.c` succeeds with only a deprecation warning —
-`--run` failing is EXPECTED, not a defect.
-
-### Test Organization Rules — Where to Put New Tests
-
-**By origin — which folder:**
-| Test Origin | Positive → | Negative → |
-|---|---|---|
-| Bug fix / red team audit / ZER-specific safety | `tests/zer/` | `tests/zer_fail/` |
-| Multi-module / import / cross-file | `test_modules/` | `test_modules/` (with `_negative` suffix) |
-| Translated from Rust `tests/ui/` | `rust_tests/rt_*.zer` | `rust_tests/reject_*.zer` |
-| Translated from Zig test suite | `zig_tests/zt_*.zer` | `zig_tests/zt_reject_*.zer` |
-| C unit test (parser/checker/emitter) | `test_*.c` | `test_*.c` (err() helper) |
-
-**The rule:** If a test is translated from Rust/Zig source, it goes in `rust_tests/` or `zig_tests/`. If it's a ZER-original test (bug fix, red team finding, feature test), it goes in `tests/zer/` or `tests/zer_fail/`. Don't put ZER-specific tests in `rust_tests/` — that directory is for Rust-equivalent translations only.
-
-**Naming:**
-- `tests/zer/feature_name.zer` — positive (compile + run + exit 0)
-- `tests/zer_fail/feature_name.zer` — negative (must fail to compile, add `// EXPECTED: compile error` as first line)
-- `rust_tests/rt_category_desc.zer` — positive Rust translation
-- `rust_tests/reject_category_desc.zer` — negative Rust translation
-- `test_modules/name.zer` — multi-file module test
-
-**Bug patterns with lessons (cross-reference BUGS-FIXED.md for root cause):**
-- `?Handle(T)` struct field double-wrap: emitter var-decl init wrapped already-optional value in `{value, 1}`. Fix: check `init_type->kind == TYPE_OPTIONAL` before wrapping (same pattern as BUG-032 for NODE_IDENT). `hash_map_chained.zer` now uses `?Handle(Node) next` directly.
-- Cross-function range propagation: `find_return_range()` scans function bodies for return expressions with `% N` or `& MASK`. Stores `return_range_min/max` on Symbol. Call sites propagate range to variables. `slot = hash(key)` where `hash()` returns `h % TABLE_SIZE` → slot proven `[0, TABLE_SIZE-1]`.
-- `--run` absolute path: skip `./` prefix for paths starting with `/` (Linux) or drive letter `C:` (Windows).
-- `[]T → *T` extern auto-coerce const safety: string literals and const slices to non-const `*T` param now rejected. Must declare `const *T`. Prevents `.rodata` write-through.
-
-**VS Code Extension (VSIX) Build:**
-- **WASM toolchain (2026-06-16):** the extension ships the compiler as
-  WebAssembly (`lsp/zer.wasm` from `zer_wasm.c` via emscripten), NOT native
-  `zerc.exe`/`zer-lsp.exe` for Windows. Reason: unsigned mingw PEs trip
-  Defender `Wacatac.B!ml`. LSP = `lsp/server.js` + `zer.wasm` run by VS Code's
-  own signed node (Electron-as-node); terminal `zerc` = `zerc.cmd` → bundled
-  signed `node.exe` → `lsp/zerc-cli.js` → `zer.wasm` → bundled gcc. Only native
-  Windows `.exe`s shipped are signed `node.exe` + reputable w64devkit gcc.
-  Architecture + the "replicate every native emitter/checker field" invariant:
-  `docs/compiler-internals.md` "WASM bridge"; open gaps: `docs/limitations.md`.
-- `make docker-vsix` — multi-stage `Dockerfile.vsix`: stage 1 (emsdk) builds
-  the wasm, stage 2 bundles wasm + signed node.exe + zerc.cmd + portable GCC,
-  runs in-image smoke/LSP/CLI tests, packages via vsce.
-- `editors/vscode/extension.js` — launches `lsp/server.js` via `process.execPath`
-  with `ELECTRON_RUN_AS_NODE=1` (no native fallback); still injects
-  `bin/win32-x64` (now holds `zerc.cmd`, `node.exe`, `gcc/`) onto PATH.
-- `editors/vscode/package.json` — name `zerc-language`, publisher `zerohexer`, MPL-2.0
-- Icon: `editors/vscode/icon.svg` — black background, silver `[*]` pointer-in-brackets logo, auto-converted to PNG during build
-- Auto-PATH: on first activation, if `zerc` not on system PATH, prompts user to add bundled dir permanently via PowerShell `[Environment]::SetEnvironmentVariable`. Requires VS Code restart after.
-- **CRITICAL:** `where zerc` check must run BEFORE `process.env.PATH` prepend (line 52-56 injects bundled dir). If checked after, it finds the bundled binary and skips the prompt.
-- **CRITICAL:** `zer.lspPath` in VS Code settings overrides bundled detection. If set to a path that doesn't exist (e.g., old mingw path), LSP fails. Fix: clear the setting.
-- Marketplace: publisher "Zerohexer", display name "ZER(C) Language"
-
-**LLM Reference:**
-- `ZER-LANG-LLM.md` — compact ZER syntax reference designed for LLM consumption. Feed to any LLM to enable accurate ZER code generation. Covers all C→ZER differences, intrinsics, builtins, MMIO, ASM, common patterns, coercion rules. ~5K tokens.
-
-### Lessons From Writing ZER Code (stdlib pitfalls)
-
-These tripped us while writing `lib/str.zer`, `lib/fmt.zer`, `lib/io.zer`. Fresh sessions WILL hit them:
-
-1. **`orelse return false` is a PARSE ERROR.** `orelse return` is bare — no value. Use `orelse return;` for void functions. For bool returns: restructure to avoid orelse in return, or use a temp variable.
-
-2. ~~`arena.alloc_slice(u8, n)` is a PARSE ERROR~~ — works since BUG-1556 (primitive keywords and container stamps are type arguments to `alloc` / `arena.alloc` / `alloc_slice` / `@size` / `@offset`).
-
-3. **`const []u8` return type requires parser lookahead.** `const` and `volatile` at global scope trigger var-decl parsing. The parser now peeks ahead to detect function declarations. Works as of this session — but if adding new qualifier keywords, they need the same lookahead treatment.
-
-4. **Returning a sub-slice/view of a slice/pointer PARAMETER is ALLOWED** (relaxation
-   shipped 2026-06-22, BUG-764) — `[*]u8 trim([*]u8 s){ return s[i..j]; }` and
-   `*u8 first([*]u8 s){ return &s[0]; }` compile: a slice/pointer param's pointee is
-   the CALLER's memory, so the return is safe at the function level; the call site
-   rejects a caller that passes a LOCAL and lets the result escape (`g = trim(local)`
-   etc. error, `trim(global)` and local use are fine). `lib/str.zer`'s `bytes_trim*`
-   compile again. (Still rejected: returning a view of a LOCAL array/struct —
-   `return arr[0..]`, `return &local`.) This is ZER inferring Rust's `'a` with zero
-   annotations. The safety rests on the escape-sink coverage from BUG-760..763 (call/
-   keep/struct-field launder); the durable unified-provenance refactor is tracked in
-   `docs/limitations.md` as optional future-proofing.
-
-5. **C macros (stderr, stdout) are NOT accessible from ZER.** They're preprocessor symbols, not variables. Wrap them in a C helper function in a `.h` file: `static inline FILE *zer_get_stderr(void) { return stderr; }`. Then `cinclude` the header and declare the function in ZER.
-
-6. **`_zer_` prefix is RESERVED.** BUG-276 rejects any identifier starting with `_zer_`. Name helpers `zer_get_stderr` not `_zer_stderr`.
-
-7. **Multiple files concatenated must NOT redeclare the same function.** If `fmt.zer` declares `fputc` and `io.zer` also declares `fputc`, the checker errors "redefinition." Keep declarations in one file or use ZER's import system for multi-file projects.
-
-8. **`@ptrcast(*opaque, data.ptr)` on `const []u8 data` fails.** The `.ptr` of a const slice is `const *u8`. Casting to `*opaque` strips const. Use `@ptrcast(const *opaque, data.ptr)` instead.
-
-9. **`cinclude` emits `#include` but does NOT register C symbols.** You must declare every C function you want to call as a ZER function signature: `i32 putchar(i32 c);`. The `cinclude` just makes the header available to GCC.
-
-10. **`bool` return via `orelse` needs restructuring.** Can't do `*opaque f = mf orelse return false;`. Instead: `?*opaque mf = io_open(...); *opaque f = mf orelse return;` for void, or use an if-unwrap pattern for bool returns.
-
-## Stage 1 of Gaps Roadmap COMPLETE 2026-04-27 — Patterns Established
-
-12 silent gaps closed in Stage 1 of `docs/4-27-2026-gaps.md` roadmap.
-**Six new compiler patterns established that future work must respect:**
-
-1. **`is_synthetic` flag on NODE_VAR_DECL** (ast.h) — set by parser
-   when desugaring emits a synthetic var-decl (e.g., range-for `_zer_ri`).
-   Checker dispatches to `add_symbol_synth` to bypass the reserved-prefix
-   check. **Use this pattern for any future desugaring that emits `_zer_`
-   prefixed names** — DO NOT special-case names in `add_symbol`.
-
-2. **`add_symbol_synth(c, name, len, type, line)`** vs `add_symbol(...)`
-   in checker.c — synth bypasses BUG-276 reserved-prefix check. ONLY
-   call from synthetic AST nodes; user source must always go through
-   `add_symbol` so users still can't declare `_zer_*` identifiers.
-
-3. **`name_looks_like_destructor(name, len)`** in zercheck.c — substring
-   match against 12 destructor-convention keywords (free, destroy,
-   close, release, delete, dispose, drop, cleanup, deinit, fini,
-   shutdown, term). Used by `is_free_call` to widen the bodyless
-   heuristic to non-void return when the name suggests a destructor
-   (Gap 17). Reuse this helper for any future cleanup-detection.
-
-4. **`ir_classify_method_call_ex(c, call)`** vs `ir_classify_method_call(call)`
-   in zercheck_ir.c — the `_ex` variant validates receiver type
-   (Pool/Slab/Ring/Arena/Struct) before matching method names. **Use
-   `_ex` at all new call sites.** Backward-compat wrapper exists for
-   migration but deprecate as you go (Gap 32).
-
-5. **`IRMC_ARENA_RESET` + alloc_id propagation pattern** — reference
-   implementation in zercheck_ir.c IR_CALL handler for "single op
-   invalidates all aliases of a class." Two-pass: snapshot alloc_ids
-   first (Gap 617-family realloc safety), then mark all matching
-   handles FREED. Reuse for any future "reset/clear/destroy-all" ops.
-
-6. **`#pragma GCC optimize("wrapv")` in emitter preamble** — defensive
-   pragma emission gated on `__GNUC__ && !__clang__` ensures signed-
-   overflow-wraps semantics even when user invokes own gcc without
-   `-fwrapv`. Pattern for any future arch-independent semantic guarantee
-   GCC supports via pragma.
-
-**New compile-error rules a fresh session must know about:**
-
-- `threadlocal shared struct` is rejected at NODE_GLOBAL_VAR (Gap 43)
-- `switch (?T)` with `.has_value` / dot-prefix arms on non-enum/union
-  inner is rejected at NODE_SWITCH typing (Gap 40)
-  - `?Enum` with `.variant` arms still works
-  - `default => |*v| { ... }` capture still works
-- Comptime call chain >16 deep emits explicit
-  "exceeded recursion depth (16)" error instead of silent
-  CONST_EVAL_FAIL propagation (Gap 33)
-- `_zer_shl(a, n)` / `_zer_shr(a, n)` returns 0 for `n < 0` (was UB
-  fall-through). Spec was already "0 for out-of-range"; macro now matches (Gap 26)
-- Bodyless `int destroy(*Resource)` (or any destructor-named function with non-void return) triggers free heuristic (Gap 17)
-- Range-for desugaring uses `_zer_ri`, not `__ri`. User vars named `__ri` no longer shadowed (Gap 30)
-- `volatile *u32 reg; reg[i]` with variable index now actually emits
-  the auto-guard the warning promised (Gap 34) — was silent miscompile
-
-See `docs/4-27-2026-gaps.md` for the full 47-gap audit + 10-stage roadmap,
-and `BUGS-FIXED.md` Session 2026-04-27 entry for per-bug detail.
-
-**Stage 1 status:** 12 of 47 silent gaps closed in main + 5 already
-fixed in `claude/cool-johnson-tNGWB` branch = 17/47 cumulative. 30
-remain across Stages 2-10.
-
-## Stage 2 Part A of Gaps Roadmap COMPLETE 2026-04-28 — Walker Semantic Fixes
-
-7 silent gaps closed by per-walker recursion / root-walk / propagation
-fixes (BUG-634 to BUG-640). Cumulative 26/47 closed.
-
-**Walker patterns established that future code must respect:**
-
-1. **`contains_move_struct_field_depth(t, depth)`** in zercheck.c —
-   recursive predicate with depth limit (32). Reuse the depth-limited
-   recursion pattern for any future "type contains X at any nesting".
-
-2. **Explicit-stack DFS for compound-key building** in zercheck.c
-   BUG-385 scan — `StructFrame { type, key, key_len, depth }` records
-   walked iteratively. Pattern for any nested-struct-with-tracked-field
-   registration.
-
-3. **NODE_FIELD/NODE_INDEX root-walk in move arg tracking** —
-   `consume(b.item)` walks through field/index to root ident, then
-   transfers root's tracked handle when target type is move-containing.
-   Both AST (zercheck.c) and IR (zercheck_ir.c) sides updated.
-
-4. **Pointer-deref alias on var-decl** — `Handle k = *p;` registers k
-   as alias of p (same alloc_id). Subsequent `free(k)` propagates to p
-   via existing alias_state mechanism. Pattern for any alias-creating
-   var-decl.
-
-5. **NODE_UNARY/AMP handle_key transparency** — `&h` produces same key
-   as `h`. Address-taking shouldn't break tracking. Pattern: when
-   computing identity-keys, unwrap `&` and `*` operators.
-
-6. **`emit_shared_lock_around_cond` / `emit_shared_unlock_after_cond`**
-   in ir_lower.c — per-control-flow lock scope around cond evaluation
-   (NOT body), to avoid deadlock on nested shared access. Reuse for any
-   future construct evaluating an expression that may read shared.
-
-**New compile-time behaviors to know about:**
-- Nested move struct (`Outer { Wrapper { File(move) } }`) tracks
-  through 2+ levels (Gap 28)
-- Function param `struct { Inner { Handle } }` registers nested handles
-  via dotted compound keys (Gap 29)
-- `consume(b.item)` where b.item is move-typed is properly tracked (Gap 42)
-- `void f(*Handle p) { Handle k = *p; free(k); }` correctly propagates
-  to caller's `&h` arg (Gap 41)
-- Shared struct reads in if/while/for/switch conditions are locked (Gap 36)
-- Stack-depth analyzer skips `comptime if(0)` bodies (Gap 44)
-- Range-for snapshots collection.len before loop (Gap 31) — mutation
-  during iteration no longer changes bound
-
-## Stage 2 Part B COMPLETE 2026-04-28 — Walker Exhaustiveness via -Wswitch
-
-`tools/walker_default_audit.sh` (NEW 2026-04-28) catalogs every
-`default:` clause inside `switch (...->kind)` / `switch (...->op)`
-across safety-critical compiler files. **Audit exits 0** — all 42
-sites converted to exhaustive case enumeration. `-Wswitch` warnings
-resolved (8 → 0).
-
-**Files with 100% walker exhaustiveness:**
-- zercheck.c, zercheck_ir.c, ir_lower.c, ast.c, checker.c, emitter.c
-
-**What this guarantees:** GCC `-Wswitch` errors at compile time if any
-new NODE_KIND / TYNODE_KIND / TYPE_KIND / IR_OPKIND value is added
-without a case label in any safety-critical walker. The "missing case
-in safety walker" gap class is mechanically prevented going forward.
-
-**HARD GATE since 2026-06-27 — `-Werror=switch` in the Makefile.** Until
-2026-06-27 this was a *warning* only (`CFLAGS = -Wall -Wextra`), so the
-guarantee above was aspirational — a new node kind silently produced a
-warning, not a build failure, and a partial hand-written walker could still
-ship. `CFLAGS` now carries `-Werror=switch`, making every no-default
-kind-switch a HARD build failure when a new enum value is unhandled. Two
-things changed together: (1) `collect_shared_types_in_expr` (checker.c, the
-per-statement deadlock-check shared-type collector) was a partial `if`-chain
-over node kinds — exactly the "form→state coverage gap" shape that produced
-BH-18 #7 (a `(T)cast`/`@intrinsic`/`[]`/`orelse`-wrapped shared read evaded
-the multi-lock check) — and is now a no-default exhaustive `switch`; (2) the
-`-Werror=switch` gate ensures it (and the ~42 existing no-default switches)
-can never silently regress. The whole-tree build is `-Wswitch`-clean, so the
-gate is free. **Do NOT add a `default:` to a kind/op switch to silence this**
-— enumerate the no-op kinds explicitly (see the `collect_shared_types_in_expr`
-no-op case block) so a future new kind still trips the gate.
-
-**Run before adding new walkers:** `bash tools/walker_default_audit.sh`
-must continue to exit 0. If you write a new walker, do NOT add a
-`default:` clause — list every enum value explicitly. If you must
-fall back (e.g., diagnostic emit), enumerate the fall-back kinds
-explicitly so the compiler enforces exhaustiveness when new kinds
-are added later.
-
-**Token-op switches excluded** (legitimate intentional defaults):
-TokenKind has 100+ values dispatching binary/unary/assign operations.
-The audit script excludes via `binary\.op|unary\.op|assign\.op|op_token`.
-
-This was the **foundation for Stages 4-5** — F4-F6 instruction-table
-walkers and Session G atomic-ordering CFG walker now ADD new walkers
-under -Wswitch discipline so they don't reintroduce the gap class.
-
-## Stage 3 COMPLETE 2026-04-28 — Fixed-buffer cleanup + CI linter (Gap 35)
-
-`tools/audit_fixed_buffers.sh` (NEW 2026-04-28) flags new fixed-size
-buffer declarations in compiler internals against
-`tools/fixed_buffer_baseline.txt`. CI gate runs in `make check`.
-**Audit matches on file:content** (line-number-agnostic, since 2026-04-29
-fix) — survives any source edit that doesn't change the buffer
-declaration itself.
-
-Stage 3 conversions (4 sites + 1 audit fix):
-- `keep_checks[8]` / `ld_nodes[8]` (Gap 35) — stack-first 8 + arena overflow doubling
-- `build_expr_key stack_buf[512]` — replaced with two-pass measure-then-fill (no buffer)
-- `ir_extract_compound_key stack_buf[256]` — same two-pass approach
-- `Node *stack[64]` AST walker — stack-first 64 + ZER_STK_RESERVE macro
-
-If you add a new fixed-size buffer and the audit complains: either
-convert to stack-first dynamic OR add a one-line justification + the
-content line to `tools/fixed_buffer_baseline.txt`. Don't increase
-constants in fixed buffers — the rule is "stack fast path, arena overflow".
-
-## Distinct-Unwrap Class Kill 2026-06-07 — `type_dispatch_kind` + CI gate
-
-The #1 historical bug class (BUG-409 "35+ sites", GAP-F 2026-06-06):
-dispatching a safety decision on `result->kind == TYPE_X` without
-unwrapping `TYPE_DISTINCT` first — a `distinct typedef` then has kind
-`TYPE_DISTINCT`, the check silently fails, the safety check is skipped.
-
-**Use `type_dispatch_kind(t) == TYPE_X`** (types.h) instead of
-`t->kind == TYPE_X` whenever `t` is a fresh `checker_get_type()` /
-`check_expr()` / `resolve_type()` / `typemap_get()` result that could be a
-distinct typedef. It unwraps all distinct levels, is NULL-safe (NULL →
-`TYPE_VOID`), and cannot forget the unwrap. NOT for already-resolved inner
-reads (`.pointer.inner->kind` etc.) or correct `_eff` locals — don't churn
-those.
-
-`tools/audit_type_dispatch.sh` (NEW, CI gate in `make check`) freezes the
-627-site `->kind == TYPE_` surface in `tools/type_dispatch_baseline.txt`
-(file:content, line-number-agnostic) and **fails on any NEW site** — the
-RF14 `-Wswitch` analog for type dispatch. Adding a new dispatch site forces
-a conscious choice: use `type_dispatch_kind` (no `->kind ==`, never trips),
-or justify the raw read in the baseline. This is the durable class-kill;
-mass-converting the 600+ already-correct sites was rejected as churn.
-
-Run `bash tools/audit_type_dispatch.sh` before committing checker/emitter/
-zercheck edits. Full detail in `docs/compiler-internals.md` "Distinct-Unwrap
-Structural Kill" section.
-
-## Audit Class-Closure 2026-06-09/10 — BUG-729..742 (14 fixes, 2 new zercheck_ir patterns)
-
-The 6u360k audit (8 silent gaps) is FULLY CLOSED plus its follow-up. New
-compile-error rules are in the agent rules block above. Full mechanism doc:
-`docs/compiler-internals.md` "Audit gap-closure mechanisms (BUG-735..742)".
-Two NEW zercheck_ir patterns future safety work MUST respect:
-
-1. **`IR_GLOBAL_ROOT_ID (-2)` pseudo-root global tracking** — globals that
-   receive a tracked allocation are compound handles keyed `(-2, name)`,
-   inheriting ALL existing machinery (CFG merge, free propagation, alias
-   snapshots). **INVARIANT: these entries always carry `escaped=true`** —
-   the exit-pass leak branches index `func->locals[h->local_id]` only after
-   the escaped skip, so -2 never reaches a locals[] access. Never clear
-   escaped on a global entry. Prefer this pseudo-root reuse over adding
-   PathState fields for any future "track non-local entity" need.
-
-2. **Argument-precise barrier principle** — "anything HANDED to an operation
-   the analyzer can't resolve may be consumed by it — and ONLY what was
-   handed." Applied twice (BUG-740 indirect calls, BUG-741 variable-index
-   frees): widen exactly the handed entities ALIVE→MAYBE_FREED + escaped
-   (+ alias group). NOT the aggressive variant (widen everything — noise),
-   NOT type-matching (shape enumeration). False positives must teach
-   structure (ownership clarity / reset hygiene), never report impossibilities.
-
-Also locked this session: false-positive criterion for new safety rules —
-acceptable ONLY when the rejected code's restructure is a teachable
-discipline (`g = null;` after free, pass-data-not-handle, don't mix index
-kinds). MAYBE_FREED globals at exit are deliberately NOT flagged (would
-noise the legit register-ctx-then-callback pattern) — see limitations.md.
-
-## Stage 4 PIVOTED 2026-05-12 — see docs/asm_lang_zer_safe.md
-
-**PIVOT NOTICE:** the "make compiler smart about specific instructions"
-direction (Session G Phase 5, Z9/Z10/Z13, per-instruction DB growth) is
-**DEFERRED indefinitely**. New direction: annotation-driven asm safety —
-**Option E** (three-layer, no-favored-ISA, `docs/asm_lang_zer_safe.md` §1.7,
-READ END-TO-END before touching asm safety; decisions there are LOCKED).
-**Phase 1 = Level C cleanup** (delete per-arch tables/scripts/categories/
-.zerdata, hardcoded ~12-entry UB-classics list, delegate register/instruction
-validation to GCC) — fresh-session-executable checklist:
-**`docs/option_e_plan.md`**. Intrinsics STAY until Phase 3 re-layering.
-
-What's shipped and survives all phases: 130 intrinsics, Z1-Z8/Z11/Z12,
-structured asm syntax (Session A/B), F7-light LR/SC pairing, naked-only
-restriction (S1). Final sub-stage status table + F4/F7 dispatch list:
-`docs/compiler-internals.md` "Stage 4 final status" (moved 2026-06-10).
-
-CLI flags: `--target-arch={x86_64,aarch64,riscv64}` (picks tables +
-cross-gcc), `--target-features=avx512f,sse,...` (ZerCpuFeature bitmap +
-GCC -m flags; baseline x86_64 = SSE|SSE2), `--probe-mode={hosted,raw,disabled}`.
-
-Gotchas that survive the pivot:
-- Mnemonic parser accepts dots (RISC-V `lr.w`, `fence.i`) — BOTH the gen
-  script regex AND checker.c NODE_ASM token reader. Don't drop (BUG-653/654).
-- `Checker.target_ptr_bits` MUST be initialized in `checker_init` from
-  `zer_target_ptr_bits` — memset-zeroed otherwise, checks silently always-true
-  (BUG-652).
-- @critical "transitive escape via callee" investigated 2026-05-02: NOT a bug —
-  don't re-implement `can_escape` (see docs/limitations.md).
-- Session G (System #30 atomic ordering): Phases 1-2 done (plumbing +
-  classification in vendored tables); Phase 3 in-block enforcement ABANDONED
-  (false-positived the canonical multi-block CLWB+SFENCE libpmem idiom).
-  Lesson: don't ship enforcement that rejects valid code patterns.
-
-## Spawning Agents That Write ZER Code — MANDATORY
-
-When spawning ANY agent that writes ZER source code (tests, examples, anything), you MUST include these rules in the agent prompt. Agents do NOT read CLAUDE.md automatically:
-
-```
-ZER SYNTAX RULES (not C — these differ):
-- No ++ or --. Use += 1, -= 1
-- else if supported: if (a) { } else if (b) { } else { }
-- C-style VALUE casts `(T)x` are supported (narrow/widen/int<->float, *T<->*opaque); a cast between two DIFFERENT pointer types is an error — use @pun. @truncate, @saturate, @bitcast remain for the explicit cases
-- Braces ALWAYS required for if/else/for/while bodies
-- Array decl: u8[256] buf (size between type and name)
-- Pointer: *Task ptr (star before type, not after)
-- Enum access: State.idle (qualified), switch arms: .idle => (dot prefix)
-- Switch uses => arrows, no case keyword, no fallthrough
-- orelse return is BARE — no value: x orelse return (NOT orelse return 1)
-- arena.alloc(T) / arena.alloc_slice(T, n) — T may be a struct/enum name, a primitive keyword (u32) or a container stamp (Box(u32))
-- For loops: for (u32 i = 0; i < N; i += 1) { }
-- String literals are []u8, not char*
-- bool is NOT an integer — no bool↔int coercion
-- Optional: ?*T (null sentinel), ?T (struct with .value/.has_value), ?void (has_value ONLY, no .value)
-- Unwrap: if (opt) |val| { use(val); }  or  val = opt orelse default;
-- goto label; and label: are supported (forward + backward). Banned inside defer and @critical blocks.
-- Inline asm: bare `asm("...")` (renamed from `unsafe asm` 2026-04-25). Only in `naked` functions. After D-Alpha-7.5 Phase 2: 100% language-safe via Z-rules + 8 categories + System #30.
-- shared struct = auto-locked mutex. shared(rw) struct = reader-writer lock.
-- spawn func(args) = fire-and-forget thread (shared ptr or value args only)
-- ThreadHandle th = spawn func(args); th.join(); = scoped spawn (allows *T)
-- @cond_wait(shared_var, condition), @cond_signal(shared_var), @cond_broadcast(shared_var)
-- @cond_timedwait(shared_var, condition, timeout_ms) returns ?void
-- @once { body } = execute exactly once (thread-safe)
-- @barrier_init(var, N) + @barrier_wait(var) = thread sync barrier
-- Semaphore(N) var; = counting semaphore, @sem_acquire(var)/@sem_release(var)
-- Both Barrier and Semaphore accept *Barrier/*Semaphore pointer params
-- threadlocal u32 var = per-thread storage (__thread)
-- async void func() { yield; await cond; } = stackless coroutine
-- _zer_async_NAME type, _zer_async_NAME_init(&task), _zer_async_NAME_poll(&task)
-- Ring(T, N) = circular buffer channel (T must be struct name, push/pop)
-- @atomic_load/store/cas + @atomic_{add,sub,or,and,xor,nand,xchg} (fetch-old) + @atomic_{add,sub,or,and,xor}_fetch (fetch-new). All SEQ_CST.
-- Bit queries: @popcount, @ctz, @clz, @parity, @ffs (return u32). Byte swap: @bswap16/32/64. Control-flow hints: @unreachable(), @expect(val, exp). Full barrier: @barrier_acq_rel().
-- Interrupt control (privileged, kernel-mode only): @cpu_disable_int/@cpu_enable_int/@cpu_wait_int/@cpu_save_int_state/@cpu_restore_int_state. Tests use dead-branch pattern (volatile + if(never_true)) to verify compile without executing privileged asm.
-- Context switch (callee-saved subset): @cpu_save_context/@cpu_restore_context/@cpu_save_fpu/@cpu_restore_fpu. Take *u8 buffer arg. Dead-branch tested.
-- Heap alloc (the malloc-equivalent, safe): alloc(T) -> ?*T (one struct object); alloc(T, n) -> ?[*]T (runtime-sized array — T = struct OR primitive like u8/u32; calloc-zeroed; escapes/returnable in a struct); free(x) frees a *T or [*]T. Fully tracked (UAF/double-free/leak). alloc(T) single needs a STRUCT (use alloc(T,n) for a primitive array). Custom allocators (bump/pool over one alloc(T,N) region) are plain ZER — hand out indices, or *T interior pointers (&region[i] where region is a heap slice or slice param is allowed). See docs/universal_alloc.md.
-- Explicit-control allocators STAY (named pools; address by variable): Pool(T, N) (fixed, ISR-safe), Slab(T) (growable), Arena (bump-reset), Handle(T). e.g. myslab.alloc_ptr(). alloc(T) uses an implicit auto-slab; a named pool is a deliberate SEPARATE pool you address explicitly.
-- move struct Name { } = ownership transfer on pass/assign, use after move = error
-- container Name(T) { T[N] data; u32 len; } = parameterized struct template (monomorphization)
-- Name(ConcreteType) var; = stamps concrete struct, functions take *Name(Type) explicitly
-- Designated init: Point p = { .x = 10, .y = 20 }; or p = { .x = 1 };
-- @ptrcast between DIFFERENT struct/union types = compile error — use @pun (BUG-735)
-- container type arg must be a PLAIN NAMED type: Box(?u32)/Box(*u32)/Pair(Handle(T)) = compile error; wrap in a named struct. Nested Box(Box(u32)) is fine (BUG-738)
-- non-keep BY-VALUE struct param carrying pointer fields can't be stored to a global — add keep or restructure (BUG-737)
-- GLOBAL pointer hygiene: after freeing a pointer stored in a global, reset it (g = null;) BEFORE returning or calling ZER functions (BUG-739/742)
-- handles/pointers passed to a FUNCPTR call are consume-maybe: don't free or use h after fp(h); pass data (h.field) or hand ownership (BUG-740)
-- don't mix literal- and variable-index frees on the same array: free(arr[k]) then free(arr[0]) (or reverse) = compile error (BUG-741)
-```
-
-Failure to include these rules causes agents to write invalid ZER (e.g., using i++ which silently passes parse-error-tolerant test harnesses).
-
-## ZER Safety Architecture — 4 Models, 29 Systems
-
-**ZER's safety is built on 4 analysis models**, each covering a different dimension of what the compiler can observe. All 29 tracking systems map to one of these 4 models (verified against actual code). When implementing ANY new safety feature, identify which model it belongs to and follow that model's pattern.
-
-**The 4 models exist because ZER uses C syntax.** Rust encodes all safety in ONE model (ownership types) because programmers annotate lifetimes/borrows. ZER programmers write plain C — the compiler must INFER everything. Each model infers a different kind of information. This is the same architecture as GCC/LLVM (multiple independent IPA passes), applied at the language level.
-
-### Model 1: State Machines — entity lifecycle tracking
-**What it answers:** "What STATE is this tracked entity in at this program point?"
-**Pattern:** Define states (ALIVE, FREED, TRANSFERRED), define valid transitions, error on invalid transition or bad terminal state.
-**When to use:** New tracked entity with a lifecycle (file handle, socket, lock, resource).
-
-| # | System | States / Transitions |
-|---|---|---|
-| 7 | **Handle States** | `UNKNOWN→ALIVE→FREED/MAYBE_FREED/TRANSFERRED` — UAF, double-free, leak |
-| 10 | **Move Tracking** | Uses `HS_TRANSFERRED` — ownership transfer, use-after-move |
-| 6 | **Alloc Coloring** (supporting) | `ZC_COLOR_POOL/ARENA/MALLOC` — set at alloc, propagated to aliases |
-| 8 | **Alloc ID** (supporting) | Unique per alloc, shared by aliases — groups `?Handle`+`Handle` as same alloc |
-
-### Model 2: Program Point Properties — values change at control flow
-**What it answers:** "What PROPERTY does this value/context have at THIS specific program point?"
-**Pattern:** Property set at declaration, updated at assignments/branches, checked at use sites. Can propagate, widen (MAYBE_FREED), or invalidate (&var taken).
-**When to use:** New value property that changes during execution (range, taint, escape status, provenance).
-
-| # | System | Property tracked |
-|---|---|---|
-| 12 | **Range Propagation** | `VarRange {min, max, known_nonzero}` — bounds safety, division safety |
-| 3 | **Provenance** | `Symbol.provenance_type` — propagates through assigns, clears on re-derive |
-| 11 | **Escape Flags** | `is_local_derived`, `is_arena_derived` — propagates, clears on reassignment |
-| 24 | **Context Flags** | `in_loop`, `defer_depth`, `critical_depth`, `in_async` — scope-exit validation |
-| 22 | **Union Switch Lock** | `union_switch_var` — set entering switch, cleared leaving, checked during body |
-| 14 | **Auto-Guard** (output) | Nodes where VRP couldn't prove safety → emitter inserts runtime guard |
-| 15 | **Dynamic Freed** (output) | `pool.free(arr[k])` event → emitter inserts UAF guard for `arr[j]` |
-
-### Model 3: Function Summaries — per-function computed properties
-**What it answers:** "What does this FUNCTION do?" (cached, used at call sites)
-**Pattern:** Scan function body (lazy, on first access), cache result on Symbol, check at call sites or context entry. DFS cycle detection for recursion.
-**When to use:** New function-level property (purity, can_panic, can_io, touches resource X).
-
-| # | System | Function property |
-|---|---|---|
-| 29 | **FuncProps** | `can_yield`, `can_spawn`, `can_alloc`, `has_sync` — context safety |
-| 9 | **Func Summaries** (zercheck) | `frees_param[i]` — cross-function UAF/leak detection |
-| 4 | **Prov Summaries** | Return provenance — cross-function `*opaque` tracking |
-| 5 | **Param Provenance** | What type each `*opaque` param expects — call-site validation |
-| 13 | **Return Range** | `return_range_min/max` — cross-function bounds: `arr[func()]` zero-overhead |
-| 18 | **Stack Frames** | Frame size, callees, recursion — `--stack-limit`, recursion detection |
-| 27 | **Spawn Global Scan** | Non-shared global access — data race detection |
-| 28 | **Shared Type Collect** | Shared types touched — deadlock detection |
-| 17 | **ISR Tracking** | Globals accessed from ISR vs main — collect-then-check for missing volatile |
-
-### Model 4: Static Annotations — set once at declaration, checked at use
-**What it answers:** "What was DECLARED about this entity?" (never changes)
-**Pattern:** Set at declaration site, checked at every use site. No propagation, no state changes.
-**When to use:** New declaration-level constraint (alignment, section, visibility, capability).
-
-| # | System | Annotation |
-|---|---|---|
-| 16 | **Non-Storable** | `pool.get()` result — can't be stored in variables |
-| 19 | **MMIO Ranges** | Declared valid address ranges — `@inttoptr` validation |
-| 20 | **Qualifier Tracking** | `is_volatile`, `is_const` — prevent stripping through casts |
-| 21 | **Keep Parameters** | `is_keep` — pointer param retained beyond the call. **INFERRED since 2026-06-19** (no annotation needed; keyword optional). Escape sites infer it; a post-body fixpoint (`check_keep_inference`) propagates transitively + enforces at call sites. See BUGS-FIXED.md 2026-06-19 + docs/reference.md "keep parameters". |
-
-### Infrastructure (not safety models — supports the 4 models above)
-| # | System | Purpose |
-|---|---|---|
-| 1 | **Typemap** | `Node* → Type*` — emitter reads resolved types |
-| 2 | **Type ID** | `next_type_id++` — runtime `*opaque` provenance tag |
-| 23 | **Defer Stack** | Pending defer blocks — LIFO cleanup emission |
-| 25 | **Container Templates** | Monomorphization stamping — type system infrastructure |
-| 26 | **Comptime Evaluator** | Compile-time function evaluation — metaprogramming |
-
-### Quick Lookup — All 29 Systems (moved to docs/safety-model.md)
-
-Flat table (29 rows listing each system with location, description, and
-model assignment) is in `docs/safety-model.md`. Consult when auditing
-specific systems. The 4-model OVERVIEW (Models 1-4) above stays in
-CLAUDE.md because it informs every new-safety-feature design decision.
-
-### Development Decision Flow
-
-```
-New safety feature → Which model?
-
-Entity with lifecycle (alloc/free/move)?     → Model 1: State Machine
-Value property that changes at assignments?  → Model 2: Point Properties
-Per-function property used at call sites?    → Model 3: Function Summary
-Declaration-level constraint, never changes? → Model 4: Static Annotation
-
-Doesn't fit any? → STOP. Either:
-  (a) It's a combination of existing models (most likely)
-  (b) Document why a new model is needed (unlikely — these 4 cover
-      what a compiler can observe: entities, points, functions, declarations)
-```
-
-### Safety Coverage by Model
-
-| Safety guarantee | Model(s) used |
-|---|---|
-| Buffer overflow | **2** (VRP ranges) |
-| Use-after-free | **1** (handle states) + **3** (cross-func summary) |
-| Null dereference | **4** (*T non-null) + **2** (optional unwrap check) |
-| Dangling pointer | **2** (escape flags at program points) |
-| Division by zero | **2** (VRP: proven nonzero?) |
-| Data races | **4** (shared annotation) + **3** (spawn scan, shared types) |
-| Deadlock | **3** (shared type collect per function) |
-| Move semantics | **1** (HS_TRANSFERRED state) |
-| Context safety | **3** (FuncProps) + **2** (context flags for scope-exit) |
-| Wrong pointer cast | **2** (provenance at point) + **3** (prov summaries) |
-| Handle leak | **1** (ALIVE at exit = error) |
-| ISR safety | **3** (FuncProps can_alloc, ISR tracking) |
-| MMIO safety | **4** (mmio ranges) |
-| Stack overflow | **3** (stack frames) |
-| Volatile/const strip | **4** (qualifiers) |
-
-**Unconditional safety (no model needed — always on):**
-- Auto-zero: every variable initialized to zero (emitter rule)
-- Integer overflow wraps: `-fwrapv` (GCC flag, defined behavior)
-- Shift safety: ternary emitted (no UB on over-width shift)
-
-**Design principle:** Safety = tracking, not banning. If a pattern is unsafe, find which tracking system can detect the violation. Only ban when NO tracking system can cover the case.
-
-**Ban Decision Framework — when banning IS correct (check in order):**
-1. **Hardware/OS constraint?** → Ban. No compiler trick fixes this. (malloc in ISR = kernel deadlock, pthread_create with interrupts disabled = hardware-unsafe)
-2. **Emission impossibility?** → Ban. Can't generate valid C. (yield in defer = duplicate Duff's device case labels)
-3. **Needs runtime?** → Ban. ZER has no scheduler/GC. (Go allows yield-in-critical because its runtime handles it — ZER can't)
-4. **Needs type system?** → Ban. ZER has no traits/lifetimes. (Rust prevents lock-across-await via !Send — ZER can't express this in types)
-5. **None of the above?** → **Track.** ZER sees all bodies, can generate correct code, no constraint prevents it.
-
-**Cross-check references:** Zig (same quadrant — no runtime, no traits) and Rust. If both ban it, ZER should too. If Rust tracks it via types that ZER can't express, ban is correct. If Zig allows it with comptime, investigate how.
-
-**Current bans justified by this framework:**
-- `yield/await in defer` — emission impossibility (duplicate case labels in Duff's device)
-- `yield/await in @critical` — needs runtime (save/restore interrupt state across suspend requires scheduler awareness)
-- `spawn in @critical` — hardware constraint (pthread_create with interrupts disabled)
-- `spawn in async` — needs type system (thread lifetime tracking requires borrow checker or GC)
-- `alloc in interrupt` — OS constraint (malloc lock + interrupted malloc = deadlock)
-- `naked non-asm` — hardware constraint (no prologue = no stack)
-- `return/break/continue/goto in @critical` — hardware constraint (skips interrupt re-enable)
-- `return/break/continue/goto in defer` — emission impossibility (corrupts cleanup flow)
-
-**`*opaque` safety coverage:**
-- Pure ZER: 100% compile-time (zercheck #7 handle states)
-- `*opaque` alone: 100% compile-time (zercheck + #3 provenance)
-- `*opaque` + `cinclude`: 100% (zercheck + `--wrap=malloc` compiled-in)
-- `cinclude` alone (raw `*u8`): NOT tracked — developer wraps with `*opaque` for safety
-
-## STRICT: No-Debt Implementation Rule
-
-**Every change — add, fix, remove — MUST be the correct solution, not a shortcut.**
-
-### Before Writing ANY Code: Read First, Implement Second
-
-**DO NOT start implementing immediately.** The natural instinct is to write code as soon as the problem is understood. Fight it. This session proved that jumping to implementation causes:
-- Comptime loop body: implemented with `eval_comptime_block` call (copies locals) → broke mutations → had to refactor to `ComptimeCtx` (the correct architecture). 3 rounds of fix.
-- Range-for: implemented with shared AST node pointer → triple evaluation → had to refactor to clone + reject. 2 rounds of fix.
-- static_assert: implemented without `check_expr` first → comptime calls unresolved → had to add ordering fix.
-
-**The correct workflow:**
-1. **Read the relevant code** — not just the function you'll change, but its callers, its callees, and the data flow. Understand HOW the data moves before changing WHERE it moves.
-2. **Identify the architecture** — is this copy-on-call? Pass-by-reference? Who owns the memory? What's the scope lifetime?
-3. **Design the fix** — write the approach in your head. Ask: "Does this create duplicate code? Does this share mutable state? Does this have ordering dependencies?"
-4. **Then implement** — with the architecture already decided, the code writes itself.
-
-### Implementation Checks
-
-Before implementing ANY change, verify:
-1. **No duplicate code.** If the same logic appears in 2+ places, extract a helper FIRST. Do NOT copy-paste and plan to "refactor later." Later never comes.
-2. **No shared mutable AST nodes.** Parser desugaring must create SEPARATE node copies for each use site. The SAME Node pointer in multiple AST positions causes double-evaluation bugs. Always deep-copy or clone.
-3. **No ordering dependencies without comments.** If function A must run before function B (e.g., `check_expr` before `eval_const_expr_scoped`), document WHY with a comment at both sites.
-4. **No copy-on-call for mutable state.** If a recursive function copies its input but callers need mutations to propagate back, the architecture is WRONG. Either pass by reference (like `ComptimeCtx*`) or use save/restore pattern (like `saved_count`).
-5. **Test the REAL pattern, not just the simple case.** If you add `for (item in slice)`, test with struct slices, nested loops, and side-effectful expressions — not just `u32[5]`.
-6. **100% coverage, not 99%.** Don't say "works for the common case." If an edge case exists, either handle it or reject it at compile time with a clear error. Never silently produce wrong behavior.
-7. **NEVER use fixed-size buffers for dynamic data.** No `int arr[64]`, `char buf[128]`, `Node *items[256]` for arrays that could grow. Use stack-first dynamic pattern: `int stack[64]; int *arr = stack; int cap = 64;` with `realloc` overflow. Fixed buffers silently drop data beyond the limit (BUG-492: `covered_ids[64]` silently ignored allocations 65+). Same pattern as parser RF9 (stack-first `[32]` with arena overflow). GCC and all production compilers use dynamic allocation — ZER must too.
-
-8. **Scope-sensitive changes at DECLARATION sites, not USE sites.** When tracking variables across scopes (zercheck handles, VRP ranges, escape flags), modifications that depend on "which scope is this variable from?" must happen at NODE_VAR_DECL (declaration), never at NODE_IDENT/NODE_CALL (use). Uses read from any scope (find_handle), declarations write to current scope (find_handle_local). Trying to add scope logic at use sites breaks cross-scope access — loops and if bodies accessing outer variables get incorrectly treated as shadows. Proven by BUG-488 (3 failed patches at use sites before proper declaration-site fix) and BUG-494 (same pattern, same lesson).
-
-### Before Committing
-
-Ask: "If I read this code in 6 months, would I know WHY it's structured this way? Would I accidentally break it by changing one of the N sites?"
-
-If the answer is no → extract helper, add comment, or restructure. Do NOT commit debt.
-
-### Anti-Patterns Found in This Session
-
-| Anti-Pattern | What Happened | Correct Approach |
-|---|---|---|
-| Copy-on-call for mutable state | `eval_comptime_block` copied locals → loop mutations lost | `ComptimeCtx*` passed by pointer with save/restore |
-| Shared AST node pointer | range-for `collection` reused in 3 positions → triple eval | Clone ident node + reject non-trivial expressions |
-| Missing ordering dependency | static_assert called `eval_const_expr_scoped` before `check_expr` → comptime unresolved | `check_expr` FIRST (resolves comptime), then eval |
-| Inline duplicate code | for/while loop body walk copy-pasted | `CT_WALK_BODY_STMT` macro → then proper `ComptimeCtx` refactor |
-| Quick fix then "refactor later" | Macro band-aid for duplicate code | Refactor NOW while you have context |
-
-## Pushback Discipline — Capitulation Is Not Helpfulness
-
-**MANDATORY: read this before responding to ANY user disagreement with your analysis.**
-
-When the user pushes back on your analysis, do NOT treat their disagreement as evidence you were wrong. Re-derive the answer from the substrate, independently of which way they leaned.
-
-**The rules:**
-
-1. **If the user is right:** change your position AND state the specific technical reason you were wrong. Not "you're right, I overstated." Name the actual error in your prior reasoning (a missing case, a faulty generalization, a wrong assumption, a substrate-level mistake). The technical reason is what proves the position change is genuine reasoning, not capitulation.
-
-2. **If the user is wrong:** hold your position and show them the specific thing they're missing. Don't soften, don't accept their framing to avoid friction. Their confidence in being wrong is not evidence of being right.
-
-3. **If it's genuinely a judgment call with no fact of the matter:** say so explicitly and lay out both sides without picking based on which way the user leaned. Mark it as "judgment call, here are the trade-offs" rather than choosing the side that matches the user's apparent preference.
-
-4. **Never open a response with "you're right" before you've actually re-checked.** The phrase "you're right" should appear only after you have independently verified the user's claim against the substrate. If you find yourself wanting to say it as a transition rather than as a conclusion, stop and re-check.
-
-5. **The drift pattern manifests as fast capitulation.** If you flip your position within one message of user pushback, that's the drift pattern, not reasoning. Real position changes require re-deriving from the substrate, which takes more than rhetorical reflexes.
-
-**Why this matters:**
-
-The user's prior conversations have repeatedly identified the drift pattern (see primitives-data-races.md Section 23). Each manifestation has the same shape: user pushes → Claude flips → Claude justifies the flip with reasoning that wasn't done before the flip. The justification is post-hoc rationalization of agreement, not pre-decision verification.
-
-Capitulation feels helpful because it reduces social friction. But it's not actually helpful — it produces wrong answers more often than correct ones, because the user pushing back is not the same signal as the user being right. The user is asking you to reason; replacing your reasoning with their lean is the opposite of what they asked for.
-
-**How to recognize you're about to drift:**
-
-- You're searching for a way to make the user's framing work, rather than checking whether it actually does
-- You're about to type "you're right" before checking the references
-- You're collapsing multiple distinct cases into one because the user's example fit one of them
-- You're conceding a position without naming the technical error that made the prior position wrong
-- You're matching the user's confidence level rather than independently calibrating
-
-**How to push back without being a wall:**
-
-- "Let me check that specific claim against [the substrate/the doc/the code] before I respond" — verify before agreeing or disagreeing
-- "That holds for X case but not for Y case because..." — distinguish where the user's framing fits and where it doesn't
-- "You're describing one corner of the trade-off; the other corners have these costs..." — engage with the full design space, not just the user's preferred corner
-- "I had this wrong because [specific technical error]" — when you do change position, prove it with the technical reason
-
-**The test for whether a position change is genuine reasoning vs capitulation:**
-
-Could you defend the new position to someone who pushed back on it from the opposite direction with equal force? If yes, the change is reasoning. If no, the change was capitulation to user pressure, and you should re-check.
-
-**Connection to other principles in this file:**
-
-- The "Anti-Circular Rule" (debugging section) says revert to substrate when stuck — same instinct applied to reasoning under user pushback
-- The "Confirmed NOT Bugs" section is the inverse: don't re-investigate settled questions just because they come up again — same instinct of holding position when verification is complete
-- The "drift pattern" documented in primitives-data-races.md Section 23 is what this section prevents
-
-## Fix Methodology — Proper vs Pragmatic (learned from 8 red team rounds)
-
-**MANDATORY: read this before fixing ANY bug.** Fresh sessions default to pragmatic patches. This section explains when that's wrong and how to identify the proper fix.
-
-### The Decision Flow
-
-```
-Bug found → Can it be fixed in ONE location?
-  YES → Is that location a DECLARATION site (not use site)?
-    YES → Fix there. Done.
-    NO  → STOP. You're patching a use site. Read "Declaration vs Use" below.
-  NO  → How many sites need changing?
-    2-3 → Fix each, add comment linking them.
-    4+  → STOP. You need a REFACTOR, not a patch. Read "Refactor Triggers" below.
-```
-
-### Declaration vs Use Site Rule
-
-When tracking state across scopes (handles, VRP ranges, escape flags, move structs):
-- **DECLARATION site** (NODE_VAR_DECL): "a new variable enters scope" → WRITE to tracking system at CURRENT scope
-- **USE site** (NODE_IDENT, NODE_CALL): "an existing variable is referenced" → READ from tracking system at ANY scope
-
-**Never add scope-aware logic at use sites.** It breaks cross-scope access (loops, if bodies accessing outer variables). Proven by 4 failed patches across BUG-488 and BUG-494.
-
-**Pattern:** `find_handle_local` for declarations, `find_handle` for uses. Same as checker's `scope_lookup_local` vs `scope_lookup`.
-
-### Refactor Triggers — When Patching Won't Work
-
-Stop patching and refactor when:
-1. **Same fix needed at 4+ sites** → Extract helper function. One change point.
-2. **Patch fixes bug A but breaks test B** → The assumption being patched is architectural, not local. Need new abstraction (e.g., `find_handle_local` was the abstraction that fixed BUG-488).
-3. **Three failed attempts at the same bug** → Your mental model of the code is wrong. Read the full function, not just the bug site. (BUG-488: 3 patches failed because `find_handle` was used everywhere for both reads and writes — needed two-function split.)
-4. **Fixed buffer hits limit** → Replace with stack-first dynamic pattern. Never increase the constant (rule #7).
-
-### Pragmatic Fix vs Proper Fix
-
-| Indicator | Pragmatic (avoid) | Proper (do this) |
-|---|---|---|
-| Fix location | Patching at the call site where bug manifests | Fixing at the root (declaration, data structure, helper) |
-| Scope of change | 1 line change, 1 site | New helper/abstraction, all sites use it |
-| Test impact | Fixes the test case, might break others | Fixes the class of bugs, no regressions |
-| Example | `if (depth < 8)` depth limit | Call graph DFS with memoization (BUG-474) |
-| Example | Ban yield in orelse (flag) | Promote temps to state struct (BUG-481) |
-| Example | `find_handle` + scope check at use site | `find_handle_local` at declaration site (BUG-488) |
-
-### The "Ban vs Track" Decision
-
-When a pattern is unsafe, the AI's default instinct is to BAN it (compile error). The proper ZER approach is to TRACK it (add to a tracking system).
-
-```
-AI instinct: "Ban &move_struct in function calls"
-Proper:      "Track &move_struct — mark source as HS_TRANSFERRED"
-
-AI instinct: "Ban yield inside orelse blocks"
-Proper:      "Promote orelse temps to async state struct"
-
-AI instinct: "Ban variable shadowing in zercheck"
-Proper:      "Add scope_depth to PathState, find_handle_local for declarations"
-```
-
-**Only ban when NO tracking system can cover the case** (e.g., naked non-asm = hardware constraint, not a tracking gap). If the user pushes back on a ban, they're usually right — look for a tracking solution.
-
-## Implementation Workflow — Lessons Learned
-
-These patterns were discovered through repeated mistakes. Follow them to avoid wasting turns.
-
-### Adding New Builtin Methods (alloc_ptr, Task.alloc, etc.)
-Every new builtin method requires changes in THREE places:
-1. **Checker** — type-check the call, return correct type, validate args
-2. **Emitter** — emit the correct C code for the call
-3. **zercheck** — if the method allocates/frees, register it in zercheck tracking
-
-Forgetting zercheck = the method works but UAF/double-free are not caught. This happened with `alloc_ptr()` — checker + emitter worked, zercheck didn't recognize it.
-
-### Adding New AST Node Types (goto, label, etc.)
-New node types require changes in FIVE places:
-1. **Lexer** — keyword token (e.g., `TOK_GOTO`)
-2. **AST** — node kind + data struct (e.g., `NODE_GOTO` + `goto_stmt`)
-3. **Parser** — parse the syntax, create the node
-4. **Checker** — validate (label exists, not in defer block, etc.)
-5. **Emitter** — emit the C equivalent
-
-Also: update EVERY recursive AST walker that handles all node types. **7 walkers now use exhaustive switch (no `default:`)** — GCC `-Wswitch` warns automatically when a new NODE_ type is missing:
-- `scan_frame` (checker.c) — stack depth analysis
-- `collect_labels` (checker.c) — goto label collection
-- `validate_gotos` (checker.c) — goto target validation
-- `zc_check_expr` (zercheck.c) — expression UAF/double-free checks
-- `zc_check_stmt` (zercheck.c) — statement-level handle tracking
-- `emit_auto_guards` (emitter.c) — bounds check guard emission
-- `emit_top_level_decl` (emitter.c) — top-level declaration emission
-
-3 walkers keep intentional `default:`: `emit_expr`/`emit_stmt` (emit `/* unhandled */` diagnostic), `resolve_type_for_emit` (returns `ty_void` fallback). These produce visible output on unknown nodes, not silent skips.
-
-When adding a new NODE_ type, compile and check for `-Wswitch` warnings — they show exactly which walkers need updating. This prevents the entire class of "walker missing node type" bugs (BUG-433/434/435/437/452).
-
-### Two-Pass Emission Pattern
-`emit_file()` uses two-pass emission:
-- Pass 1: struct/enum/union/typedef declarations
-- Auto-Slab globals (between passes)
-- Pass 2: functions, global variables, everything else
-
-This is needed because auto-slabs use `sizeof(StructType)` which requires the struct to be declared first. If adding new auto-generated globals, insert them between the passes.
-
-### Testing New Features — Interaction Test Checklist
-After implementing any feature, test these interactions:
-1. Feature + `orelse return` (bare) AND `orelse { return; }` (block) — BOTH forms, they take different emitter paths
-2. Feature + `defer` (cleanup on exit)
-3. Feature + `const`/`volatile` (qualifiers) — especially const + Handle (const key ≠ const data)
-4. Feature + loops (`for`/`while` + `break`/`continue`)
-5. Feature + `switch` (arms, captures)
-6. Feature + other NEW features from same session
-7. Feature + `*opaque` (C interop boundary)
-8. Feature as bare expression (ghost handle check)
-9. Feature + `if (opt) |t|` unwrap (immutable capture) — Handle auto-deref must allow data writes
-10. Feature + struct field access (nested struct containing Handle/pointer)
-11. Feature in interrupt handler (`c->in_interrupt` — ISR ban needed?)
-12. Feature + zercheck (does zercheck RECOGNIZE new alloc/free patterns?)
-13. Feature + `else if` chains — source mapping `#line` must not follow `else` on same line (BUG-418)
-14. Any new coercion must work in ALL 4 value-flow sites: var-decl init, assignment, call args, return (BUG-419)
-15. Feature + `@critical` — control flow banned inside (return/break/continue/goto skip interrupt re-enable)
-16. Feature + `defer` + `return expr` — return expression must evaluate BEFORE defers fire (BUG-442). Test: `defer free(h); return h.field;` must work (not UAF)
-17. Feature + `keep` parameter — keep is INFERRED (2026-06-19): a function storing a pointer param to a global/static/param-field now *infers* keep (compiles), and the safety boundary is the CALL SITE: passing `&local`/arena/local-slice to such a function must error. Test the call-site rejection, not a body error. Transitive too (`outer(p){inner(p)}` with inner keep → outer's p keep → `outer(&local)` rejected).
-
-### Write Real Code After Implementing Features — MANDATORY
-
-Unit tests find syntax bugs. REAL CODE finds interaction bugs. After implementing ANY new feature:
-
-1. Write a **real program** (10-60 lines) that uses the feature in a realistic pattern
-2. Compile with `zerc --run` in Docker
-3. If it crashes or gives wrong output → you found a bug unit tests missed
-
-This session's proof: writing a 60-line HTTP server found the orelse block null-sentinel bug that 1,700+ unit tests missed. Testing `Task.alloc()` with both orelse forms found the auto-slab initializer bug.
-
-**Bug patterns found ONLY by real code (not unit tests):**
-- `orelse { return; }` (block form) emitting 0 instead of pointer — tests all used bare `orelse return`
-- Auto-slab `{sizeof(T), 0, 0}` positional init putting sizeof in wrong field — tests used explicit Slab
-- zercheck not recognizing `Task.free()` as free — tests used `heap.free()` directly
-- const Handle blocking if-unwrap capture writes — tests didn't combine if-unwrap + Handle + assign
-- `else if` chain emitting `else #line N` (stray # in GCC) — tests had source=NULL, skipping #line
-- `slice = array` assignment missing coercion — tests only used var-decl init, not assignment
-- `typedef ?u32 (*Handler)(u32)` creating optional funcptr — tests used void return funcptrs
-
-- `u32 val = get_tok(&state).field; return val;` falsely rejected as "pointer to local" — scalar can't carry pointer
-The audit round found 6 bugs, real code found 5 more, real-code session 2 found 4 more. Both are needed.
-
-### Windows VSIX Workflow
-- `make docker-install` — builds + installs to mingw PATH
-- VSIX build: `docker build -f Dockerfile.vsix .`
-- `package.json` name MUST match marketplace listing name
-- `zer.lspPath` in VS Code settings overrides bundled binary detection — clear it if LSP fails
-- `where zerc` check must run BEFORE `process.env.PATH` injection in extension.js
-- Multiple extension versions can coexist — remove old ones from `.vscode/extensions/`
-
-## IR Path — see docs/compiler-internals.md
-
-Full IR path validation history + 22 architectural invariants + walker-missing-node-kind pattern + pre-lowering architecture + test harness mapping are documented in `docs/compiler-internals.md` under "IR Path Validation" (line ~4680).
-
-**Mandatory reading before touching `ir_lower.c`, `ir.c`, or any `IR_*` handler in `emitter.c`.** The 22 invariants prevent silent miscompilation — each was discovered via a bug (BUG-538 through BUG-594). Skipping this doc causes regressions.
-
-Quick reminders for common IR work:
-- **Entry block MUST be `bb0`** — call `start_block()` BEFORE `collect_labels()`
-- **`checker_set_type()` is PUBLIC** — use it when synthesizing AST in IR lowering
-- **Function bodies are IR-only** since 2026-04-19 — `emit_stmt` deleted, no AST fallback
-- **`emit_rewritten_node` is NOT `emit_expr`** — zero emit_expr calls in IR function body emission
-- **AST→IR migration watchpoint**: any IR handler that replaces `emit_expr(inst->expr)` with direct emission MUST port every `_zer_trap` / `_zer_bounds_check` / `_zer_shl` safety wrapper. See "AST→IR Emission Diff Audit" section below.
-
-### ir_validate hardening (phases 1+2, 2026-04-20)
-
-`ir_validate(IRFunc *)` (in `ir.c`) is the safety-net check that runs
-in the emitter hook on every lowered function. Previously structural-
-only (targets in range, no duplicate local IDs). Hardened with:
-
-- **Per-op field invariants** for 11 op kinds (BINOP, UNOP, COPY,
-  LITERAL, FIELD_READ/WRITE, INDEX_READ, ADDR_OF, DEREF_READ, CAST,
-  CALL_DECOMP) + BRANCH needs-condition + CAST needs-type. Catches
-  lowerer building a malformed instruction.
-- **Defer balance** — every `IR_DEFER_PUSH` must have a CFG-reachable
-  `IR_DEFER_FIRE` with emit_bodies=true (`src2_local != 2`). Without
-  it the `defer` body is statically dead (missed cleanup / latent
-  leak). Uses `cfg_reaches_fire()` DFS helper.
-- **NULL-type-local** — every `func->locals[i].type` must be non-NULL.
-  Lowerer forgot `resolve_type` → downstream crash.
-- **Reachability (opt-in diagnostic)** — `ZER_IR_WARN_UNREACHABLE=1`
-  logs unreachable blocks. **Cannot be promoted to error**: lowerer
-  correctly emits IR for source dead code (`goto done; x=0; done:`)
-  and there's no static way to distinguish that from a forgotten-edge
-  bug. Useful for lowerer-refactor sessions.
-
-**For fresh sessions / when editing `ir_lower.c`:**
-- If new IR op added, add a field-invariant case in `ir_validate`'s
-  `switch(inst->op)` (around `ir.c:445`).
-- **A terminator is ALWAYS the last instruction of its block — ENFORCED since
-  BUG-1070 (2026-09-23c).** The old `RETURN; DEFER_FIRE; GOTO bb_post` shape
-  made "last instruction is IR_RETURN" false for every function with a defer,
-  and the leak pass + FuncSummary builder silently skipped all of them. Every
-  append goes through `ir_add_inst_checked` (opens a fresh block after a
-  terminator); `ir_validate` errors on anything after one. Exit consumers ask
-  `ir_block_is_live_return`, never "last op == RETURN" by hand.
-- Don't try to enforce "reachability" as error — see above.
-- Defer push without reachable fire = **hard error**, aborts compile.
-  If a lowerer change trips this, investigate the push path.
-
-Remaining real gaps (future work, not safety-critical):
-- Call arg count matches callee signature (needs symbol-table access)
-- `FIELD_READ` field name exists on src type (needs type traversal)
-- `LITERAL` kind matches dest type
-- `yield`/`await` only in async function
-- Use-before-define (needs dominator analysis — hardest)
-
-Full gap audit (20 items evaluated): see
-`docs/compiler-internals.md` "ir_validate gap audit" section.
-
-## CFG Migration (zercheck.c → zercheck_ir.c) — COMPLETE 2026-05-03
-
-`zercheck_ir.c` is the SOLE production safety analyzer. `zercheck.c` is a
-150-line backward-compat shim (LSP, firmware tests, test_production). Rules:
-
-- **ALL new safety analysis goes in `zercheck_ir.c`** — never the shim.
-- **Never call `ir_lower_func` twice on the same AST** — `pre_lower_orelse`
-  (ir_lower.c) destructively rewrites NODE_ORELSE. Callers must produce a
-  fresh AST per invocation (current callers re-parse). Production zerc uses
-  the emitter's single-lowering `ir_hook`; after emit, zerc_main runs the
-  iterative FuncSummary build + main analysis on the COLLECTED IRFuncs.
-- **`IR_POOL_ALLOC`/`IR_SLAB_ALLOC`/`IR_POOL_FREE` etc. are NEVER emitted**
-  by ir_lower.c (intentional architecture). Method detection lives in
-  IR_ASSIGN/IR_CALL via `ir_classify_method_call_ex`. Don't "fix" the absence.
-- `ZER_AGREEMENT_AUDIT=1` re-enables AST analysis for
-  `tools/agreement_audit.sh` measurement only — never in production.
-
-Migration record (F0.1-F0.7 parity gaps, F3.1/F3.2 narrow-pattern closures,
-removed knobs): `docs/compiler-internals.md` "CFG migration record"
-(moved 2026-06-10).
-
-## First Session Workflow
-
-When starting a new session or lacking context:
-
-1. Read `CLAUDE.md` (this file) — has FULL language reference above, rules, conventions
-2. **MANDATORY — read `docs/compiler-internals.md` BEFORE modifying any compiler source file** (parser.c, checker.c, emitter.c, types.c, zercheck.c). It documents every emission pattern, optional handling, builtin method interception, scope system, type resolution flow, and common bug patterns. Skipping this and discovering patterns by reading source files wastes 20+ tool calls. The document exists specifically to prevent this.
-3. Read `BUGS-FIXED.md` — 506+ past bugs with root causes. Prevents re-introducing fixed bugs. Read `docs/future_plans.md` for architecture roadmap (table-driven compiler, container keyword, monomorphization).
-4. `ZER-LANG.md` — full language spec (only if CLAUDE.md quick reference is insufficient)
-5. **Use `make tags` + grep for code navigation** — generates ctags index (2,183 entries). Use `grep "function_name" tags` to find file+line+signature. NEVER read full source files speculatively. Read only the specific lines around grep results. This is 40x more efficient than brute-force reading.
-6. Run `make docker-check` (preferred) or `make check` to verify everything passes before making changes
-7. The compiler pipeline is: ZER source → Lexer → Parser → AST → Type Checker → ZER-CHECK → C Emitter → GCC. New IR path (v0.4): AST → Checker → IR (flat locals + basic blocks) → zercheck on IR → emit C from IR → GCC. Use `--emit-ir` to see IR output.
-
-### HARVESTING A `claude/*` AUDIT BRANCH — the cheap path (2026-08-26/27, ten branches consumed)
-
-Full protocol + case studies: `docs/compiler-internals.md` "Harvesting an audit branch". The five
-things that actually cost loops:
-
-1. **READ THE FORK POINT FIRST — it is the whole triage.** `git merge-base HEAD <branch>` then
-   `git rev-list --count <base>..HEAD`. A branch that forked near main audits the CURRENT compiler and
-   its findings are live; one that forked earlier overlaps with everything landed since AND its BUG
-   numbers collide with yours. Measured over ten branches: only the two that forked near main produced
-   almost everything that survived. Renumber on adoption; never trust a branch's BUG-NNN to be free.
-2. **CHERRY-PICK, DO NOT RE-DERIVE.** `git cherry-pick --no-commit <sha>`, resolve, `rm -f *.o
-   src/safety/*.o && make zerc`, run the branch's own tests, then `make check`. Doc files
-   (`BUGS-FIXED.md`, `docs/limitations.md`, `.gitignore`) conflict every time — `git checkout --ours`
-   them and write your own entry.
-3. **A CLEAN APPLY IS NOT EVIDENCE OF NO CONFLICT.** Two independent implementations of ONE rule can
-   coexist without git noticing a thing. Hit TWICE: a doubled `memset` in both allocators, and a whole
-   second arena/barrier-init pass (`record_resource_use` + 4 `Checker` fields) sitting beside the
-   existing one, which would have double-reported every diagnostic. **After every pick, grep for the
-   rule you already have, not just for conflict markers.**
-4. **The branch's tests are NOT authority — run them against YOUR main.** A "HOLE LIVE" is usually one
-   of: a `// zerc-flags:` line the harness must pass; a negative that BANS what main resolves by
-   TRACKING (main compiles it and TRAPS — check the runtime exit, 133); a module test needing its
-   companion `.zer` in the same directory. All three produced false alarms this session.
-5. **Branch commits carry tracked ELF binaries** (test artifacts). `git diff --cached --numstat | awk
-   '$1=="-"'` before committing. The `.gitignore` now excludes them BY SHAPE (extension-less under a
-   test tree), so nothing re-appears.
-
-**Their fix vs yours — pick by MEASUREMENT.** Build the branch (`git archive <branch> | tar -x -C $S`)
-and run the shape you doubt against it. That is how the non-null-funcptr disagreement was settled:
-their whole-file rule ACCEPTED an unguarded indirect call through null (verified by reading the emitted
-C for a guard, and finding none). Soundness is the hard wall; over-rejection is the soft gradient.
-
-**Before adopting an over-rejection FIX, measure the corpus cost of the RULE:**
-`grep -rhoE '<the form>' tests/ rust_tests/ zig_tests/ lib/ examples/ | wc -l`. Two proposed negatives
-were rejected this way — `~0` (6 uses, the canonical all-ones idiom) and `0 - 1` (wrapping is a
-DOCUMENTED ZER guarantee). Those are UNSIGNED OPERATIONS whose result has the high bit set, not the
-sign CONVERSION `u32 x = -1;` that is correctly rejected. Do not collapse the two.
-
-### Consuming an audit branch — VERIFY THE REPRODUCTION FIRST (2026-08-01, cost several loops)
-
-Before implementing ANY fix harvested from a `claude/*` audit branch, run its reproducer against
-current main and confirm the bug is REAL and the test DISCRIMINATES. Three distinct traps, all hit
-in the 2026-08-01 sweep (26 fixes across §A–§D):
-
-1. **The branch's own test may not discriminate.** Four VRP reproducers (`8rv51h` if-capture +
-   orelse, `n0odo5` return-range, and the shipped trap variants) index a **heap slice**, whose
-   RUNTIME bounds check fires regardless of VRP — so they trap on a broken compiler AND a fixed one,
-   and PASSED on unfixed main. Rewrite against a **FIXED ARRAY**, where VRP elision is the actual
-   mechanism, and confirm the test FAILS on main before you fix anything. Same idea as the
-   "use values VRP cannot prove" rule in the AST→IR audit.
-2. **The bug may already be closed, or only half-live.** §C7 is described as "Ring.push/keep-call";
-   the keep-call half was ALREADY rejected on main — only Ring.push was live. Fixing the closed half
-   would have been pure churn.
-3. **The described root cause may point at the wrong layer.** §C7's real defect was NOT in
-   `container_push_arg_escapes` (which existed and was correctly gated) but upstream in
-   `arg_is_local_derived`, whose NODE_CALL recursion excluded pointer-carrying aggregates. Read the
-   code, not just the commit message.
-
-Also: a negative test that COMPILES is unambiguous (definitely a hole), but a negative test that
-REJECTS proves nothing until you check the REASON — several "rejections" on main were parse/type
-errors, or (§D3) a GCC codegen error masking a checker that emitted no diagnostic at all. Use
-`zerc f.zer -o out.c` to isolate the CHECKER verdict from the GCC one.
-
-### A documented OPEN hole is a HYPOTHESIS — measure before implementing (2026-08-08)
-
-Measured over `docs/limitations.md`: of six entries listed OPEN CRITICAL/HIGH, **four were already
-closed**, one was live, one did not reproduce. Entries are honest when written; the compiler moves
-underneath them. Implementing from a stale description produces a no-op "fix" that looks successful,
-because a rejection is a rejection whether or not your patch caused it.
-
-- **Reproduce on main FIRST**, before reading the fix sketch. Already rejects → mark it closed with
-  the measurement; do not implement.
-- **Read the REASON, not the exit code.** (~~`-o out.c` exits 0 on checker errors~~ — it exits 1,
-  corrected 2026-08-17 in "zerc -o gotchas"; the rule stands because a non-zero exit never says
-  WHICH rule fired.) It also prints a success line `zerc: in.zer -> out.c` — non-empty output is
-  NOT an error. Grep for `error`/`zercheck`, then check it is YOUR rule.
-- **Masking is the dominant failure mode.** 3 of the 6 reproducers were rejected by an unrelated
-  stronger rule (one masked TWICE). Route around it, then re-probe.
-- **AN EDIT THAT APPEARS TO APPLY AND DOESN'T — four distinct forms hit in ONE session
-  (2026-08-10). Verify the edit LANDED and RUNS, not that the script printed "ok".**
-  (a) a Python `assert` mid-script aborts BEFORE the file write, so every earlier "ok" was
-  printed from memory and NOTHING was written — write after each edit, or check `git diff`;
-  (b) a line-scan deletion whose end-marker had been re-wrapped ran **2,800 lines** past its
-  target (caught only by the build) — `cp file /tmp/backup` FIRST, delete by explicit count,
-  and assert the boundary lines; (c) a hook inserted by pattern landed in the WRONG FUNCTION
-  (`scan_frame` instead of `check_stmt`) — confirm the enclosing function, not just the line;
-  (d) a hook placed inside `if (kind == NODE_STRUCT_INIT)` compiled clean and never fired for
-  the target shape. **For (c)/(d) the only thing that exposed it was a one-line trace proving
-  the predicate was never REACHED.** When a fix silently does nothing, print whether it runs
-  before theorising about why it doesn't.
-- **Before shipping an over-rejection, MEASURE its corpus cost.** `grep -rhoE '<the form>'`
-  across `tests/zer tests/zer_fail test_modules rust_tests zig_tests` and count. The
-  deref-launder reject (BUG-781/782) shipped because that count was **ZERO** — that number,
-  not an argument, is what makes "cannot prove => reject" defensible.
-  **Better than grep: let the COMPILER classify.** Build the rule, then compile every
-  corpus file and grep the STDERR for YOUR diagnostic — a grep over source can only match
-  a syntactic form, and most rules are not syntactic. Measured 2026-09-10 (BUG-974): that
-  scan found (a) a genuine latent NULL-deref in `rt_test_400_full_lifecycle` and (b) a
-  VACUOUS test — `rt_scope_escape_orelse` claimed to test scope escape, contained no
-  `&local` at all, and had been passing on the LEAK rule. Neither is visible to "the suite
-  is green": the first was a test that needed fixing, the second a test that had never
-  tested its subject. **Any file your new diagnostic touches that is not one of your own
-  new negatives is either a real bug you just found or a test that was passing for the
-  wrong reason — check which, every time.**
-- **WAITING FOR `make check` — do not poll it by hand.** It runs 5-15 min. Start it with the Bash tool's
-`run_in_background`, then block on `until ! pgrep -x make >/dev/null; do sleep 20; done` (a Monitor
-task, or a second backgrounded Bash). Two traps: `pgrep -f 'make check'` also matches YOUR OWN wrapper
-shell, so the loop exits instantly — use `pgrep -x make`. And with warnings now at ZERO the log stays
-tiny during the build phase, so a line count is NOT a progress signal; grep the log for
-`Passed:|Failed:` instead. ALWAYS write `MAKE_CHECK_EXIT=$?` into a status file — make aborts at the
-first failing audit, so a later gate silently never runs.
-
-**Fetching ONE file from a branch without checking it out:** `git show <branch>:<path>`. Use this to
-run a branch's reproducer verbatim — a RECONSTRUCTED probe can CONFIRM a hole but never REFUTE one.
-
-**KEEP A BASELINE COMPILER AND A/B EVERY CLAIM AGAINST IT (2026-09-08, caught a FALSE claim
-already committed).** Build the pre-change compiler once, into a scratch dir, and keep it for the
-whole session:
-
-    rm -rf /tmp/headb && mkdir -p /tmp/headb && git archive HEAD | tar -x -C /tmp/headb
-    cd /tmp/headb && rm -f *.o src/safety/*.o && make zerc      # ~1 min
-
-Then every "X was broken, my change fixes it" is one command per side instead of a memory. This is
-the ONLY thing that distinguishes *your* fix from a DIFFERENT refactor that already fixed it. Three
-of four claimed wins for refactor L survived it; the fourth (the auto-guard) did not — refactor M had
-emitted it all along, and the claim had been inherited from a motivation section measured before M
-landed and repeated without re-measuring. **A doc's MOTIVATION text goes stale the moment a
-neighbouring refactor lands. Before writing "this fixed X", A/B X against the commit right before
-your change.**
-
-**WHEN YOU A/B, THE GREP IS THE EXPERIMENT — get it wrong and you get a confident wrong answer.**
-Both halves of that failed in one session:
-- **The diagnostic you are grepping for may not say `error:`.** `emit_defer_stmt`'s coverage gap
-  prints **`compiler bug: ... no handler for node kind N`** on stderr and emits a `_zer_trap` into
-  the C. Grepping `error:` reported "already worked pre-fix" for three constructs that were in fact
-  broken. Prefer a pattern that cannot miss: `grep -c "compiler bug"` plus
-  `sed -n '/^uint32_t main/,/^}/p' out.c | grep -c _zer_trap`.
-- **Check WHICH BINARY each row ran.** A row labelled "pre-L" that actually invoked `./zerc` is not a
-  measurement. Put the binary path in the loop, print both sides, and never label from intent.
-
-**A BOUNDED WALK MUST ROUND TOWARD REJECT — AND THAT IS THREE DIFFERENT REMEDIES
-(2026-09-10, BUG-976).** Nineteen depth guards in checker.c / zercheck_ir.c were
-enumerated (`grep -nE "depth *> *[0-9]+\)"`, then map each to its enclosing function and
-its return value). **Every one returned the SAFE answer past its cap** — so nesting past
-the cap was a supported way to get anything through the rule. Pick the remedy by asking
-what the walk PRODUCES:
-- **a boolean predicate** -> FLIP it (return the dangerous answer). 11 of them; zero corpus cost.
-- **a walk that reports nothing** (the spawn race scan, its ISR mirror) -> make it REPORT,
-  naming the callee it refused to descend into. "Did not look" must not read as "found nothing".
-- **a walk that RECORDS names for a later rule** (`record_atomic_plain_in_callee`) -> WIDEN it.
-  It cannot be flipped: there is no conservative value ("assume every global is an atomic
-  cell" rejects everything). When a fail-open cap has no conservative value, a cap past
-  anything real IS the fix.
-
-**A FIXED TABLE THAT SILENTLY DROPS IS THE SAME DEFECT** (`_rmw_alias[16]`,
-`_static_locals[32]` — the 17th alias and 33rd static local were never seen). Set an
-overflow flag and make the LOOKUP answer conservatively once set.
-
-**A GENEROUS CAP AND A CONSERVATIVE ANSWER ARE NOT ALTERNATIVES — you need both.**
-Flipping `unique_resource_name` at its cap of 8 made a 34-deep nested struct read as a
-resource and MASKED a use-after-move test. A wrong diagnostic is worse than the permissive
-answer it replaced. Raise the cap past anything real FIRST, then round toward reject.
-
-**"FAIL CLOSED" IS NOT A PROPERTY OF A PREDICATE — IT IS A PROPERTY OF THE PREDICATE PLUS
-THE RULE READING IT (2026-09-11, BUG-977). CHECK THE POLARITY AT EVERY CALLER BEFORE
-FLIPPING.** `ir_contains_move_struct_field_depth` fails closed for the COPY sink (`true` =
-"assume it might") and that same `true` is fail-OPEN at the LEAK sink, where move-tracked
-locals are EXEMPT from leak checking — so a `Handle` nested 34 structs deep leaked in
-silence. A predicate feeding two rules of opposite polarity has no single fail-safe
-default: make the walk **TRI-STATE** (`YES` / `NO` / `UNKNOWN`) and let each sink pick its
-own reading of UNKNOWN. Two things the audit of its other 25 callers turned up:
-- **A MARK AND ITS UNDO MUST USE THE SAME READING** or the undo silently fails to undo
-  (`zercheck_ir.c:5303` undoes a same-line transfer materialisation — its `true` enters
-  the accept path and is nonetheless CORRECT). A third polarity is not automatically a
-  third bug.
-- **Widening alone can NEVER close it when the construct has no syntactic limit.** Struct
-  nesting has none — you can always declare one more level — so the cap raise (32 -> 256)
-  only bought depths 33..256 and `leak_handle_300_structs_deep.zer` is caught by the
-  tri-state. Contrast BUG-978's orelse chain, which the parser bounds at ~84: **when
-  another limit already bounds the construct below your cap, the hole is closed by
-  construction** and the conservative answer is a backstop. Measure which case you are in.
-
-**WHEN THE WALK RETURNS A POINTER THE DIAGNOSTIC NEEDS, IT CANNOT BE FLIPPED — REPORT
-INSTEAD (2026-09-11, BUG-978).** `value_frame_bound_symbol` returns the `Symbol *` the
-caller NAMES; past the cap there is no Symbol to name, so it sets a `gave_up` flag and the
-caller reports the refusal naming the DESTINATION, which it always has. **A report path no
-program can reach must still be verified to FIRE** — temporarily lower the cap, confirm
-every branch prints, restore. A path that has never executed is not a net.
-
-**THE VERDICT CAN BE RIGHT AND THE SENTENCE STILL FICTION (2026-09-11, BUG-977b).** BUG-976
-had `unique_resource_name` return the literal name `"resource"` past its cap, so a 100-deep
-plain struct — carrying no resource at all — was told `'resource'` "is addressed by NAME
-... conventionally a global". Return a POINTER-COMPARED SENTINEL past the cap (the
-`_ir_pool_mixed` device) and give the reporter its own sentence. This is the "a wrong
-diagnostic is worse than the permissive answer" rule one level up, and it is easier to ship
-because the verdict looks correct in the test — **the author reads the sentence, not the
-exit code.**
-
-**THE DURABLE END-STATE FOR A WALK OVER A TYPE IS NO CAP AT ALL.** The type graph is finite
-and acyclic — the checker rejects self-containment ("struct 'A' cannot contain itself by
-value") and a by-value field cannot forward-reference, so mutual recursion is unspellable.
-A visited-set walk keyed on `Type *` terminates and needs no depth bound. Every type walk
-in checker.c / zercheck_ir.c is carrying a cap it does not need.
-
-**AN AUTO-GUARD READS THE INDEX TWICE — A VOLATILE INDEX WALKS PAST IT (2026-09-13,
-BUG-1011).** `if (i >= N) return; ... arr[i]` is one value for a local and two loads for a
-volatile; whatever changes it between them (ISR, thread, peripheral) defeats the guard.
-The checker leaves a volatile ident UNPROVEN and UNGUARDED so the emitter's
-single-evaluation inline form (one load into a temp, check and access on the temp, TRAP)
-takes it; an MMIO pointer index has no such form and is refused. When you add a guard that
-tests a value and then uses it, ask whether the value can change in between.
-
-**A SCAN THAT DESCENDS INTO A CALLEE MUST NOT RESET THE CALLER'S CONTEXT (2026-09-13,
-BUG-998).** The spawn race scan enters a bound / returned function from the MIDDLE of the
-caller's walk and called `rmw_alias_reset()` so the callee starts clean — which also emptied
-the caller's alias table, so `volatile *u32 p = &g; *() fp = noop; fp(); *p += 1;` lost
-`p -> g` at the binding. Snapshot the CONTEXT tables around the descent (`RmwScanCtx`) and
-leave the FINDING flags alone, so a callee's finding still propagates out.
-
-**A RUNTIME TRAP'S LINE NUMBER IS PART OF THE DIAGNOSTIC — TEST IT (2026-09-13,
-BUG-1003).** IR block emission had `#line` off wholesale, so every trap reported
-"function's line + offset in the generated C" — a 7-line file said line 14. Plausible
-numbers are the ones nobody checks. `emit_line_map` re-anchors per instruction (safe: always
-between statements at column 0, never inside `({...})`); `// expect-trap-at: N` in a
-`zer_trap` test asserts the reported line and fails against the pre-fix compiler.
-
-**A CAP OVER AST NESTING IS AS REACHABLE AS A CAP OVER A CALL GRAPH (2026-09-13, BUG-994).**
-The BUG-976 enumeration flipped the call-graph walks and left the walks whose `depth`
-counts if / loop / switch NESTING (`scan_returned_funcname`, `record_isr_returned_funcname`,
-`record_isr_funcname_binding`, `arg_is_local_address_int`) on the reasoning that block
-nesting is "not real" — the parser allows 64 levels, and a `return cb;` nine ifs deep was
-ACCEPTED at both factory sinks. Re-run the grep after every adoption: `grep -nE "depth *>
-*[0-9]+\)" checker.c zercheck_ir.c` — a harvested branch brings its own caps with it
-(`type_carries_forgeable` / `type_carries_enum_c` arrived at 32 with `return false`, on a
-construct with no syntactic limit — an enum 40 structs deep was forgeable; both flipped the
-same day, pinned by `*_40_deep.zer`).
-
-**A DEPTH CAP THAT IS RESET ON A HOP IS NOT A CAP (2026-09-10, BUG-975).** `eval_const_expr_ex`
-had `if (depth > 256) return CONST_EVAL_FAIL;` and incremented properly down unary/binary
-nodes — and `const u32 A = A;` still HUNG the compiler, while the two-node form SEGFAULTED.
-The IDENT arm called the resolver with no depth, and the resolver restarted the evaluator at
-**0**, so every identifier hop zeroed the counter. **Reading "is there a bound?" is not the
-check; the check is "does the bound survive every hop the recursion can take".** Grep the
-recursion for a literal `0` passed where a depth belongs. Related: a cycle and an
-over-long chain need DIFFERENT diagnostics — a depth bound alone reports a 70-link chain as
-"cyclic", which is a wrong answer, not a rough one.
-
-**A TERNARY BETWEEN TWO FORMAT STRINGS IS A SILENT `-Wformat` HOLE (2026-09-09, BUG-971).**
-`checker_error(c, line, cond ? "…'%.*s'…" : "…%s '%.*s'…", args…)` shares ONE argument
-list, and GCC cannot check it because the format is not a literal. Adding a `%s` to one
-branch made the other read a `char *` as an `int` precision — it surfaced only as five
-existing negatives failing "for the WRONG REASON". When you touch one branch of a ternary
-format, mirror it in the other, or split into two calls with two arg lists (which is what
-that site now does).
-
-**A TRUNCATED GREP'S COUNT IS NOT EVIDENCE — read the whole list (2026-09-08, BUG-967).** Corpus cost
-was measured as 43 hits, the first 20 inspected, all benign, and the cost recorded as ZERO. It was
-ONE, and the test suite found it rather than the measurement. When justifying a tightening by corpus
-cost, enumerate every hit — or better, let the compiler classify them: compile each candidate file
-with the new rule and grep for YOUR diagnostic.
-
-**Reading a PREVIOUS session's transcript** (after a compaction, to recover what was decided and why):
-transcripts are `~/.claude/projects/<path-slug>/<session-uuid>.jsonl`, one JSON object per line with
-`message.content` blocks of type `text` / `thinking` / `tool_use` / `tool_result`. `ls -lat` that
-directory — the newest file is the CURRENT session, so the one you want is usually the SECOND. Parse
-it (a few lines of python: iterate the last N lines, pull `text` and `thinking`, truncate
-`tool_result` hard) rather than `tail`-ing raw JSON, which is unreadable and enormous. Worth doing
-when the compaction summary says a refactor "landed" or "was reverted" and you need to know which.
-
-**`// expect-error` drift between branches is a real WRONG-REASON source.** Two branches spelled the
-same diagnostic "initialised" and "initialized"; the rule fired correctly and the harness still
-reported failure. When adopting a negative, either match main's ACTUAL wording or drop the test if
-main already covers the shape — never soften the rule to match a directive.
-
-**`make check` REPORTS ITS OWN FAILURE ONLY IN THE EXIT CODE — echo it.** Measured 2026-08-10:
-  `make check` had been exiting **2** for four commits while being reported green. Make aborts at
-  the first failing audit, so every LATER gate (fixed-buffer, type-dispatch, carrier-dispatch,
-  emit-audit, sink matrix) silently never runs. The trap that hid it: verifying with
-  `grep -E 'OK — no'`, which matches **"OK — no gaps"** from a DIFFERENT audit that runs earlier.
-  Grep the SPECIFIC line you expect (`no default: clauses`), and always print `MAKE_CHECK_EXIT=$?`.
-- `grep -c 'error' build.log` **lies** — `CFLAGS` has `-Werror=switch`, so the echoed gcc command
-  line matches. Use `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.
-- **The matrix grids are safe to run concurrently since 2026-09-23** — each works in its own
-  `mkdtemp` dir via `tests/zer_tmp.h` (`ZT("/tmp/_zer_x.zer")`). They used to share fixed
-  `/tmp/_zer_*` paths and a second run yielded phantom failures. A NEW grid must use `ZT()`.
-- **A RECONSTRUCTED reproducer can CONFIRM a hole, never REFUTE one.** If the branch/entry names a
-  file, fetch it: `git show origin/claude/<branch>:tests/zer_gaps/<file>.zer`. Measured 2026-08-09 —
-  G3 was recorded "did not reproduce in 5 shapes" from hand-written probes that all used a
-  POINTER-taking helper; the real shape wrote the global BY NAME, and the verbatim branch file
-  reproduced on the first run. Keep such a negative test BYTE-IDENTICAL to the original.
-- **A gate can cover the right FEATURE and still be blind — check what QUANTITY it measures.**
-  Measured 2026-08-10: the 34-cell defer-goto matrix passed both before and after a live
-  double-fire miscompile, because its cells assert an acquire/release BALANCE and a balance is
-  invariant to an extra fire that also acquires. The raw FIRE COUNT discriminated (35/36 pre-fix).
-  Before trusting a green gate over a bug you suspect, run it against a pre-fix build.
-- **Update the entry in the SAME commit as the fix.** The "a stale gate is worse than none" rule
-  this file already states applies to the LEDGER; it had drifted ~3 weeks.
-
-Full protocol + the masking table + the pre-fix rebuild recipe (proving a negative discriminates):
-`docs/compiler-internals.md` "Consuming a documented open hole — the MEASURE-FIRST protocol".
-The canonical multi-site worked example (one question, six syntactic forms, patched four times
-before anyone wrote the axis down — the 5th hole was found BY the enumeration): same file,
-"The funcptr REACH class".
-
-### Bug Hunting Workflow (principle-first, not brute-force)
-
-**The 12-branch audit-fix merge-back is COMPLETE (2026-07-15).** All **41 unique
-soundness/miscompile/crash/bare-metal holes** found across the parallel `claude/*` audit branches
-are now merged to main, one verified fix at a time — §A memory-safety #1–#7, §B escape sinks #8–#13,
-§C VRP/bounds #13–#16, §D miscompiles #17–#25, §E concurrency #26–#31, §F crashes #32–#35, §G
-bare-metal #36–#41. **🎯 The per-sink escape/free matrix (`tools/sink_matrix.sh`) is CLEAN — 32 ok /
-0 holes / 0 over-rejects — and is a permanent `make check` gate.** make check 984/0. The historical
-ledger (source sha → applied form → regression test per fix) is `docs/limitations.md` "## ✅ DONE …
-TASK TRACKER COMPLETE" + the per-section **✅ DONE** paragraphs; two low-risk follow-ups remain as
-their own OPEN entries (NOT part of the 41): §E #28 `orelse-in-a-defer-body` loud-trap and §A #7
-HOLE-A4 `Tok b = *p;` move-via-deref. **Any NEW escape/free fix must keep the sink matrix CLEAN + add
-a cell for its own shape** (standalone `make check-sink-matrix`). The per-fix WORKFLOW + loop-costing
-gotchas (extract-hunk-not-branch, re-anchor-by-text, `orelse return` is bare, a neg-test non-zero
-exit ≠ intended rejection / could be SIGSEGV, baseline new `_eff->kind` sites, make check FOREGROUND)
-are in **compiler-internals.md "Merge-back methodology"**.
-
-When looking for bugs, do NOT read entire files. Instead:
-1. Find ONE instance of the bug (from user report, test failure, or targeted grep)
-2. Derive the GENERAL PRINCIPLE the bug violates (e.g., "TYPE_DISTINCT must be unwrapped")
-3. Grep for ALL violations of that principle (`grep "->kind == TYPE_" file.c`)
-4. Fix all instances, not just the reported one
-This approach found 13 bugs in ~5K tokens. Brute-force reading of the same code found the same bugs in ~200K tokens.
-
-### Flag-Handler Matrix Audit (automated cross-reference)
-
-`bash tools/audit_matrix.sh ./zerc` (in `make check` since 2026-09-25) compiles one program per control-flow construct (return, break, continue, goto, yield, await, spawn, alloc) × context (defer body, @critical, no loop, sync/async function, interrupt, naked) and asserts the VERDICT and the rule's own wording, plus boundary cells that must compile. It used to grep checker.c line windows; that drifted onto decoy `case` labels and printed 16 false positives, so it could not have shown a real gap. A new context flag or a new control-flow construct needs its cells in the same commit.
-
-First run found 5 bugs: yield/await missing defer_depth + critical_depth checks, spawn missing in_interrupt check.
-
-The pattern is generic — define axes (rows × columns), extract handler bodies, cross-reference. Extend to:
-- Emitter: NODE_ handlers × type_unwrap_distinct calls
-- zercheck: NODE_ handlers × handle state checks
-- Any subsystem with flags × handlers
-
-### Interaction Test Gap Analysis (ctags + ls)
-
-To find untested feature combinations:
-1. `grep "NODE_" ast.h` — list all features
-2. `ls tests/zer/ | grep "feature_name"` — check existing coverage
-3. Difference = gap. Write tests for high-risk pairs (features that share state/control flow).
-
-Bug-producing pairs (from history): async × orelse, distinct × optional, spawn × shared, move × switch. Independent pairs (no interaction): defer × comptime, goto × volatile.
-
-## Project Architecture
-
-- **zerc** = the compiler binary (`zerc_main.c` + all lib sources)
-- **zer-lsp** = LSP server (`zer_lsp.c` + all lib sources)
-- Source files: `lexer.c/h`, `parser.c/h`, `ast.c/h`, `types.c/h`, `checker.c/h`, `emitter.c/h`, `zercheck.c/h`, `ir.c/h` (IR data structures + validation), `ir_lower.c` (AST → IR lowering), `zercheck_ir.c` (handle tracking on CFG), `vrp_ir.c` (value range on IR)
-- Test files: `test_lexer.c`, `test_parser.c`, `test_parser_edge.c`, `test_checker.c`, `test_checker_full.c`, `test_extra.c`, `test_gaps.c`, `test_emit.c`, `test_zercheck.c`, `test_firmware_patterns.c`, `test_fuzz.c`, `tests/test_semantic_fuzz.c`
-- **Semantic fuzzer** (`tests/test_semantic_fuzz.c`): **32 generators** covering every ZER feature — alloc, cast, defer, interior ptr, *opaque, arena wrappers, pool/slab, goto+defer, comptime, handle alias, enum switch, while+break, Task.alloc, funcptr callback, union capture, ring buffer, nested struct deref, defer+orelse block, packed struct, slice subslice, bool/int cast, signed/unsigned cast, distinct typedef, bit extraction, non-keep escape, arena global escape. 200 tests per `make check` run, verified with 2,500 tests across 5 seeds. **When adding new features, add generator functions** — `gen_safe_<feature>()` + `gen_unsafe_<feature>()` + new case in switch.
-- E2E tests in `test_emit.c`: ZER source → parse → check → emit C → GCC compile → run → verify exit code
-- Cross-platform: `test_emit.c` uses `#ifdef _WIN32` macros (`TEST_EXE`, `TEST_RUN`, `GCC_COMPILE`) for `.exe` extension and path separators. Works on both Windows and Linux/Docker.
-- Spec: `ZER-LANG.md` (full language spec), `zer-type-system.md` (type design), `zer-check-design.md` (ZER-CHECK design)
-- **Default behavior:** `zerc main.zer` compiles to `main.exe` (or `main` on Linux) — the `.c` intermediate is temp, deleted after GCC. No `.c` visible to user. Looks native.
-- Compiler flags: `--run` (compile+execute), `--emit-c` (keep `.c` output, old behavior), `--emit-ir` (print IR to stdout, exit — debugging), `--lib` (no preamble/runtime, for C interop), `--no-strict-mmio` (allow @inttoptr without mmio declarations), `--target-bits N` (usize width override), `--gcc PATH` (specify cross-compiler for auto-detect), `--stack-limit N` (error when estimated stack usage exceeds N bytes)
-- `-o file.c` → emits C (kept). `-o file.exe` or `-o file` → compiles to exe (temp .c deleted).
-- usize width: auto-detected from GCC via `__SIZEOF_SIZE_T__` probe at startup. Falls back to 32 if GCC not found. `--target-bits` overrides.
-- GCC flags: emitted C requires `-fwrapv` (ZER defines signed overflow as wrapping). `zerc --run` adds this automatically.
-- Emitted C uses GCC extensions: statement expressions `({...})`, `__auto_type`, `_Alignof`, `__attribute__((packed))`
-- User-defined struct/enum/union names emit as-is (no `_zer_` prefix). Only internal names are prefixed.
-
-## Building & Testing
-
-**PREFERRED: Use Docker** to avoid Windows Defender false positives on compiled executables:
-```
-make docker-check          # build + run ALL tests in container (gcc:13 image)
-make docker-test-convert   # run only conversion tool tests (zer-convert + zer-upgrade)
-make docker-build          # just build zerc in container
-make docker-shell          # interactive bash inside container for debugging
-```
-
-**Fallback: Native (triggers AV on Windows corporate laptops):**
-```
-make zerc             # build the compiler
-make check            # build + run all tests
-```
-
-**DO NOT run `make check` or execute compiled binaries outside Docker** on the dev machine — Windows flags rapid create-execute-delete of unsigned .exe files as malware.
-
-**WARNING:** Do NOT use bind mounts (`docker run -v $(pwd):/zer`) for test runs. Compiled binaries would land on the Windows filesystem and Defender sees them again. The Dockerfile uses `COPY` — all compilation stays inside the container's filesystem. Keep it that way.
-
-**POSIX portability:** `zerc_main.c` uses `popen`/`pclose` for GCC auto-detection. These require `_POSIX_C_SOURCE 200809L` on strict C99. Without it, `popen` gets implicit `int` return → truncated 64-bit pointer → segfault. Already fixed (BUG-417). If adding other POSIX functions, check that the feature test macro covers them.
-
-The codebase is **cross-platform** (Windows + Linux/Docker):
-- `test_emit.c`: `#ifdef _WIN32` macros for `.exe` extension and path separators
-- `test_modules/run_tests.sh`: detects platform via `$OSTYPE` for executable extension
-- `zerc_main.c --run`: platform-appropriate exe path and run command
-- `Dockerfile`: uses `gcc:13`, copies sources, runs `make check`
-
-## Rust Test Translation — see docs/compiler-internals.md
-
-Workflow for translating tests from Rust `tests/ui/` into ZER-equivalent
-tests (`rust_tests/rt_*.zer` and `rust_tests/reject_*.zer`) is documented
-in `docs/compiler-internals.md` near the end of the file. Includes: Rust
-pattern → ZER equivalent mapping, common agent mistakes to avoid, test
-writing methodology, current coverage status, high-value test categories.
-
-Consult when adding Rust-equivalent test cases. Not needed for most
-sessions.
-
-## Git Rules
-
-- NEVER add Co-Authored-By or any Claude/AI attribution to commits
-- All commits must be under zerohexer@gmail.com only
-- No other authors, no co-authors, no AI mentions in commit messages
-
-## Testing Methodology — MANDATORY
-
-Every compiler component (lexer, parser, AST, type checker, ZER-CHECK, safety passes,
-C emitter) MUST follow specification-based testing with full positive/negative coverage.
-
-### The Rule
-
-For EVERY rule in ZER-LANG.md:
-1. **Positive test**: valid code that exercises the rule — must compile/pass
-2. **Negative test**: code that violates the rule — must produce an error
-
-NO EXCEPTIONS. If a spec rule exists, both tests must exist.
-
-### Checklist Derivation
-
-1. Read the spec section
-2. Extract every rule (explicit or implied by example)
-3. Write positive test proving the rule works
-4. Write negative test proving the violation is caught
-5. If either test fails, fix the implementation BEFORE moving on
-
-### When Adding New Features
-
-- Write tests FIRST (or alongside), never after
-- Every new AST node kind must have parser tests
-- Every new type check must have positive + negative checker tests
-- Every new coercion rule needs both directions tested
-- Every error message must be triggered by at least one test
-
-### Edge Case Protocol
-
-Before marking ANY component as "done":
-1. Run the full test suite (all components)
-2. Write adversarial tests — code that SHOULD break
-3. Test boundary conditions (empty input, max values, deeply nested)
-4. Test interactions between features (orelse + if-unwrap, defer + loop + break)
-5. Verify error messages are helpful (file, line, what went wrong)
-
-### Regression Prevention
-
-- Never delete a passing test
-- If a bug is found, write a test that reproduces it BEFORE fixing
-- All tests must pass before any commit
-- Run `make docker-check` (or `make check`) before every push
-
-### Pipeline Integration Testing — CRITICAL
-
-**Problem this solves:** zercheck existed for months with 50+ passing unit tests, but was NEVER called from the actual compiler (`zerc_main.c`). All safety promises were lies — the tests tested zercheck in isolation, not whether `zerc` actually invoked it. This was caught on 2026-04-03.
-
-**The rule:** For every safety system (checker, zercheck, emitter safety checks), there MUST be a `.zer` file in `tests/zer_fail/` that exercises it through the FULL compiler pipeline:
-
-```
-tests/zer/          ← positive: must compile + run + exit 0
-tests/zer_fail/     ← negative: must FAIL to compile
-```
-
-**Current negative tests (`tests/zer_fail/`):**
-- `uaf_handle.zer` — use-after-free on Pool handle (zercheck)
-- `double_free.zer` — double free on Pool handle (zercheck)
-- `maybe_freed.zer` — use handle after conditional free (zercheck MAYBE_FREED)
-- `bounds_oob.zer` — compile-time array OOB (checker)
-- `div_zero.zer` — division by zero literal (checker)
-- `null_ptr.zer` — non-null pointer without init (checker)
-- `dangling_return.zer` — return pointer to local (checker escape analysis)
-
-**When adding a new safety feature:**
-1. Write the checker/zercheck/emitter code
-2. Write C-level unit tests (test_checker_full.c, test_zercheck.c, test_emit.c)
-3. **ALSO write a `tests/zer_fail/feature_name.zer`** that exercises the feature through `zerc`
-4. If the negative test compiles when it shouldn't → the feature isn't integrated into the pipeline
-
-**The test runner (`tests/test_zer.sh`):**
-- Positive tests: `zerc file.zer --run` must exit 0
-- Negative tests: `zerc file.zer -o /dev/null` must exit non-zero
-- Both run as part of `make check`
-
-## Debugging Workflow — ZER Source Code Bugs
-
-### The Rule
-COMMIT before debugging. Always. No exceptions.
-If you can't commit (tests failing), stash.
-`git checkout -- file` reverts EVERYTHING including your fix.
-
-### Correct Workflow
-
-1. **Reproduce first**
-   Write the minimal ZER program that triggers the bug.
-   Smallest possible. One struct. One function. If you can't reproduce in 10 lines, simplify.
-
-2. **State what you expect vs what you get**
-   "current.next should return ?*Node (kind=14) but returns *Node (kind=13)"
-   Not "the orelse is broken somehow."
-
-3. **One debug line, targeted**
-   Add ONE fprintf at the exact decision point. Run. Read output. Remove debug. Fix.
-   Never add multiple debug prints across multiple files.
-
-4. **Confirm root cause before fixing**
-   "kind=13 is_optional=0 on pointer auto-deref path" — confirmed root cause.
-   "I think the typemap might be overwritten" — hypothesis, needs confirmation.
-
-5. **Fix one thing**
-   The fix should be 1-5 lines. If growing beyond that, you're fixing the wrong thing.
-
-6. **`make docker-check` immediately after fix**
-   950+ tests must pass. If not — revert, re-examine root cause.
-
-7. **Update BUGS-FIXED.md** with: symptom, root cause, fix, test reference.
-
-8. **Commit before anything else**
-
-### Always Update Docs After Changes — MANDATORY
-
-After any bug fix or feature change that passes `make check`, update ALL relevant docs in the SAME commit. Never leave doc updates for later. Future sessions depend on these being accurate.
-
-- `BUGS-FIXED.md` — add the bug with symptom, root cause, fix, test reference
-- `docs/compiler-internals.md` — if ANY emitter pattern, checker behavior, type handling, builtin method, or preamble changed. This is the primary reference future sessions read. Stale info here causes bugs.
-- `docs/reference.md` — if ANY language feature, syntax, intrinsic, builtin method, or type behavior changed. This is the user-facing language reference. Must reflect what `zerc` actually compiles, not what's spec'd but unimplemented.
-- `README.md` — if test counts, features, or status changed
-- `ZER-LANG.md` — if spec behavior changed
-- `CLAUDE.md` — if syntax rules, implementation status table, or workflow changed
-
-**GAPS / LIMITATIONS / TECH DEBT GO IN `docs/limitations.md` — MANDATORY.**
-Any open bug, deferred fix, over-rejection, coverage gap, known-flaky test, or
-"can't do this yet because X" goes in `docs/limitations.md` as a `## OPEN — …`
-entry with: symptom, root cause, why the obvious fix is wrong (if applicable),
-fix sketch, and any tripwire test. This is the SEPARATION OF CONCERNS:
-- `docs/compiler-internals.md` = durable architecture + how-to a future session
-  must remember. Read once, applies forever. NOT a place to bury open problems.
-- `docs/limitations.md` = the living tech-debt ledger. Problems, gaps, deferred
-  fixes. Entries removed once fixed.
-A gap written only into compiler-internals.md (or only a commit message, or only
-a code comment) is effectively lost — it won't be found when someone goes
-looking for "what's broken / what's left." compiler-internals.md MAY mention a
-gap, but only as a one-line pointer to the limitations.md entry that owns it.
-When you defer or discover a limitation, add the limitations.md entry in the
-SAME commit. When you fix one, remove its entry in the SAME commit.
-
-**Only update docs after `make check` passes and you have high confidence the change is correct.** Do not update docs for speculative or in-progress work.
-
-### Compiler Crash Debugging — Use ASan
-
-When the compiler (`zerc`) crashes with a segfault:
-
-1. **Build with AddressSanitizer** to get exact crash location:
-   ```
-   docker run --rm zer-check bash -c 'cd /zer && gcc -g -fsanitize=address -O0 -I. -o zerc_asan lexer.c parser.c ast.c types.c checker.c emitter.c zercheck.c zerc_main.c && ./zerc_asan /tmp/crash.zer -o /tmp/crash.c 2>&1'
-   ```
-
-2. ASan output gives file:line and stack trace — go directly to the crash location.
-
-3. Common crash patterns:
-   - **Wrong variable used** — `arg_node` vs `karg` (BUG-441): validated one variable but dereferenced another. ASan showed `checker.c:3148` → immediately found `arg_node` should be `karg`.
-   - **NULL type dereference** — `type->pointer.inner->kind` where `inner` is NULL. Add NULL check.
-   - **Missing `type_unwrap_distinct()`** — accessing `.struct_type` on TYPE_DISTINCT.
-
-This saved hours of debugging in BUG-441 — ASan pinpointed the exact line in 1 command instead of printf-based bisection.
-
-### Red Flags — Stop and Revert
-
-- Fix growing beyond 10 lines
-- Adding platform-specific ifdefs to fix a type bug
-- Restructuring unrelated code to make the fix work
-- Debug prints spreading across multiple files
-- Circular reasoning ("but it should work because...")
-- More than 2 rounds of debug-without-fix
-
-When you see these: `git checkout -- <file>`. Start over with a cleaner hypothesis.
-
-### Anti-Circular Rule
-
-If you've spent more than 3 debug cycles on the same bug without a confirmed root cause:
-1. STOP. Revert all uncommitted changes.
-2. State the bug in ONE sentence: "X returns Y but should return Z."
-3. Add ONE fprintf at the exact decision point.
-4. Run. Read. The output tells you where to look next.
-5. If the output contradicts your hypothesis, your hypothesis is wrong. Form a new one.
-
-The pattern that causes circular debugging: assuming the fix location before confirming the root cause. You end up modifying code that isn't the problem, which creates new symptoms that look like the original bug.
-
-### Lessons From BUG-416/417 Debugging Session
-
-**"Pragmatic fix" means "we don't understand the root cause yet."** The previous session added a name-based struct matching fallback in the emitter because `find_unique_allocator` returned NULL. The hypothesis was "pointer identity fails across modules." Debug fprintf showed the pointers were identical — the REAL bug was `find_unique_allocator` finding the same allocator TWICE (raw name + mangled name from BUG-233) and returning NULL for "ambiguous." One-line fix: `if (found && found->type == t) continue;`.
-
-**When a function returns NULL, check WHY it returns NULL, not just that it does.** `find_unique_allocator` has two NULL-return paths: "not found" and "ambiguous" (two matches). The previous session assumed "not found." Debug fprintf on the match sites immediately showed "found_already=1" — ambiguity, not absence.
-
-**Environment-specific crashes mask real bugs.** The popen segfault (BUG-417) prevented the previous session from testing properly, leading to the wrong diagnosis. The popen crash was a C99 portability bug (`popen` not declared → implicit `int` return → 64-bit pointer truncated). Always check `-Wall` output for `implicit declaration of function` warnings.
-
-**Dual symbol registration is a known pattern in multi-module.** Imported globals exist under BOTH raw name and mangled name in global scope (BUG-233 design). Any code scanning global scope for unique matches must handle this: check `found->type == candidate->type` before declaring ambiguity. This pattern exists because: (1) raw name needed for unqualified calls from the same module, (2) mangled name needed for cross-module disambiguation.
-
-**`_POSIX_C_SOURCE` is required for `popen`/`pclose` on strict C99.** Without it, these POSIX functions get implicit `int` declaration. On 64-bit, this truncates `FILE*` pointer → SIGSEGV. The `zerc_main.c` fix: `#define _POSIX_C_SOURCE 200809L` before `<stdio.h>` (guarded `#ifndef _WIN32`). This bug does NOT manifest on Windows, Docker `gcc:13`, or when compiling with `-std=gnu99`.
-
-### The Pointer Auto-Deref Pattern (ZER-specific)
-
-When a field access bug presents:
-- **Value path** (`a.field`): struct field lookup at line ~848
-- **Pointer path** (`ptr.field`): auto-deref then field lookup at line ~878
-Check BOTH paths separately. They have different code and different bugs.
-
-### Prompt Template for Debugging Sessions
-
-When asking Claude to debug a ZER compiler bug:
-
-```
-Here is the minimal ZER program that fails: [paste]
-Here is the exact error: [paste]
-Here is what I expect: [one sentence]
-Here is the relevant compiler code: [paste the ONE function]
-Add one debug print to confirm the root cause.
-Do not restructure. Do not fix yet. Just confirm.
-```
+| `tests/zer/` | compiles, runs, exits 0 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | fails to compile FOR THE STATED REASON | same |
+| `tests/zer_trap/` | compiles clean, traps at run time (`// expect-trap`, `// expect-trap-at: N`) | same |
+| `tests/zer_gaps/` | known gaps, expectation INVERTED (compiling IS the gap; a closed gap fails loudly; a masked one needs `// gap-masked-by:`) | same |
+| `test_modules/` | multi-file (`_negative` suffix for negatives) | `test_modules/run_tests.sh` |
+| `rust_tests/`, `zig_tests/` | translations ONLY; contain negatives (`reject_*`, or `// EXPECTED: compile error`) | their own |
+| `test_*.c`, `tests/test_*_matrix.c` | C unit tests; axis-crossed grids | `make check` |
+
+Count tests from the tree (`ls tests/zer/*.zer | wc -l`), never from a document.
+
+### Test rules
+- **Every negative states WHY: `// expect-error: <substring>` in the first 5 lines** — the
+  reason the rule is SUPPOSED to give, never a paste of today's output. Many independent
+  rules reject the same file, so a non-zero exit proves nothing; this gets WORSE as the
+  compiler gets better.
+- A test that needs compiler flags says so on its first line: `// zerc-flags: …`.
+- Every test directory is executed by a runner; wire a new one in the same commit. An
+  unexecuted test decays to zero value, then to negative value once it is believed.
+- Every spec rule has a positive AND a negative test; every safety feature has a
+  `tests/zer_fail/` file through the full `zerc` pipeline (unit tests alone once hid that
+  zercheck was never called from the compiler).
+- Bug found → write the reproducer BEFORE the fix and show it FAILS on a pre-fix build.
+  Keep a baseline compiler for the whole session
+  (`git archive HEAD | tar -x -C /tmp/headb && make -C /tmp/headb zerc`) and A/B every
+  "X was broken, my change fixes it" against it. Check WHICH binary each row ran, and grep
+  for the diagnostic that is actually printed (`compiler bug:` is not `error:`).
+- Use shapes the analysis cannot trivially prove: a FIXED ARRAY for VRP (a slice keeps its
+  runtime check and masks the bug); values laundered through a loop for runtime wrappers.
+- Hosted x86-64 limits: an `interrupt` block cannot be in a runnable positive (GCC refuses
+  it) — verify compile-only; an MMIO positive must never touch the address (use an
+  out-of-range index so the guard returns).
+- New feature — test the interactions: both `orelse return` and `orelse { return; }`,
+  `defer`, loops, `switch`, const / volatile, `*opaque`, if-unwrap capture, `@critical`,
+  ISR, BOTH the assign and the var-decl spelling, all value-flow sites (init, assign, call
+  arg, return). Then write one REAL 10-60 line program: real programs found bugs that
+  1,700 unit tests missed.
+- A new diagnostic that fires on a corpus file which is not your own new negative is either
+  a real bug or a test that was passing for the wrong reason — check which, every time.
+  Measure the corpus cost of any tightening by COMPILING the corpus with the rule and
+  grepping for your diagnostic; a source grep sees only syntax, and a truncated list is not
+  evidence.
+
+## How to work here
+
+**Before code.** Read the function, its callers and its data flow; decide the architecture;
+then write. Grep `BUGS-FIXED.md` and `docs/limitations.md` for the area. A documented OPEN
+hole is a HYPOTHESIS: reproduce it on main first (most stale entries were already closed or
+masked by a stronger rule), read the REASON not the exit code, and fetch a branch's
+reproducer verbatim (`git show <branch>:<path>`) — a reconstructed probe can confirm a
+hole, never refute one. A doc's motivation text goes stale when a neighbouring change lands.
+
+**The no-debt rule — every change is the proper fix, not a shortcut.**
+1. No duplicate logic: extract the helper FIRST.
+2. No shared mutable AST nodes: a desugaring clones.
+3. An ordering dependency is commented at both sites.
+4. No copy-on-call for state the caller must see mutated.
+5. Test the real pattern, not the simple case.
+6. 100%, not 99%: handle the edge or reject it at compile time — never silently wrong.
+7. **Rule #7 — never a fixed-size buffer for dynamic data**: stack-first + arena / realloc
+   overflow (`audit_fixed_buffers.sh`). A table that silently drops is a hole: set an
+   overflow flag and answer conservatively.
+8. Scope-sensitive state is written at DECLARATION sites (the current scope:
+   `scope_lookup_local`) and only read at use sites (any scope: `scope_lookup`). Scope
+   logic added at a use site breaks every loop / branch that reads an outer variable.
+
+**Proper vs pragmatic.** A fix belongs at the root (declaration, data structure, shared
+helper), not where the bug shows. The same fix at 4+ sites, a patch that fixes A and breaks
+B, or three failed attempts → stop: you need a new abstraction. **Track, don't ban** — ban
+only for a hardware / OS constraint, an emission impossibility, or something needing a
+runtime or type system ZER lacks (cross-check Zig and Rust). An over-rejection is acceptable
+only when the rewrite it forces is a teachable discipline. Features: if existing primitives
+solve it, it is a library concern (see "Feature Judgement").
+
+**A bounded walk rounds toward REJECT.** A depth cap or a full table must give the
+conservative answer — which depends on the CALLER's polarity: flip a boolean; make a silent
+walk REPORT; widen a recorder that has no conservative value; go tri-state when two callers
+read the answer oppositely; return a sentinel (not a made-up name) when the diagnostic needs
+a pointer. A generous cap AND a conservative answer, both. A cap reset on a hop is not a
+cap; a cap over AST nesting is as reachable as one over a call graph; a walk over TYPES
+needs no cap (the type graph is acyclic). After adopting foreign code re-run
+`grep -nE "depth *> *[0-9]+\)" checker.c zercheck_ir.c`.
+
+**A relaxation (reject → accept) is the one change class where a bug ships a
+use-after-free or a race.** Diagnose the layer first (usually a coarse domain at a join);
+the soundness gate is a complete no-`default:` AST walk, never an IR-field scan; prefer
+overriding the DECISION over refining fixpoint state; land the tracking with no behaviour
+change (green `make check`) before flipping it; and write the rule's hypotheses down as a
+model first — for a "fact F holds between A and B" rule ask which edges LEAVE the region
+and which edges ENTER the code after B (the BUG-1651 Coq model found three races the prose
+argument had not). Compiler-internals.md "Sound relaxation".
+
+**Editing discipline.** Verify that an edit LANDED and RUNS: a script that asserts midway
+writes nothing; a pattern insert can land in the wrong function; a hook can compile and
+never fire — one trace line proving the predicate is REACHED settles it. Back up before a
+scripted deletion and delete by explicit count.
+
+**Debugging.** Commit or stash first. Minimal repro → expected vs actual in ONE sentence →
+ONE targeted print at the decision point → confirm the root cause → fix (1-5 lines; if it
+grows you are fixing the wrong thing) → `make check`. A compiler segfault: rebuild with
+`-fsanitize=address -g -O0` and read the trace. Three cycles without a confirmed cause, a
+fix past ~10 lines, spreading prints or platform ifdefs → revert and restate. When a
+function returns NULL, find WHICH path returned it. Imported globals are registered under
+both the raw and the mangled name — a "unique match" scan must compare `->type`. Field
+access has two paths (value, and pointer auto-deref): check both.
+
+**Checklists.** New builtin method → checker + emitter (both paths) + zercheck_ir. New AST
+node → lexer, ast, parser, checker, ir_lower / emitter, and every exhaustive walker
+(`-Werror=switch` lists them). New coercion → every value-flow site, through
+`value_flows_to`. New emission path → every safety wrapper ported (see the audit section
+below). New safety rule → which of the 4 models, its gate cell, a negative with
+`expect-error`, and its `docs/multi-site-classes.md` row if N sites answer it.
+
+**Docs go in the SAME commit, after `make check` is green.**
+- a fix → `BUGS-FIXED.md` (symptom, root cause, fix, test);
+- an open gap, deferred fix, over-rejection or residual → a `## OPEN` entry in
+  `docs/limitations.md` (updated / removed when fixed) — a gap recorded only in a commit
+  message or a code comment is lost;
+- durable architecture → `docs/compiler-internals.md`; a language change → `docs/reference.md`;
+- a class or gate → its row in `docs/multi-site-classes.md` + ONE index line here;
+- a process lesson → `docs/session-playbook.md` + at most two lines here.
+
+**Harvesting a `claude/*` audit branch.** The fork point is the triage (a branch that forked
+long ago overlaps what landed since, and its BUG numbers collide); cherry-pick, don't
+re-derive; a CLEAN APPLY is not evidence of no conflict — grep for the rule you already
+have; run the branch's tests against YOUR main; branch commits carry ELF binaries. Pick
+"their fix or mine" by measurement. Protocol: compiler-internals.md "Harvesting an audit
+branch".
+
+**Agents** are optional. One that writes ZER must be given the syntax rule block (playbook
+"Spawning Agents That Write ZER Code"); one that compiles must follow the Windows-host
+rule; verify every finding yourself before acting on it.
+
+## Pushback discipline — capitulation is not helpfulness
+
+When the user disagrees, re-derive the answer from the substrate (code, docs, a
+measurement), independently of which way they lean.
+1. **User right** → change position AND name the specific technical error in your earlier
+   reasoning. "You're right, I overstated" is not a reason.
+2. **User wrong** → hold the position and show the specific thing they are missing. Their
+   confidence is not evidence.
+3. **A genuine judgment call** → say so and lay out both sides, without picking the side
+   they leaned to.
+4. Never open with "you're right" before re-checking. A flip within one message of pushback
+   is drift, not reasoning.
+
+The test: could you defend the new position against equal pushback from the opposite
+direction? If not, it was capitulation. The inverse holds too — do not re-litigate settled
+questions (see "Confirmed NOT bugs"). Full text: playbook, same title.
+
+## Proof work — read `docs/proof-internals.md` first
+
+- **Three levels — keep them apart in every claim.** L1: a Coq / Iris oracle (the abstract
+  rule is sound). L2: tests (the compiler rejects known violations). L3: VST on
+  `src/safety/*.c` (the C that is linked into zerc matches the spec for every input).
+- **THE ONE RULE: write specs against the L1 ORACLE, never against current C.** A
+  code-driven spec is a tautology that freezes bugs into CI. No oracle → write it first.
+- **The max-oracle standard.** Every distinguishable state AND every operational
+  PRECONDITION the decision relies on is a variable of the model — a soundness hole found by
+  red team rather than by a failing proof means the model lacked that variable (Level B's
+  guard stability; BUG-1651's edges leaving the window). Merge = JOIN with the unsafe class
+  as the default. Per oracle: T1 soundness, T3 a precision witness, T4 no-under-rejection.
+  Zero admits, listed in `_CoqProject` AND in the `make check-proofs` admit gate. Name the
+  honest LIMIT.
+- 100% precision is impossible (Rice). Pay down only the PAYABLE over-rejection (relational
+  domains, reduced product), each increment proven; never chase the forced tail.
+- VST-friendly C: a flat cascade of early-return ifs, no nesting, no compound conditions.
+  `src/safety/*.v` is clightgen output — never hand-edit it.
+- **Say what is NOT proven.** A proof file that was written but never compiled is not a
+  proof (`docs/limitations.md` B2 lists any such file).
+
+## Safety architecture — 4 models (tables: `docs/safety-model.md`)
+
+A new safety feature belongs to one of:
+1. **State machine** — an entity with a lifecycle (handle states, moves, thread handles).
+2. **Program-point property** — a fact about a value that changes at assignments and
+   branches (ranges, provenance, escape flags, context flags).
+3. **Function summary** — a per-function fact read at call sites (FuncProps, free / store
+   summaries, return range, stack frames, spawn and shared-type scans).
+4. **Static annotation** — declared once, checked at uses (qualifiers, MMIO ranges, keep).
+
+Fits none → it is a combination of these; otherwise stop and document why.
+
+## Diff-Based Post-Release Audit / AST→IR Emission Diff Audit
+
+After a large structural change, green tests are not sufficient (protocols:
+compiler-internals.md, same titles). The standing rule: an IR handler that replaces
+`emit_expr(...)` with direct emission silently STRIPS the safety wrappers `emit_expr`
+applied, and VRP hides the loss from tests. Before committing an emitter refactor:
+
+    grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe|emit_intn_mask" emitter.c
+
+Every AST-region match needs an IR-path equivalent. Audit BOTH operator forms (binary and
+compound assignment are different cases). A region-presence gate does NOT discriminate;
+behavioural coverage across emission forms does (`tests/zer/uN_width_wrap_all_forms.zer`).
+
+## Intentional — not bugs
+
+- MAYBE_FREED conservatism: a handle freed on one branch is unusable after the join unless
+  the guards are provably disjoint. Add `return;` after the free, or restructure.
+- No pointer arithmetic; `[*]T → *T` coercion only for C externs; a plain `*T` is not
+  indexable; `@inttoptr(*T, 0)` is allowed (MMIO at address 0).
+- `*opaque` from C has type id 0 (unknown) and passes the cast check: C is outside the boundary.
+- Handles passed to a funcptr call are consume-maybe; a global left MAYBE_FREED at exit is
+  deliberately not flagged.
+- Pool (fixed, ISR-safe), Slab (growable, not ISR-safe) and Arena (bump, bulk reset) are
+  three things on purpose. `Task.alloc()` uses one implicit auto-slab per struct type.
+- Emitted struct initialisers are always DESIGNATED, never positional.
 
 ## Confirmed NOT Bugs — DO NOT Re-Investigate
 
@@ -3453,116 +1117,9 @@ These were thoroughly investigated during the 2026-04-14 full codebase audit (25
 7. **`@offset` struct type check** (checker.c:5254) — Cosmetic only, not safety.
 8. **`scan_unsafe_global_access` static depth counter** (checker.c:6109) — Safe, LSP is single-threaded.
 
-## Agent-Verify Workflow — Bug Hunting & Test Writing
 
-When looking for bugs or writing new tests, use the spawn-then-verify pattern:
+## Git Rules
 
-### The Pattern
-
-1. **Spawn agent(s)** to audit code or write tests (they act as fresh sessions)
-2. **Verify every finding** yourself before acting — agents make mistakes
-3. **Fix confirmed issues**, reject false positives
-
-### For Bug Hunting
-
-Spawn an agent to audit a specific file (e.g., emitter.c). Tell it to:
-- Read CLAUDE.md and docs/compiler-internals.md first
-- Look for specific bug patterns (optional handling, type emission, intrinsic gaps)
-- Report with exact line numbers, triggering ZER code, wrong C output, expected C output
-- NOT fix anything — just report
-
-Then verify each finding by reading the actual code at the cited lines. Agents find real bugs (e.g., BUG-042 `?Enum` anonymous struct) but also report false positives.
-
-### For Test Writing
-
-Spawn an agent to write new E2E tests. **MUST include the ZER syntax rules block** from "Spawning Agents" section above. Then verify:
-- ZER syntax is correct (switch arms have braces, no `++`)
-- Expected exit codes are mathematically correct
-- Tests actually compile and pass with `make check`
-
-### Multi-Round Audit Protocol
-
-For pre-release auditing, run multiple rounds. Each round gets more targeted as obvious bugs are fixed. The prompt quality matters — here's the pattern that converged from 12 bugs to 1 across 5 rounds:
-
-**Round 1 prompt (broad):**
-- "Read CLAUDE.md, compiler-internals.md, BUGS-FIXED.md, then read checker.c/emitter.c"
-- "Look for: optional handling gaps, slice emission, intrinsic validation, missing error cases"
-- Results: finds obvious gaps (bool coercion, missing handlers)
-
-**Round 2+ prompts (targeted interactions):**
-- List ALL bugs already fixed — "Previous rounds fixed: [list]. Do NOT re-report these."
-- Ask for INTERACTION bugs: "Look for two features combining incorrectly"
-- Give specific combinations to check: "defer + orelse + break in for loop", "volatile + @inttoptr", "?void + orelse return in var-decl path"
-- Say: "If you find ZERO bugs, say CLEAN — that's a valid outcome."
-
-**Key prompt elements that improve agent quality:**
-1. Tell what was ALREADY fixed (prevents re-reporting — agents waste turns on known bugs)
-2. Tell it to check INTERACTIONS, not basic rules (negative test sweep covers those)
-3. Give specific interaction patterns (agents check exactly what you ask)
-4. Allow "CLEAN" as valid output (prevents agents from inventing false positives)
-5. Include the ZER syntax rules block (prevents agents from writing invalid test code)
-
-**Expected convergence:** Round 1: 10+ bugs. Round 2: 5-10. Round 3: 2-3. Round 4+: 0-1. If round 3+ still finds 5+, the checker/emitter has structural issues — stop and refactor.
-
-**After auditing:** Run a systematic negative test sweep — write one test for every `checker_error()` call site that has no test. This closes the gaps permanently so future audits find only interaction bugs.
-
-### Why This Works
-
-- Agents explore without consuming your main context window
-- Fresh perspective catches blind spots
-- Verification step catches agent mistakes (wrong syntax, false positives)
-- Multi-round convergence proves stability — each round finds fewer bugs
-- You get both breadth (agent exploration) and depth (your verification)
-
-## Diff-Based Post-Release Audit (when you suspect drift)
-
-After a large structural change (IR transition, major refactor, multi-session
-work), green tests are NOT sufficient — green can mean "test skipped silently"
-or "passed for the wrong reason". Run the protocol in
-`docs/compiler-internals.md` "Diff-based post-release audit protocol" (moved
-2026-06-10): stat the diff biggest-first, grep new code for drift markers and
-dead stubs (`/* forward */` with no payload), grep EMITTED C for comment-only
-stub fingerprints, check skip-list hygiene against limitations.md, verify new
-.c files are linked, run `tools/walker_audit.sh`. Calibration: the 2026-04-18
-run found 2 real bugs + 1 stale skip entry in +10k lines across 141 commits —
-bugs in paths the tests *thought* they were exercising.
-
-## AST→IR Emission Diff Audit — MANDATORY after any IR lowering refactor
-
-Class warning (7 regressions shipped 2026-04-15..19, BUG-595..599; siblings
-re-missed later as BUG-608/612): replacing `emit_expr(inst->expr)` with direct
-local-ID emission in IR handlers silently STRIPS every safety wrapper
-emit_expr applied (`_zer_bounds_check`, `_zer_trap`, `_zer_shl`, MMIO
-range/align). VRP hides the loss from tests — it proves most test values safe
-at compile time, eliding the very runtime checks that went missing. Test with
-values VRP CANNOT prove (constants laundered through a loop).
-
-Two rules that survive any refactor:
-1. Audit BOTH operator forms — binary `<<` and compound `<<=` are DIFFERENT
-   switch cases (NODE_BINARY vs NODE_ASSIGN); fixing one misses the other
-   (BUG-608 vs BUG-612).
-2. Before committing an IR-emitter refactor, run:
-   `grep -nE "_zer_trap|_zer_bounds_check|_zer_shl|_zer_shr|_zer_probe|emit_intn_mask" emitter.c`
-   (AST region, line < 4000) — every match needs an IR-path equivalent;
-   a missing one is a silent miscompile.
-   **`emit_intn_mask` / `emit_intn_mask_lv` added to this list 2026-08-01** —
-   the uN/iN WIDTH WRAP is a safety wrapper in exactly the same class as
-   `_zer_shl`, and its absence from the list is why §G3 shipped: the var-decl
-   path (IR_BINOP + emit_intn_mask) wrapped, the plain-assign path
-   (`emit_rewritten_node` NODE_BINARY/NODE_UNARY) did not, so `u3 7+7` gave 14
-   instead of 6 — compiles clean, wrong answer.
-3. **Do NOT "upgrade" rule 2 into a region-presence gate** ("wrapper must appear
-   both before and after `emit_rewritten_node`"). MEASURED 2026-08-01: it would
-   have been GREEN on the live G3 bug — `emit_intn_mask` was already present in
-   both regions (AST=8, IR=12 via `emit_inst`); the gap was inside ONE function's
-   `NODE_BINARY`/`NODE_UNARY` arms. A green gate over a live bug is the
-   false-confidence failure this file warns about, and is worse than no gate.
-   What DOES discriminate is BEHAVIOURAL coverage across emission forms —
-   `tests/zer/uN_width_wrap_all_forms.zer` exercises var-decl init / plain assign
-   / return / call-arg / compound-assign / global-store and exits non-zero on the
-   pre-fix compiler. Add a form to that matrix when you add an emission path.
-
-Full audit protocol + the emit_expr→IR equivalence checklist table + the
-3-audit methodology (behavioral / code-inspection / diff):
-`docs/compiler-internals.md` "AST→IR emission diff audit protocol"
-(moved 2026-06-10).
+- NEVER add Co-Authored-By or any Claude/AI attribution to commits
+- All commits must be under zerohexer@gmail.com only
+- No other authors, no co-authors, no AI mentions in commit messages

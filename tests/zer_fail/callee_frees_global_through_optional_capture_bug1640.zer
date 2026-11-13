@@ -1,4 +1,7 @@
-// GAP (2026-11-13 audit, docs/limitations.md): a callee frees a field of a captured ?struct global (exit 99)
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1640: the same through the capture of an OPTIONAL struct global
+// (`if (g_h) |c| { free(c.p); }`).
 struct T { u32 v; }
 struct H { *T p; u32 n; }
 ?H g_h;

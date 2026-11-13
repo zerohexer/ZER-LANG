@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is freed
+// BUG-1641: a getter reads a pointer field through a local VIEW of its parameter
+// (`*H h = &c.h; return h.p;`). The direct spelling `return c.h.p;` summarised as
+// "a view of c"; the view spelling bound the result to the slot's own id and
+// summarised as a view of nothing, so the caller kept `q` across `free(a)` and the
+// write below landed in the recycled slot of `b` (returned 99).
+struct T { u32 v; }
+struct H { *T p; }
+struct Ctx { H h; }
+*T get(*Ctx c) { *H h = &c.h; return h.p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    Ctx w;
+    w.h.p = a;
+    *T q = get(&w);
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    q.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

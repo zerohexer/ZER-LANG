@@ -1,0 +1,33 @@
+// BUG-1643 boundary: a pointer parameter handed to a task that is polled to
+// completion BEFORE the free; a task given only a value argument while a pointer
+// parameter is freed; a value-only global task started in a helper.
+struct T { u32 v; }
+async void co(*T p) { yield; p.v = 9; }
+async void cv(u32 n) { yield; }
+_zer_async_cv gv;
+void startv(u32 n) { _zer_async_cv_init(&gv, n); }
+u32 run(*T a) {
+    _zer_async_co t;
+    _zer_async_co_init(&t, a);
+    _zer_async_co_poll(&t);
+    _zer_async_co_poll(&t);
+    free(a);
+    return 0;
+}
+u32 run2(*T a) {
+    _zer_async_cv t;
+    _zer_async_cv_init(&t, 3);
+    _zer_async_cv_poll(&t);
+    free(a);
+    _zer_async_cv_poll(&t);
+    return 0;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    u32 r = run(a);
+    *T b = alloc(T) orelse return;
+    r += run2(b);
+    startv(3);
+    _zer_async_cv_poll(&gv);
+    return r;
+}

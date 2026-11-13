@@ -339,6 +339,12 @@ struct Symbol {
      * object as both is a race the callee's own borrow check cannot see. */
     unsigned short *alias_pairs;   /* (lent i << 8) | used j */
     int alias_pair_n, alias_pair_cap;
+    /* BUG-1645: pairs (param i, GLOBAL g) — param i is lent to a scoped spawn (here
+     * or in a callee) while the function touches the plain global g BY NAME before
+     * the join. A caller that passes `&g` as param i hands the thread the very
+     * object the window writes: the borrow check sees only the param side. */
+    struct LentGlobal { unsigned char param; Symbol *g; } *lent_globals;
+    int lent_glob_n, lent_glob_cap;
     /* BUG-1303: a pointer / slice LOCAL that holds this function's param n-1
      * (`*u32 q = b;`); 0 = none. */
     int param_alias_pos1;

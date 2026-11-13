@@ -1,0 +1,18 @@
+// BUG-1641 boundary: the view getter's result is used while its owner is alive and
+// freed after; a SCALAR read through the same view aliases nothing.
+struct T { u32 v; }
+struct H { *T p; u32 n; }
+struct Ctx { H h; H h2; }
+*T get(*Ctx c) { *H h = &c.h; return h.p; }
+u32 num(*Ctx c) { *H h = &c.h; return h.n; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    Ctx w;
+    w.h.p = a;
+    w.h.n = 4;
+    *T q = get(&w);
+    q.v = 3;
+    u32 r = a.v + num(&w);
+    free(a);
+    return r - 7;
+}

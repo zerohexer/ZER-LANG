@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1640: a callee reads a global struct into a local COPY, resets the global's
+// slot, and frees through the copy. Only a pointer/slice read of a global minted the
+// global's slot entry, so the freed-global summary named nothing and the caller's
+// alias of what the global held stayed ALIVE across the call (exit 99).
+struct T { u32 v; }
+struct H { ?*T p; }
+H g_h;
+void drop() { H c = g_h; g_h.p = null; if (c.p) |q| { free(q); } }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    g_h.p = a;
+    drop();
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    a.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

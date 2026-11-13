@@ -206,6 +206,12 @@ typedef struct {
      * free(c); a.v` read a recycled object. NULL = not proven. */
     const char *ret_global_key;
     uint32_t ret_global_key_len;
+    /* BUG-1642: every live return is the ADDRESS of ONE global (`*H geth() { return
+     * &g_h; }`) — a getter of the object, not a read of its value. A projection
+     * rooted at the call (`geth().p`) names that global's slot `g_h.p`. NULL = not
+     * proven (a bare global name only; a projection `&g.sub` is not summarised). */
+    const char *ret_addr_global;
+    uint32_t ret_addr_global_len;
 } FuncSummary;
 
 /* ZER-CHECK context */
@@ -242,6 +248,12 @@ typedef struct {
      * malloc'd, reset per function) — becomes FuncSummary.freed_global. */
     struct ZcFreedGlobal *cur_freed_global;
     int cur_freed_global_n, cur_freed_global_cap;
+    /* BUG-1640: (global slot key, allocation id) pairs this function MINTED when it
+     * read a global into a struct local. A reset of the slot (`g.p = null;`) drops
+     * its entry, but a free through the local copy still frees what the global
+     * held at entry — the note consults this table too. Dynamic, reset per function. */
+    struct ZcMintedGlobal { const char *key; uint32_t len; int aid; } *cur_minted_global;
+    int cur_minted_global_n, cur_minted_global_cap;
     /* BUG-1268: which heap allocation backs each arena of the function being
      * analysed (`Arena a = Arena.over(hb);`) — name -> backing alloc_id, so an
      * allocation from `a` can list `hb` in its view set and die with it.

@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is freed
+// BUG-1642: a getter returns the ADDRESS of a global (`return &g_h;`) and the caller
+// frees through a projection of the call (`geth().p`). The call at the base of the
+// projection had no key, so the free was not attributed to the global's slot and
+// `a` stayed ALIVE: the write below hit the recycled slot of `b` (returned 99).
+struct T { u32 v; }
+struct H { ?*T p; }
+H g_h;
+*H geth() { return &g_h; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    g_h.p = a;
+    *T q = geth().p orelse return;
+    free(q);
+    g_h.p = null;
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    a.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

@@ -1878,6 +1878,103 @@ cell p78_safe_inline_keep   compile "$P78"' u32 main(){ keep78(alloc(T78) orelse
 cell p78_safe_store_free    compile "$P78"' u32 main(){ H78 h; put78(&h, alloc(T78) orelse return); if (h.p) |q| { free(q); } h.p = null; return 0; }'
 cell p78_safe_store_global  compile "$P78"' u32 main(){ putg78(alloc(T78) orelse return); if (g78) |q| { free(q); } g78 = null; return 0; }'
 
+# SHAPE p79 (BUG-1639): a MOVE out of what a pointer / slice points at, where the
+# argument names no root (a pointer local viewing the object, a pointer PARAM
+# forwarded, an array handed over as a slice), crossed with the callee's summary.
+# BOUNDARY: a read-only callee takes the same pointer any number of times.
+echo "===== SHAPE p79 = move-out through a pointer / slice argument ====="
+P79='move struct Tk79 { u32 k; }
+struct W79 { Tk79 t; u32 n; }
+void con79(Tk79 t) { }
+void eat79(*W79 w) { con79(w.t); }
+u32 peek79(*W79 w) { return w.n; }
+void eats79([*]Tk79 s) { con79(s[0]); }
+u32 cnt79([*]Tk79 s) { return @truncate(u32, s.len); }
+void chain79(*W79 w) { eat79(w); }
+'
+cell p79_ptr_local_twice    reject "$P79"' u32 main(){ W79 w; *W79 p = &w; eat79(p); eat79(p); return 0; }'
+cell p79_ptr_local_then_use reject "$P79"' u32 main(){ W79 w; *W79 p = &w; eat79(p); con79(w.t); return 0; }'
+cell p79_param_forward_twice reject "$P79"' void two79(*W79 w) { eat79(w); eat79(w); } u32 main(){ W79 w; two79(&w); return 0; }'
+cell p79_param_chain_twice  reject "$P79"' void top79(*W79 w) { chain79(w); chain79(w); } u32 main(){ W79 w; top79(&w); return 0; }'
+cell p79_slice_then_use     reject "$P79"' u32 main(){ Tk79[2] ts; eats79(ts); con79(ts[0]); return 0; }'
+cell p79_slice_twice        reject "$P79"' u32 main(){ Tk79[2] ts; eats79(ts); eats79(ts); return 0; }'
+cell p79_safe_readonly_ptr  compile "$P79"' u32 main(){ W79 w; *W79 p = &w; u32 a = peek79(p); u32 b = peek79(p); return a + b; }'
+cell p79_safe_readonly_slice compile "$P79"' u32 main(){ Tk79[2] ts; u32 a = cnt79(ts); u32 b = cnt79(ts); return a + b; }'
+cell p79_safe_param_peek    compile "$P79"' u32 two(*W79 w) { return peek79(w) + peek79(w); } u32 main(){ W79 w; return two(&w); }'
+cell p79_safe_two_objects   compile "$P79"' u32 main(){ W79 a; W79 b; *W79 pa = &a; *W79 pb = &b; eat79(pa); eat79(pb); return 0; }'
+
+# SHAPE p80 (BUG-1640): a callee frees through a struct COPY / optional-struct
+# capture of a GLOBAL (the slot is read into a local aggregate, not a pointer).
+# BOUNDARY: a read-only copy; a free of the OTHER field; a pointer-leaf copy.
+echo "===== SHAPE p80 = free through a struct copy or capture of a global ====="
+P80='struct T80 { u32 v; }
+struct H80 { ?*T80 p; ?*T80 r; }
+struct N80 { *T80 p; }
+H80 gh80;
+?N80 gn80;
+'
+cell p80_copy_free         reject "$P80"' void drop() { H80 c = gh80; gh80.p = null; if (c.p) |q| { free(q); } } u32 main(){ *T80 a = alloc(T80) orelse return; gh80.p = a; drop(); return a.v; }'
+cell p80_copy_free_noreset reject "$P80"' void drop() { H80 c = gh80; if (c.p) |q| { free(q); } } u32 main(){ *T80 a = alloc(T80) orelse return; gh80.p = a; drop(); return a.v; }'
+cell p80_capture_free      reject "$P80"' void drop() { if (gn80) |c| { free(c.p); } gn80 = null; } u32 main(){ *T80 a = alloc(T80) orelse return; N80 n = { .p = a }; gn80 = n; drop(); return a.v; }'
+cell p80_ptr_copy_reset    reject "$P80"' void drop() { ?*T80 c = gh80.p; gh80.p = null; if (c) |q| { free(q); } } u32 main(){ *T80 a = alloc(T80) orelse return; gh80.p = a; drop(); return a.v; }'
+cell p80_safe_readonly     compile "$P80"' u32 look() { H80 c = gh80; if (c.p) |q| { return q.v; } return 0; } u32 main(){ *T80 a = alloc(T80) orelse return; a.v = 2; gh80.p = a; u32 r = look() + a.v; if (gh80.p) |q| { free(q); } gh80.p = null; return r - 4; }'
+cell p80_safe_other_field  compile "$P80"' void drop() { H80 c = gh80; if (c.r) |q| { free(q); } gh80.r = null; } u32 main(){ *T80 a = alloc(T80) orelse return; gh80.p = a; drop(); u32 r = a.v; if (gh80.p) |q| { free(q); } gh80.p = null; return r; }'
+
+# SHAPE p81 (BUG-1641): a getter returns a pointer FIELD read through a local VIEW of
+# its parameter, vs the direct spelling and a scalar read. BOUNDARY: the result used
+# while the owner is alive; a scalar read through the view.
+echo "===== SHAPE p81 = getter returning a field through a local view of its param ====="
+P81='struct T81 { u32 v; }
+struct H81 { *T81 p; u32 n; }
+struct C81 { H81 h; }
+*T81 get81v(*C81 c) { *H81 h = &c.h; return h.p; }
+*T81 get81d(*C81 c) { return c.h.p; }
+u32 num81(*C81 c) { *H81 h = &c.h; return h.n; }
+'
+cell p81_view_getter_free_use   reject "$P81"' u32 main(){ *T81 a = alloc(T81) orelse return; C81 w; w.h.p = a; *T81 q = get81v(&w); free(a); q.v = 1; return 0; }'
+cell p81_direct_getter_free_use reject "$P81"' u32 main(){ *T81 a = alloc(T81) orelse return; C81 w; w.h.p = a; *T81 q = get81d(&w); free(a); q.v = 1; return 0; }'
+cell p81_view_getter_double     reject "$P81"' u32 main(){ *T81 a = alloc(T81) orelse return; C81 w; w.h.p = a; *T81 q = get81v(&w); free(q); free(a); return 0; }'
+cell p81_safe_view_getter_use   compile "$P81"' u32 main(){ *T81 a = alloc(T81) orelse return; C81 w; w.h.p = a; *T81 q = get81v(&w); q.v = 3; u32 r = a.v; free(a); return r - 3; }'
+cell p81_safe_scalar_view       compile "$P81"' u32 main(){ *T81 a = alloc(T81) orelse return; C81 w; w.h.p = a; w.h.n = 4; u32 n = num81(&w); free(a); return n - 4; }'
+
+# SHAPE p82 (BUG-1642): a getter returning the ADDRESS of a global, used as a
+# projection base (`geth().p`), through a pointer local, and as a store target.
+# BOUNDARY: freeing through it with a reset; another global; a getter with two
+# different returns (not summarised); a scalar read.
+echo "===== SHAPE p82 = getter returning &global ====="
+P82='struct T82 { u32 v; }
+struct H82 { ?*T82 p; u32 n; }
+H82 gh82;
+H82 go82;
+*H82 geth82() { return &gh82; }
+*H82 pick82(u32 c) { if (c > 1) { return &gh82; } return &go82; }
+'
+cell p82_free_through_getter   reject "$P82"' u32 main(){ *T82 a = alloc(T82) orelse return; gh82.p = a; *T82 q = geth82().p orelse return; free(q); gh82.p = null; return a.v; }'
+cell p82_store_through_getter  reject "$P82"' u32 main(){ *T82 a = alloc(T82) orelse return; geth82().p = a; free(a); if (gh82.p) |z| { z.v = 1; } return 0; }'
+cell p82_store_through_local   reject "$P82"' u32 main(){ *T82 a = alloc(T82) orelse return; *H82 hp = geth82(); hp.p = a; free(a); if (gh82.p) |z| { z.v = 1; } return 0; }'
+cell p82_safe_reset            compile "$P82"' u32 main(){ *T82 a = alloc(T82) orelse return; gh82.p = a; *T82 q = geth82().p orelse return; free(q); gh82.p = null; return 0; }'
+cell p82_safe_other_global     compile "$P82"' u32 main(){ *T82 a = alloc(T82) orelse return; go82.p = a; *T82 b = alloc(T82) orelse return; gh82.p = b; *T82 q = geth82().p orelse return; free(q); gh82.p = null; u32 r = a.v; if (go82.p) |z| { free(z); } go82.p = null; return r; }'
+cell p82_safe_two_returns      compile "$P82"' u32 main(){ *T82 a = alloc(T82) orelse return; gh82.p = a; *T82 q = pick82(1).p orelse return; free(q); gh82.p = null; go82.p = null; return 0; }'
+cell p82_safe_scalar           compile "$P82"' u32 main(){ gh82.n = 3; u32 r = geth82().n; return r - 3; }'
+
+# SHAPE p83 (BUG-1643): an async task that holds a pointer the FUNCTION was given
+# (a parameter), and a GLOBAL task started in a helper. BOUNDARY: polled to
+# completion before the free; a value-only task; a value-only helper.
+echo "===== SHAPE p83 = async task holding a pointer parameter / started in a helper ====="
+P83='struct T83 { u32 v; }
+async void co83(*T83 p) { yield; p.v = 9; }
+async void cv83(u32 n) { yield; }
+_zer_async_co83 gt83;
+_zer_async_cv83 gv83;
+void start83(*T83 a) { _zer_async_co83_init(&gt83, a); _zer_async_co83_poll(&gt83); }
+void startv83(u32 n) { _zer_async_cv83_init(&gv83, n); }
+'
+cell p83_param_free_then_poll   reject "$P83"' u32 run(*T83 a) { _zer_async_co83 t; _zer_async_co83_init(&t, a); _zer_async_co83_poll(&t); free(a); _zer_async_co83_poll(&t); return 0; } u32 main(){ *T83 a = alloc(T83) orelse return; return run(a); }'
+cell p83_helper_global_free_poll reject "$P83"' u32 main(){ *T83 a = alloc(T83) orelse return; start83(a); free(a); _zer_async_co83_poll(&gt83); return 0; }'
+cell p83_safe_poll_then_free    compile "$P83"' u32 run(*T83 a) { _zer_async_co83 t; _zer_async_co83_init(&t, a); _zer_async_co83_poll(&t); _zer_async_co83_poll(&t); free(a); return 0; } u32 main(){ *T83 a = alloc(T83) orelse return; return run(a); }'
+cell p83_safe_value_task        compile "$P83"' u32 run(*T83 a) { _zer_async_cv83 t; _zer_async_cv83_init(&t, 3); _zer_async_cv83_poll(&t); free(a); _zer_async_cv83_poll(&t); return 0; } u32 main(){ *T83 a = alloc(T83) orelse return; return run(a); }'
+cell p83_safe_value_helper      compile "$P83"' u32 main(){ startv83(3); _zer_async_cv83_poll(&gv83); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

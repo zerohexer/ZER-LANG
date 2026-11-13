@@ -752,6 +752,8 @@ enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2,
        ANW_CAPTURE = 5 };
 typedef bool (*AstNameWriteFn)(Node *value, int kind, void *ud);
 bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud);
+bool ast_name_writes_parts(Node *n, const char *name, uint32_t len, AstNameWriteFn fn,
+                           void *ud, bool scalar);
 int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */
 /* BUG-1366: is this GLOBAL never assigned or address-taken anywhere in the
  * program (every registered body AND every global initializer)? The one query

@@ -1,4 +1,4 @@
-// GAP (2026-11-13 audit, docs/limitations.md): the parent's callee reaches a lent global through a pointer FIELD of a global struct (TSan)
+// expect-error: is lent to a scoped spawn
 struct H { ?*u32 p; }
 u32 g;
 H gh;

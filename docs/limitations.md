@@ -30,7 +30,7 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1638; measured, reproducers in `tests/zer_gaps/`)
+## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1643; measured, reproducers in `tests/zer_gaps/`)
 
 Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
 executed reproducer in `tests/zer_gaps/` (compile-clean = the gap still holds; the runner
@@ -57,28 +57,29 @@ each a missing SUMMARY fact, not a missing key:
      two. Refill every field, or reset them in the caller.
    The durable fix is a per-path list (`{param, path, must, reset}`, the shape `param_store`
    and `ret_field` already have) in place of the two bool arrays.
-3. **A getter of an ADDRESS** — `*H geth() { return &g_h; }`: `ret_global_key` (BUG-1311) is
-   for a getter returning the global's VALUE. `alloc_getter_returns_addr_of_global`,
-   `alloc_getter_through_local_view` (a getter reading a field through a local view is not a
-   view of its argument — the return-view summary reads the AST root, not the view place;
-   `ir_local_view_place` is the query to give it).
-4. **A global reached through a COPY or a capture** — `H c = g_h; g_h.p = null; free(c.p)`,
-   `if (g_opt) |c| { free(c.p); }`: nothing is minted for the global's slot at the copy, so
-   the state-based note (BUG-1623) has no entry to find.
-   `alloc_callee_frees_global_{struct_copy,optional_capture}`. (A slice VIEW of a global
-   array is CLOSED, BUG-1635.)
+3. ~~A getter of an ADDRESS~~ — CLOSED (BUG-1642: `return &g`; BUG-1641: a field read through
+   a local view of a pointer param). Residual: a getter returning `&g.sub` (a projection of a
+   global, not the bare global), a getter reading a field through a by-value COPY of the param's
+   struct (`H h = c.h; return h.p;` — no slot entry exists to match), and a getter with two
+   different `&G` returns (not summarised, so the result is an unrelated value).
+4. ~~A global reached through a COPY or a capture~~ — CLOSED (BUG-1640) for a struct copy and
+   an optional-struct capture. Residual: a copy of a global ARRAY of structs (the leaf path
+   contains a variable-index family `g[*].p`, deliberately not minted as one slot) and a copy
+   made through a pointer-to-global that is reassigned.
 5. ~~A carrier forwarded to a funcptr PARAMETER~~ — CLOSED (BUG-1638).
 6. ~~A `?*T` read out of a slice view of a local array~~ — CLOSED (BUG-1635).
    Residual precision (loud): a VARIABLE index through a view that does not start at 0
    (`[*]?*T u = arr[1..3]; for (i..) { free(u[i]); u[i] = null; }`) is "some element", so
    the reset reaches no specific slot and the loop is refused — the same answer as the
    direct `arr[i + 1]` spelling. Iterate the array, or a view starting at 0.
-7. **An async task holding a pointer the FUNCTION was given** — `_init(&task, a)` with `a` a
-   parameter (the same body with a local allocation is refused), and a global task started in
-   a helper. `alloc_async_task_holds_param_ptr`, `alloc_async_global_task_started_in_helper`.
-8. **`move struct` across a pointer / slice parameter** — `void eat(*W w) { consume(w.t); }`
-   called twice, through a pointer local, or on a slice element: no memory fault, the
-   use-after-move guarantee only. `move_{double_via_param_forward,via_ptr_local_then_use,from_slice_param}`.
+7. ~~An async task holding a pointer the FUNCTION was given~~ — CLOSED (BUG-1643, parameter and
+   global-task-in-helper).
+8. ~~`move struct` across a pointer / slice parameter~~ — CLOSED (BUG-1639). Residual
+   (over-rejection, loud, unchanged): the crude call-site rule still transfers a ROOT written
+   `&w` / `w` passed to ANY function — `peek(&w); peek(&w);` on a struct containing a move
+   field is "use after move" although `peek` only reads. The summary bit 32 now exists to
+   relax it; doing so is an accept-unsafe change (every way a callee can consume must be in
+   the bit) and needs its own audit.
 9. **Silent leaks** — ~~`use(alloc(T) orelse return)`~~ (CLOSED, BUG-1636/1637), a
    `goto` that jumps over a `defer free(a)`, and a GLOBAL slot overwritten with null
    (`g.p = alloc(T); g.p = null;` — global entries are escaped, so the overwrite query stays
@@ -104,15 +105,17 @@ each a missing SUMMARY fact, not a missing key:
    model to copy — but a flow-insensitive borrow also refuses the read AFTER the join, so it
    needs a per-label join of the borrow set, not a blanket latch. (The atomic-cell rule's
    `defer`-before-spawn form is CLOSED, BUG-1629.)
-4. **A helper lends its pointer param and touches the same global by NAME** — `void sp(*u32
-   p) { th = spawn w(p); g += 1; th.join(); } ... sp(&g);`. BUG-1303's pairs are
-   param-versus-param. `conc_helper_lends_param_touches_global`; and "same object" by name
-   misses a plain local alias (`sp(&t.x, &tp.x)`, `conc_alias_pair_local_alias`).
-5. **A lent global reached by the parent's callee through a pointer FIELD of a global
-   struct** (`gh.p = &g; spawn w(&g); poke();` with `poke` writing `*gh.p`).
-   `conc_lent_global_via_global_struct_ptr_field`.
-6. **The spin-lock recogniser accepts a loop that does not lock** — a `break` in the CAS spin
-   loop, or a wrong expected value. `conc_spinlock_with_break`.
+4. ~~A helper lends its pointer param and touches the same global by NAME~~ — CLOSED
+   (BUG-1645: per-parameter lent-global fact, call-site check), and ~~"same object" by name
+   misses a plain local alias~~ — CLOSED (BUG-1646: the pair root follows a pointer local's
+   borrow root through a projection). **Residual (precision, loud):** the pair is keyed on the
+   ROOT object, so two arguments naming DISJOINT fields of one struct (`sp(&t.x, &t.y)`) are
+   refused as "both reach 't'"; a field-path disjointness test would recover it.
+5. ~~A lent global reached by the parent's callee through a pointer FIELD of a global
+   struct~~ — CLOSED (BUG-1647: the write-target query walks PART-writes of an aggregate name
+   and follows the assigned `&g`).
+6. ~~The spin-lock recogniser accepts a loop that does not lock~~ — CLOSED (BUG-1644: a
+   `break`, a wrong expected value or a non-CAS condition is not a lock).
 7. **ISR split read-modify-write through MEMORY** (checker only; an `interrupt` block does not
    build hosted, so no gap file): `mem = g; g = mem + 1;` through a global, through two
    functions, through `*p`, and across a loop back edge (`g = x + 1; x = g;`). The local-copy

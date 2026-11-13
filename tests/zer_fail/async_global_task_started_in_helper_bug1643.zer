@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// expect-error: polling 'gtask', which still holds a freed pointer
+// BUG-1643: a GLOBAL task is started in a helper (`start(a)` = `_init(&gtask, a)`).
+// The store summary knew ordinary stores of a parameter and not `_init`, so the
+// caller's `free(a)` left the pointer held by `gtask` unflagged and the later poll
+// ran the task on a recycled slot.
+struct T { u32 v; }
+async void co(*T p) {
+    yield;
+    p.v = 99;
+}
+_zer_async_co gtask;
+void start(*T a) { _zer_async_co_init(&gtask, a); _zer_async_co_poll(&gtask); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    start(a);
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    _zer_async_co_poll(&gtask);
+    u32 r = b.v;
+    free(b);
+    return r;
+}

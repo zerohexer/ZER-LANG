@@ -162,7 +162,7 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
-## The 2026-11-13 audit (BUG-1609..1638) — what took a loop to find
+## The 2026-11-13 audit (BUG-1609..1643) — what took a loop to find
 
 Read with BUGS-FIXED.md "Session 2026-11-13". Only what is not obvious from the diff.
 
@@ -332,6 +332,55 @@ to mark `escaped`, ask whether the destination is this frame's own storage
 (`ir_key_path_in_frame`) — if so the slot keeps the duty. And a hand-off applier keyed on the
 BARE handle (`ir_find_handle(arg_local)`) does nothing for a by-value struct argument, whose
 allocations are compound entries `(local, ".f")`: descend explicitly.
+
+**11d. Where a summary bit lives: `transfers_param` is a FLAG BYTE (BUG-1639).** 1/2 spawn
+(some / every path), 4 hand-off to an unseen callee, 8/16 a FIELD handed to a thread, 32 moves
+out of the pointee. A new per-parameter fact that fits a bit goes there — the allocation,
+change-detection in the fixpoint and the free are already wired; a new array means four more
+sites. A fact about a POINTER that is not a handle STATE (it must not make ordinary reads of
+the pointer an error) is a flag on `IRHandleInfo` joined in `ir_merge_entry_flags`, never a new
+`IR_HS_*`: every state is consulted by ~40 use checks.
+
+**11e. A fact keyed on a slot's ENTRY dies when the slot is reset — record the identity
+separately (BUG-1640).** The freed-global note asks "which global entries hold this
+allocation?" at the free. A callee that copies a global and then resets it
+(`H c = g; g.p = null; free(c.p)`) has dropped the entry by the time it frees, so the state
+holds nothing to find. Anything a SUMMARY wants to say about "what the global held at entry"
+needs a flow-insensitive side table written at the READ (`cur_minted_global`), not a query of
+the state at the free. Mint per LEAF with its own id: one id for a whole struct makes a free of
+one field look like a free of all of them.
+
+**11f. A call at the BASE of a projection has three consumers, not one (BUG-1642).** `geth().p`
+reaches the allocation tracker as (a) the key query (`ir_rebase_slice_index` call arm — the
+read), (b) the stable-aim query (`ir_ptr_stable_aim` — a pointer LOCAL the call was copied
+into), and (c) the view binding of the call RESULT (`view_root_gkey`, set at the call). The
+store spelling is hoisted into a temp by the target-before-value rule (BUG-1618), so only (b)
+and (c) see it. Teaching one consumer a new getter fact and testing the read spelling proves
+nothing about the other two. Also: a debugging trap — `ir_slot_read` runs AFTER the alias arms
+of IR_FIELD_READ and re-binds the destination to the slot entry's id, so an alias set by an
+earlier arm of the same handler is silently undone; fix such a gap where the fact is
+CONSUMED (the summary builder), not by re-ordering the transfer.
+
+**11g. A generated call is a STORE the summaries must know about (BUG-1643).** The async
+`_zer_async_T_init(&task, args…)` is emitted by the checker, has no `FuncSummary`, and writes
+its arguments into the task value. Every analysis that asks "where did this argument go?" —
+the store summary (`ir_ps_scan`), the carried entries (`ir_async_task_call`) — has to name it
+explicitly; a generated function the summary tables do not list is a function that stores
+nothing, so a helper wrapping it looked like a read-only call. When a new builtin writes a
+caller-supplied value into a caller-supplied object, add it to `ir_ps_scan` in the same change.
+
+**11h. A write-target query must see PART-writes of an aggregate (BUG-1647) and a lent
+parameter is a fact on the FUNCTION (BUG-1645).** `write_targets_of_node` follows a pointer
+name through its initializer and every reassignment; for a name that holds a struct / union /
+array BY VALUE the pointer lives in a FIELD, written by `gh.p = &g` — a part-write that the
+whole-name walk (`ast_name_writes`) never reports. `ast_name_writes_parts` hands the visitor the
+assigned value of a plain part-assignment; use it whenever the name is an aggregate (a
+pointer / slice / Handle name keeps the plain walk — its projections write the POINTEE). For
+the spawn-window rules, "g is lent" is not only a local fact: a helper that lends its pointer
+PARAMETER and touches a global by name is recorded per parameter (`Symbol.lent_globals`,
+fixpoint through callees) and the caller's argument is checked at the call
+(`check_alias_spawn_calls`). The BUG-1303 pair root must be resolved through a pointer local's
+borrow root (`alias_arg_root`), or a plain alias of the same object is a stranger.
 
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key

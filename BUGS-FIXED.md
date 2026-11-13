@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-11-13 — BUG-1609..1638: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
+## Session 2026-11-13 — BUG-1609..1643: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
 
 **Branch.** The one branch ahead of main, `zerohexer-automated/serene-shannon-0xnbk1`
 (BUG-1566..1608, 3 commits), forked AT main's head, so it was a fast-forward; `make check`
@@ -236,6 +236,90 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   `(h, ".p")`) so nothing was touched and `a.v` after read freed memory (exit 99). Every
   allocation the struct carries now gets the same MAYBE_FREED + hand-off. Test:
   `funcptr_param_frees_carrier_field_bug1638`; sink-matrix SHAPE p78.
+
+- **BUG-1639 — a move out of what a pointer / slice points at was tracked only when the
+  argument named a root.** `*W p = &w; eat(p); consume(w.t);`, a pointer PARAM forwarded
+  twice (`eat(w); eat(w);`) and an array handed over as a slice (`eats(ts)` = `eats(ts[..])`)
+  all moved the same object twice with no diagnostic (use-after-move; no memory fault).
+  The call-site transfer is the crude "a root of move-containing type passed to anything
+  transfers" rule; it only sees `&w` / `w.t` / `w`. A callee now carries `transfers_param`
+  **bit 32** = "moves out of this parameter's pointee on some path" (a move struct passed on, a
+  field read into a new owner, or the bit of a callee it forwarded the pointer to), and a
+  pointer / slice argument naming such a parameter transfers its target — the aggregate via the
+  alias group, or `IRHandleInfo.moved_via_ptr` for a pointer param (a separate OR-merged fact,
+  NOT a handle state: every ordinary use of a TRANSFERRED pointer would be refused). Gated on
+  the summary so a read-only helper still takes a pointer any number of times. Tests:
+  `move_{twice_via_forwarded_ptr_param,via_ptr_local_then_use,from_slice_param}_bug1639`,
+  positive `move_readonly_ptr_calls_ok_bug1639`; sink-matrix SHAPE p79.
+
+- **BUG-1640 — a callee freeing through a struct COPY / optional-struct capture of a global
+  named no freed global.** `void drop() { H c = g_h; g_h.p = null; if (c.p) |q| { free(q); } }`
+  and `if (g_h) |c| { free(c.p); }`: the global read mint (BUG-1242) fired only for a pointer /
+  slice destination, so a struct local had no entry tied to the global's slot, the state-based
+  freed-global note (BUG-1623) found nothing, and the caller's alias of what the global held
+  stayed ALIVE (exit 99). `ir_mint_global_struct_read` mints the global's slot for every
+  pointer leaf of the struct and aliases it onto the destination's field; the (key, allocation
+  id) pair also goes into a per-function table the note consults, because the callee's own
+  `g_h.p = null;` drops the slot's entry before the free. Per-leaf ids, so a free of the OTHER
+  field stays clean. Tests: `callee_frees_global_through_{struct_copy,optional_capture}_bug1640`,
+  positive `global_struct_copy_readonly_ok_bug1640`; sink-matrix SHAPE p80.
+
+- **BUG-1641 — a getter reading a pointer field through a local VIEW of its parameter
+  summarised as "a view of nothing".** `*T get(*Ctx c) { *H h = &c.h; return h.p; }`: the
+  direct spelling `return c.h.p;` binds the result to the base param's identity (what
+  `returns_param_mask` matches); through a view the result was bound to the slot's own fresh
+  id, so the caller kept `q` across `free(a)` (exit 99). The return classification now also
+  matches a returned local that aliases a slot entry rooted at a POINTER param (a by-value
+  struct's field is a copy the caller still names). Tests:
+  `getter_returns_field_through_local_view_bug1641`, positive `getter_through_local_view_ok_bug1641`;
+  SHAPE p81.
+- **BUG-1642 — a getter returning the ADDRESS of a global was a stranger to the global.**
+  `*H geth() { return &g_h; }` then `geth().p`, `geth().p = a`, `*H hp = geth(); hp.p = a`:
+  a free / store through the result was not attributed to `g_h`'s slot. `FuncSummary.
+  ret_addr_global` (every live return is `&G` of ONE unshadowed global) feeds three consumers:
+  the call-at-projection-base rebase (`geth().p` -> `g_h.p`), the stable-aim query (a local
+  defined once by such a call aims at G), and a pure-view binding of the call result at the
+  call (`view_root_gkey`, owns nothing — what `%t = &G` gets). Tests:
+  `getter_returns_addr_of_global_free_bug1642`, `..._store_then_free_bug1642`, positive
+  `getter_addr_of_global_ok_bug1642`; SHAPE p82.
+
+- **BUG-1643 — an async task holding a pointer PARAMETER, and a global task started in a
+  helper.** `_init(&task, a)` with `a` a parameter carried nothing (a parameter has no entry
+  until its identity is minted — the local-allocation spelling was carried and refused), so
+  `free(a)` then `_poll(&task)` ran the task on a recycled slot (exit 99). And
+  `void start(*T a) { _init(&gtask, a); }` stored the caller's pointer into a GLOBAL through a
+  call the store summary did not know (`_init` has no `FuncSummary`), so the caller freed it
+  while `gtask` held it. `_init` now mints the parameter's identity, and the store-summary scan
+  treats `_zer_async_T_init(&task, args…)` as the stores `task.<param> = arg` (global, param or
+  local task). Tests: `async_task_holds_param_ptr_freed_bug1643`,
+  `async_global_task_started_in_helper_bug1643`, positive
+  `async_param_ptr_polled_before_free_ok_bug1643`; SHAPE p83.
+
+- **BUG-1644 — the CAS spin-lock recogniser accepted a loop that does not lock.**
+  `while (!@atomic_cas(&la, 0, 1)) { break; }` (and a wrong expected value) was taken as lock
+  acquisition by the atomic-downgrade check, so two threads incrementing one global "under"
+  it were accepted (TSan). The recogniser is rebuilt (`sync_stmt_acquires`,
+  `sync_spin_cond_lock`, `sync_spin_body_plain`): the loop condition must be a CAS / exchange
+  spin with the polarity and expected value that ACQUIRE, and the body must be plain
+  statements with no `break`. Tests: `spin_lock_with_break_not_a_lock_bug1644`, positive
+  `spin_lock_cas_ok_bug1644`; conc-matrix DO_XCHG / DO_BREAK / DO_POLARITY / DO_SAMEVAL /
+  DO_XCHG_EQ cells.
+- **BUG-1645 — a helper lends its pointer parameter to a scoped spawn and touches the global
+  the caller passed, by name.** `void sp(*u32 p) { th = spawn w(p); g += 1; th.join(); }`
+  with `sp(&g)`. `Symbol.lent_globals` records which globals a lent parameter's function
+  touches before the join (a fixpoint through callees); `check_alias_spawn_calls` refuses a
+  call that passes a global (or its address) for such a parameter. Tests:
+  `helper_lends_param_touches_global_bug1645`, positive `lent_param_global_after_join_ok_bug1645`.
+- **BUG-1646 — one object passed twice, once through a local pointer alias.**
+  `sp(&t.x, &tp.x)` with `*Two tp = &t`: the BUG-1303 pair root named `tp`, not `t`.
+  `alias_arg_root` now resolves a pointer local's borrow root through a projection. Test:
+  `alias_pair_through_local_pointer_bug1646`.
+- **BUG-1647 — the parent's callee reaches a lent global through a pointer FIELD of a global
+  struct.** `gh.p = &g; spawn w(&g); poke();` with `poke` writing `*gh.p`. The write-target
+  query (`write_targets_of_node`) walked whole-name writes only, so a PART-write `gh.p = &g`
+  aimed nothing. `ast_name_writes_parts` hands the visitor the assigned value of a plain part
+  assignment, and an aggregate name (struct / union / array) is walked with it. Test:
+  `lent_global_via_global_struct_ptr_field_bug1647`.
 
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**

@@ -1,0 +1,22 @@
+// The helper lends its param to a scoped spawn but touches the global only
+// AFTER the join; a global struct's pointer field read after the join is
+// accepted too.
+u32 g;
+struct H { ?*u32 p; }
+H gh;
+void w(*u32 p) { for (u32 i = 0; i < 1000; i += 1) { *p += 1; } }
+void sp(*u32 p) {
+    ThreadHandle th = spawn w(p);
+    th.join();
+    g += 1;
+}
+void poke() { if (gh.p) |q| { *q += 1; } }
+u32 main() {
+    sp(&g);
+    gh.p = &g;
+    ThreadHandle th = spawn w(&g);
+    th.join();
+    poke();
+    if (g != 2002) { return 1; }
+    return 0;
+}

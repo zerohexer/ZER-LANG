@@ -1812,6 +1812,8 @@ static int atomic_param_of(Checker *c, Node *e);                /* BUG-1284 */
 static int param_pos_named(Checker *c, const char *n, uint32_t l);   /* BUG-1303 */
 static void alias_call_record(Checker *c, Node *call);              /* BUG-1303 */
 static bool alias_pair_add(Checker *c, Symbol *f, int i, int j);    /* BUG-1303 */
+static bool spawn_global_needs_sync(Checker *c, Symbol *sym);       /* BUG-1645 */
+static bool lent_global_add(Checker *c, Symbol *f, int i, Symbol *g);   /* BUG-1645 */
 static int param_alias_of_value(Checker *c, Node *e);               /* BUG-1303 */
 static Symbol *current_func_symbol(Checker *c);                 /* BUG-1284 */
 static void atomic_cell_mark_visit(Checker *c, Symbol *g, void *ud);
@@ -8379,6 +8381,21 @@ static void for_each_value_pointee(Checker *c, Node *value, WriteTargetFn fn, vo
     write_target_reassign_visit(value, ANW_ASSIGN, &u);
 }
 
+/* BUG-1647: every write of the GLOBAL `s` in `body`, fed to the reassign visitor. A name
+ * that holds an AGGREGATE by value (struct / union / array) is also written by
+ * `s.p = &g` / `s[i] = &g` — a write of a pointer FIELD, whose VALUE aims that
+ * field. Walking only the whole-name writes left `gh.p = &g; ... *gh.p` with no
+ * aim at all (a callee racing a lent global through a global struct's pointer
+ * field, accepted). A pointer / slice / Handle name keeps the plain walk: a
+ * projection through it writes the pointee, not the name. */
+static void write_targets_name_writes(Node *body, Symbol *s, void *u) {
+    TypeKind k = type_dispatch_kind(s->type);
+    if (k == TYPE_STRUCT || k == TYPE_UNION || k == TYPE_ARRAY)
+        ast_name_writes_parts(body, s->name, s->name_len, write_target_reassign_visit, u, false);
+    else
+        ast_name_writes(body, s->name, s->name_len, write_target_reassign_visit, u);
+}
+
 /* `names_pointee`: the node stands for what the pointer POINTS AT even when it is
  * a bare pointer name (a pointer VALUE being followed, or the ISR tracker's
  * "naming the pointer reaches it"). Otherwise a bare pointer name as a WRITE
@@ -8434,11 +8451,13 @@ static void write_targets_of_node(WriteTargetWalk *w, Node *target, int depth,
                 Node *body = NULL;
                 if (d->kind == NODE_FUNC_DECL) body = d->func_decl.body;
                 else if (d->kind == NODE_INTERRUPT) body = d->interrupt.body;
-                if (body) ast_name_writes(body, s->name, s->name_len,
-                                          write_target_reassign_visit, &u);
+                if (body) write_targets_name_writes(body, s, &u);
             }
         }
     } else if (c->current_body) {
+        /* A LOCAL aggregate keeps the whole-name walk: its carrier flow is the
+         * precise `carrier_value_global` table (BUG-1046), and following `h.p = &g`
+         * here made a read-only carrier (`rd(h)`) look like an RMW source of g. */
         ast_name_writes(c->current_body, s->name, s->name_len,
                         write_target_reassign_visit, &u);
     }
@@ -14370,6 +14389,18 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                 track_isr_global(c, node->ident.name,
                                  (uint32_t)node->ident.name_len, false);
                 track_isr_pointee_of(c, node);   /* BUG-1059 */
+                /* BUG-1645: this global is touched BY NAME while a pointer param is
+                 * lent to a live scoped thread — remember (param, global) so a caller
+                 * passing `&g` for that param is refused. A plain access only:
+                 * @atomic_* targets, shared structs, threadlocals and the volatile
+                 * single-word flag keep their own rules (spawn_global_needs_sync). */
+                if (c->lent_param_live_mask && !c->in_atomic_intrinsic_arg &&
+                    spawn_global_needs_sync(c, gs)) {
+                    Symbol *lfs = current_func_symbol(c);
+                    for (int li = 0; lfs && li < 64; li++)
+                        if (c->lent_param_live_mask & (1ULL << li))
+                            lent_global_add(c, lfs, li, gs);
+                }
                 /* A6-full slice 2: record a plain VALUE read of a scalar global
                  * after a spawn (concurrent context). Post-check flags it if the
                  * global is an atomic cell. Skip `&g` (in_amp — address-take, not
@@ -25220,23 +25251,59 @@ static Symbol *sync_intrinsic_lock(Checker *c, Node *e, const char *const *names
     if (!a || a->kind != NODE_UNARY || a->unary.op != TOK_AMP) return NULL;
     return resolve_write_target_global(c, a->unary.operand, 0);
 }
-/* A CAS / exchange somewhere in a spin condition (through `!`, comparisons). */
-static Symbol *sync_cond_cas_lock(Checker *c, Node *e, int depth) {
-    static const char *const acq[] = { "atomic_cas", "atomic_xchg", NULL };
-    if (!e || depth > 16) return NULL;
-    Symbol *l = sync_intrinsic_lock(c, e, acq);
-    if (l) return l;
-    if (e->kind == NODE_UNARY) return sync_cond_cas_lock(c, e->unary.operand, depth + 1);
-    if (e->kind == NODE_BINARY) {
-        l = sync_cond_cas_lock(c, e->binary.left, depth + 1);
-        return l ? l : sync_cond_cas_lock(c, e->binary.right, depth + 1);
+static bool contains_break(Node *node);   /* BUG-1644: defined with the function-body pass */
+/* BUG-1644: is this loop REALLY a spin ACQUIRE — i.e. does it exit only when the
+ * lock word was won? The recogniser used to accept any `while` with an atomic
+ * CAS / exchange anywhere in its condition, so `while (!@atomic_cas(&L, 0, 1))
+ * { break; }` (leaves without the lock), `while (@atomic_cas(&L, 0, 1)) {}` (loops
+ * WHILE it is won) and `@atomic_cas(&L, 1, 1)` (never changes the word) all
+ * counted as a lock and downgraded the race to a warning. Accepted shapes only:
+ *   `!@atomic_cas(&L, E, D)`        E, D integer literals, E != D;
+ *   `@atomic_xchg(&L, V) != 0`      V a nonzero integer literal (either operand order);
+ * and a body of plain statements with no `break` (no goto, no nested control flow). */
+static bool sync_lit_value(Node *n, uint64_t *out) {
+    if (!n || n->kind != NODE_INT_LIT) return false;
+    *out = n->int_lit.value;
+    return true;
+}
+static Symbol *sync_spin_cond_lock(Checker *c, Node *cond) {
+    static const char *const cas_n[] = { "atomic_cas", NULL };
+    static const char *const xch_n[] = { "atomic_xchg", NULL };
+    if (!cond) return NULL;
+    if (cond->kind == NODE_UNARY && cond->unary.op == TOK_BANG && cond->unary.operand) {
+        Node *i = cond->unary.operand;
+        Symbol *l = sync_intrinsic_lock(c, i, cas_n);
+        uint64_t e, d;
+        if (l && i->intrinsic.arg_count >= 3 && sync_lit_value(i->intrinsic.args[1], &e) &&
+            sync_lit_value(i->intrinsic.args[2], &d) && e != d) return l;
+        return NULL;
+    }
+    if (cond->kind == NODE_BINARY && cond->binary.op == TOK_BANGEQ) {
+        Node *i = cond->binary.left, *z = cond->binary.right;
+        uint64_t zv, v;
+        if (i && i->kind == NODE_INT_LIT) { Node *t = i; i = z; z = t; }
+        Symbol *l = sync_intrinsic_lock(c, i, xch_n);
+        if (l && i->intrinsic.arg_count >= 2 && sync_lit_value(z, &zv) && zv == 0 &&
+            sync_lit_value(i->intrinsic.args[1], &v) && v != 0) return l;
     }
     return NULL;
 }
+static bool sync_spin_body_plain(Node *b) {
+    if (!b) return true;
+    if (b->kind != NODE_BLOCK) return false;
+    for (int i = 0; i < b->block.stmt_count; i++) {
+        Node *st = b->block.stmts[i];
+        if (!st || (st->kind != NODE_EXPR_STMT && st->kind != NODE_VAR_DECL)) return false;
+        if (contains_break(st)) return false;
+    }
+    return true;
+}
 static Symbol *sync_stmt_acquires(Checker *c, Node *s) {
     if (!s) return NULL;
-    if (s->kind == NODE_WHILE || s->kind == NODE_DO_WHILE)
-        return sync_cond_cas_lock(c, s->while_stmt.cond, 0);
+    if (s->kind == NODE_WHILE || s->kind == NODE_DO_WHILE) {
+        if (!sync_spin_body_plain(s->while_stmt.body)) return NULL;
+        return sync_spin_cond_lock(c, s->while_stmt.cond);
+    }
     return NULL;
 }
 static Symbol *sync_stmt_releases(Checker *c, Node *s) {
@@ -37920,6 +37987,18 @@ static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
         else break;
     }
     if (!a || a->kind != NODE_IDENT) return NULL;
+    /* BUG-1646: `&tp.x` where `tp` is a pointer LOCAL bound to `&t` projects through
+     * the pointer into t — the object is t, exactly as the bare `tp` already names it
+     * above. Only the bare spelling used the pointer's borrow root, so `sp(&t.x,
+     * &tp.x)` passed one object twice under two names. */
+    {
+        Symbol *s = scope_lookup(c->current_scope, a->ident.name, (uint32_t)a->ident.name_len);
+        if (s && s->borrow_root_name && s->type &&
+            type_dispatch_kind(s->type) == TYPE_POINTER) {
+            *len = s->borrow_root_len;
+            return s->borrow_root_name;
+        }
+    }
     *len = (uint32_t)a->ident.name_len;
     return a->ident.name;
 }
@@ -37929,7 +38008,7 @@ static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
 static void alias_call_record(Checker *c, Node *call) {
     if (!call || !call->call.callee || call->call.callee->kind != NODE_IDENT) return;
     int n = call->call.arg_count;
-    if (n < 2) return;
+    if (n < 1) return;      /* BUG-1645: a single pointer argument can name a global too */
     Symbol *rc = global_decl_lookup(c, call->call.callee->ident.name,
                                     (uint32_t)call->call.callee->ident.name_len);
     if (!rc || !rc->is_function || !rc->func_node) return;
@@ -37948,6 +38027,13 @@ static void alias_call_record(Checker *c, Node *call) {
         for (int j = 0; roots[i] && j < i; j++)
             if (roots[j] && lens[j] == lens[i] && memcmp(roots[j], roots[i], lens[i]) == 0)
                 dup = true;
+        /* BUG-1645: an argument rooted at a GLOBAL is recorded too (the lend-vs-global
+         * check compares its root with the callee's lent_globals once bodies are known) */
+        if (roots[i]) {
+            Symbol *rs = scope_lookup(c->current_scope, roots[i], lens[i]);
+            Symbol *rg = global_decl_lookup(c, roots[i], lens[i]);
+            if (rg && rs == rg && !rg->is_function) dup = true;
+        }
         /* which of THIS function's params the argument hands on */
         Node *pa = unwrap_ptr_launder(call->call.args[i]);
         int pp = pa ? atomic_param_of(c, pa) : -1;
@@ -37959,7 +38045,7 @@ static void alias_call_record(Checker *c, Node *call) {
         if (pp >= 0 && pp < 64) { pparam[i] = (signed char)pp; nparam++; }
     }
     Symbol *caller = current_func_symbol(c);
-    if (nparam >= 2 && caller) {
+    if (nparam >= 1 && caller) {   /* BUG-1645: one forwarded param carries a (param, global) pair too */
         if (c->param_fwd_n >= c->param_fwd_cap) {
             int nc = c->param_fwd_cap ? c->param_fwd_cap * 2 : 8;
             struct ParamFwdRec *nb = (struct ParamFwdRec *)arena_alloc(c->arena,
@@ -38011,6 +38097,26 @@ static bool alias_pair_add(Checker *c, Symbol *f, int i, int j) {
     return true;
 }
 
+static bool lent_global_has(Symbol *f, int i, Symbol *g) {
+    for (int k = 0; k < f->lent_glob_n; k++)
+        if (f->lent_globals[k].param == i && f->lent_globals[k].g == g) return true;
+    return false;
+}
+static bool lent_global_add(Checker *c, Symbol *f, int i, Symbol *g) {
+    if (!f || !g || i < 0 || i >= 64 || lent_global_has(f, i, g)) return false;
+    if (f->lent_glob_n >= f->lent_glob_cap) {
+        int nc = f->lent_glob_cap ? f->lent_glob_cap * 2 : 4;
+        struct LentGlobal *nb = (struct LentGlobal *)arena_alloc(c->arena, (size_t)nc * sizeof(*nb));
+        if (!nb) return false;
+        if (f->lent_glob_n) memcpy(nb, f->lent_globals, (size_t)f->lent_glob_n * sizeof(*nb));
+        f->lent_globals = nb;
+        f->lent_glob_cap = nc;
+    }
+    f->lent_globals[f->lent_glob_n].param = (unsigned char)i;
+    f->lent_globals[f->lent_glob_n].g = g;
+    f->lent_glob_n++;
+    return true;
+}
 /* BUG-1303: the callee lends param i to a scoped spawn and uses param j before
  * the join; a call that passes one object as both is a data race. First the
  * pairs are carried through callees that FORWARD their params (a fixpoint). */
@@ -38029,8 +38135,38 @@ static void check_alias_spawn_calls(Checker *c) {
             }
         }
     }
+    /* BUG-1645: (param, global) pairs travel up through callees that FORWARD a param. */
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (int k = 0; k < c->param_fwd_n; k++) {
+            struct ParamFwdRec *r = &c->param_fwds[k];
+            Symbol *g = r->callee;
+            for (int q = 0; q < g->lent_glob_n; q++) {
+                int i = g->lent_globals[q].param;
+                if (i >= r->argc) continue;
+                int pi = r->pparam[i];
+                if (pi >= 0 && lent_global_add(c, r->caller, pi, g->lent_globals[q].g)) changed = true;
+            }
+        }
+    }
     for (int k = 0; k < c->alias_call_n; k++) {
         struct AliasCallRec *r = &c->alias_calls[k];
+        for (int q = 0; q < r->callee->lent_glob_n; q++) {
+            int i = r->callee->lent_globals[q].param;
+            Symbol *lg = r->callee->lent_globals[q].g;
+            if (i >= r->argc || !r->roots[i]) continue;
+            if (r->root_lens[i] != lg->name_len ||
+                memcmp(r->roots[i], lg->name, lg->name_len) != 0) continue;
+            /* the argument's root names the GLOBAL itself, not a local shadowing it */
+            checker_error(c, r->line,
+                "argument %d is '%.*s', and '%.*s' lends that parameter to a scoped "
+                "spawn while it touches '%.*s' by name before the join — the thread "
+                "and the function both access one object (data race). Pass a copy, "
+                "or access it only after the join",
+                i + 1, (int)lg->name_len, lg->name, (int)r->callee->name_len,
+                r->callee->name, (int)lg->name_len, lg->name);
+            break;
+        }
         if (!r->callee->alias_pair_n) continue;
         bool done = false;
         for (int i = 0; i < r->argc && i < 64 && !done; i++) {

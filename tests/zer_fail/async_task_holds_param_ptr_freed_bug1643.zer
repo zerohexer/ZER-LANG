@@ -1,0 +1,28 @@
+// EXPECTED: compile error
+// expect-error: polling 'task', which still holds a freed pointer
+// BUG-1643: an async task is handed a pointer PARAMETER of the running function; the
+// function frees it and polls the task again. A local allocation handed to the task
+// was carried (and its free refused); a parameter has no entry until its identity is
+// minted, so the task carried nothing and the second poll ran on a recycled slot
+// (the program returned 99).
+struct T { u32 v; }
+async void co(*T p) {
+    yield;
+    p.v = 99;
+}
+u32 run(*T a) {
+    _zer_async_co task;
+    _zer_async_co_init(&task, a);
+    _zer_async_co_poll(&task);
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    _zer_async_co_poll(&task);
+    u32 r = b.v;
+    free(b);
+    return r;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    return run(a);
+}

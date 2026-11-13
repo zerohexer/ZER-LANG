@@ -182,6 +182,7 @@ static int run_pos(const char *name, const char *code) {
 typedef enum { DP_TWO, DP_LOOP, DP_HELPER, DP_PARENT, DP_CALLER, DP_UNCALLED, DP_POINTER,
                DP_COUNT } DgPair;
 typedef enum { DO_NONE, DO_LOCK, DO_TWO_LOCKS, DO_HANDOFF, DO_FORGED, DO_RESET,
+               DO_XCHG, DO_BREAK, DO_POLARITY, DO_SAMEVAL, DO_XCHG_EQ,
                DO_COUNT } DgOrder;
 typedef enum { DA_WW, DA_WR, DA_COUNT } DgAccess;
 static const char *dp_name(DgPair p) {
@@ -199,12 +200,18 @@ static const char *do_name(DgOrder o) {
     case DO_NONE: return "none"; case DO_LOCK: return "one-lock";
     case DO_TWO_LOCKS: return "two-locks"; case DO_HANDOFF: return "handoff";
     case DO_FORGED: return "forged"; case DO_RESET: return "reset";
+    case DO_XCHG: return "xchg-lock"; case DO_BREAK: return "lock-with-break";
+    case DO_POLARITY: return "lock-wrong-polarity"; case DO_SAMEVAL: return "lock-cas-same-value";
+    case DO_XCHG_EQ: return "lock-xchg-wrong-sense";
     case DO_COUNT: break;
     }
     return "?";
 }
 static int dg_cell_exists(DgPair p, DgOrder o, DgAccess a) {
     if ((o == DO_FORGED || o == DO_RESET) && p != DP_TWO) return 0;
+    /* BUG-1644: the acquire-shape orders are crossed with the two pairs where the
+     * holder and the broken acquirer meet in one program. */
+    if (o >= DO_XCHG && p != DP_TWO && p != DP_PARENT) return 0;
     switch (p) {
     case DP_LOOP: case DP_HELPER: case DP_UNCALLED:   /* one body against itself */
         return a == DA_WW && (o == DO_NONE || o == DO_LOCK);
@@ -217,7 +224,8 @@ static int dg_cell_exists(DgPair p, DgOrder o, DgAccess a) {
 static int dg_negative(DgOrder o) {
     switch (o) {
     case DO_NONE: case DO_TWO_LOCKS: case DO_FORGED: return 1;
-    case DO_LOCK: case DO_HANDOFF: case DO_RESET: return 0;
+    case DO_BREAK: case DO_POLARITY: case DO_SAMEVAL: case DO_XCHG_EQ: return 1;
+    case DO_LOCK: case DO_HANDOFF: case DO_RESET: case DO_XCHG: return 0;
     case DO_COUNT: break;
     }
     return 1;
@@ -235,6 +243,25 @@ static const char *dg_body(DgOrder o, DgAccess a, int which) {
         if (which == 0) return "while (!@atomic_cas(&la, 0, 1)) { } g += 1; @atomic_store(&la, 0);";
         return wr ? "while (!@atomic_cas(&lb, 0, 1)) { } g += 1; @atomic_store(&lb, 0);"
                   : "while (!@atomic_cas(&lb, 0, 1)) { } u32 x = g; @atomic_store(&lb, 0);";
+    case DO_XCHG:
+        return wr ? "while (@atomic_xchg(&la, 1) != 0) { } g += 1; @atomic_store(&la, 0);"
+                  : "while (@atomic_xchg(&la, 1) != 0) { } u32 x = g; @atomic_store(&la, 0);";
+    /* BUG-1644: instance 0 holds a REAL lock; instance 1's acquire is broken in one way. */
+    case DO_BREAK: case DO_POLARITY: case DO_SAMEVAL: case DO_XCHG_EQ: {
+        if (which == 0)
+            return o == DO_XCHG_EQ
+                ? "while (@atomic_xchg(&la, 1) != 0) { } g += 1; @atomic_store(&la, 0);"
+                : "while (!@atomic_cas(&la, 0, 1)) { } g += 1; @atomic_store(&la, 0);";
+        const char *acq = o == DO_BREAK    ? "while (!@atomic_cas(&la, 0, 1)) { break; }" :
+                          o == DO_POLARITY ? "while (@atomic_cas(&la, 0, 1)) { }" :
+                          o == DO_SAMEVAL  ? "while (!@atomic_cas(&la, 1, 1)) { }" :
+                                             "while (@atomic_xchg(&la, 1) == 0) { }";
+        static char buf[4][160];
+        int slot = (int)(o - DO_BREAK);
+        snprintf(buf[slot], sizeof(buf[slot]), wr ? "%s g += 1; @atomic_store(&la, 0);"
+                                                  : "%s u32 x = g; @atomic_store(&la, 0);", acq);
+        return buf[slot];
+    }
     case DO_HANDOFF: case DO_FORGED:
         if (which == 0) return "g = 1; @atomic_store(&fl, 1);";
         return wr ? "while (@atomic_load(&fl) == 0) { } g = 2;"

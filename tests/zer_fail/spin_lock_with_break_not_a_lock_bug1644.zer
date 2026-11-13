@@ -1,4 +1,4 @@
-// GAP (2026-11-13 audit, docs/limitations.md): a CAS spin loop with a break is accepted as a lock by the downgrade check (TSan)
+// expect-error: no common lock
 u32 g;
 u32 la;
 void w() {

@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is freed
+// BUG-1635: a VARIABLE index through the view (`s[k]` is `arr[k]` when the
+// view starts at element 0). The free reached no slot of `arr`, so `a` stayed
+// ALIVE and the read below was accepted.
+struct T { u32 v; }
+u32 pick(u32 k) {
+    *T a = alloc(T) orelse return;
+    ?*T[2] arr;
+    arr[k % 2] = a;
+    [*]?*T s = arr[0..];
+    if (s[k % 2]) |q| { free(q); }
+    return a.v;
+}
+u32 main() { return pick(1); }

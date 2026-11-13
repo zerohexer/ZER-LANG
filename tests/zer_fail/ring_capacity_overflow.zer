@@ -1,0 +1,5 @@
+// expect-error: larger than a Ring can hold
+// BUG-1590: builtin capacities past u32 were truncated mod 2^32.
+struct S { u32 v; }
+Ring(S, 4294967297) r;
+u32 main() { return 0; }

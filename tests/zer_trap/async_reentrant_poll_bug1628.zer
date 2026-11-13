@@ -1,0 +1,24 @@
+// expect-trap
+// expect-trap-at: 11
+// expect-trap-msg: polled while it is already running
+// BUG-1628: a call in an async body that reaches a poll of the SAME task re-ran
+// the current segment on the same frame (the state advances only at the next
+// yield) — here a double free. The poll traps on re-entry instead.
+async void t();
+_zer_async_t ga;
+u32 depth;
+void again() { depth += 1; if (depth == 1) { _zer_async_t_poll(&ga); } }
+async void t() {
+    ?[*]u32 m = alloc(u32, 4);
+    [*]u32 s = m orelse return;
+    yield;
+    free(s);
+    again();
+    yield;
+}
+u32 main() {
+    _zer_async_t_init(&ga);
+    _zer_async_t_poll(&ga);
+    _zer_async_t_poll(&ga);
+    return 0;
+}

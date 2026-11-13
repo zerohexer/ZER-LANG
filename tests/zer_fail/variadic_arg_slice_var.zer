@@ -1,0 +1,9 @@
+// expect-error: has no C scalar representation
+// BUG-1600: a slice VARIABLE in a variadic tail is a {ptr,len} struct to C; it is
+// not known to be NUL-terminated, so it is refused rather than silently passed.
+i32 printf(const *u8 fmt, ...);
+u32 main() {
+    const [*]u8 s = "hi";
+    printf("%s %d\n", s, 5);
+    return 0;
+}

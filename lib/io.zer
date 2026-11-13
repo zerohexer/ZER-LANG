@@ -13,24 +13,31 @@ i32 fclose(*opaque stream);
 usize fread(*opaque buf, usize size, usize count, *opaque stream);
 usize fwrite(const *opaque buf, usize size, usize count, *opaque stream);
 i32 fseek(*opaque stream, i64 offset, i32 whence);
+i32 fputc(i32 c, *opaque stream);
 
 // ================================================================
 // File open / close
 // ================================================================
 
-?*opaque io_open(const []u8 path, const []u8 mode) {
-    u8[512] path_buf;
-    u8[8] mode_buf;
-    if (path.len >= 511) { return null; }
-    if (mode.len >= 7) { return null; }
-    for (usize i = 0; i < path.len; i += 1) {
+// The NUL-terminated copies live in STATIC buffers, not on the stack: fopen is a C
+// function, and the checker cannot know it does not return a pointer into its
+// argument, so a stack buffer would make the returned FILE* frame-bound. (fopen copies
+// the path; the buffers are only read during the call.) Not reentrant across threads.
+?*opaque io_open(const [*]u8 path, const [*]u8 mode) {
+    static u8[512] path_buf;
+    static u8[8] mode_buf;
+    usize pn = path.len;
+    usize mn = mode.len;
+    if (pn >= 511) { return null; }
+    if (mn >= 7) { return null; }
+    for (usize i = 0; i < pn; i += 1) {
         path_buf[i] = path[i];
     }
-    path_buf[path.len] = 0;
-    for (usize i = 0; i < mode.len; i += 1) {
+    path_buf[pn] = 0;
+    for (usize i = 0; i < mn; i += 1) {
         mode_buf[i] = mode[i];
     }
-    mode_buf[mode.len] = 0;
+    mode_buf[mn] = 0;
     *opaque fp = fopen(&path_buf[0], &mode_buf[0]);
     return fp;
 }
@@ -43,15 +50,15 @@ void io_close(*opaque f) {
 // Read / Write
 // ================================================================
 
-usize io_read(*opaque f, []u8 buf) {
+usize io_read(*opaque f, [*]u8 buf) {
     return fread(@ptrcast(*opaque, buf.ptr), 1, buf.len, f);
 }
 
-usize io_write(*opaque f, const []u8 data) {
+usize io_write(*opaque f, const [*]u8 data) {
     return fwrite(@ptrcast(const *opaque, data.ptr), 1, data.len, f);
 }
 
-usize io_writeln(*opaque f, const []u8 data) {
+usize io_writeln(*opaque f, const [*]u8 data) {
     usize n = io_write(f, data);
     fputc(10, f);
     return n + 1;
@@ -63,7 +70,7 @@ usize io_writeln(*opaque f, const []u8 data) {
 
 // Read entire file into a caller-provided buffer.
 // Returns slice of bytes read, or null on failure.
-?[]u8 io_read_file_buf(const []u8 path, []u8 buf) {
+?[*]u8 io_read_file_buf(const [*]u8 path, [*]u8 buf) {
     ?*opaque mf = io_open(path, "rb");
     *opaque f = mf orelse return;
     usize total = 0;
@@ -81,7 +88,7 @@ usize io_writeln(*opaque f, const []u8 data) {
 // Write entire buffer to file
 // ================================================================
 
-bool io_write_file(const []u8 path, const []u8 data) {
+bool io_write_file(const [*]u8 path, const [*]u8 data) {
     ?*opaque mf = io_open(path, "wb");
     *opaque f = mf orelse return;
     usize written = io_write(f, data);

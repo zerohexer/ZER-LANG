@@ -1,0 +1,7 @@
+// expect-error: would keep pointing at 'wp' after 'wp' dies
+// BUG-1570: a field read through a pointer with two recorded roots
+struct W { *u32 p; }
+u32 main() { u32 g = 1; *u32 q = &g;
+  { u32 x = 7; W w = { .p = &x }; *W wp = &w; q = wp.p; }
+  { u32 x = 100; x += 1; }
+  return *q; }

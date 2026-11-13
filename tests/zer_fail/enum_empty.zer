@@ -1,0 +1,6 @@
+// expect-error: has no variants
+// BUG-1585: an empty enum bypassed the zero-variant rule.
+enum E { }
+struct S { E e; }
+S s;
+u32 main() { u32 v = (u32)s.e; return v + 3; }

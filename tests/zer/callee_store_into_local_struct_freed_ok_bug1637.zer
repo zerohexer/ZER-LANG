@@ -1,0 +1,27 @@
+// BUG-1637 boundary: the caller frees the slot the callee filled (a local struct
+// field, and a struct behind a pointer field reaching a global), and a store into
+// a GLOBAL slot is correctly escaped (the global owns it).
+struct T { u32 v; }
+struct H { ?*T p; }
+struct W { *H hp; }
+H gh;
+?*T ga;
+void put_h(*H h, *T p) { h.p = p; }
+void put_w(*W w, *T p) { w.hp.p = p; }
+void put_g(*T p) { ga = p; }
+u32 main() {
+    H h;
+    put_h(&h, alloc(T) orelse return);
+    if (h.p) |q| { free(q); }
+    h.p = null;
+
+    W w = { .hp = &gh };
+    put_w(&w, alloc(T) orelse return);
+    if (gh.p) |q| { free(q); }
+    gh.p = null;
+
+    put_g(alloc(T) orelse return);
+    if (ga) |q| { free(q); }
+    ga = null;
+    return 0;
+}

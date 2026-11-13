@@ -1,0 +1,11 @@
+// expect-error: non-atomic read-modify-write of volatile global 'vg' while a spawned
+// BUG-1604: the thread's store is reached through a callee and a function pointer; the
+// store record moved to the sync walk, which must still see both.
+volatile u32 vg;
+void set1() { vg = 1; } void worker() { *() f = set1; f(); }
+u32 main() {
+    ThreadHandle th = spawn worker();
+    vg |= 2;
+    th.join();
+    return 0;
+}

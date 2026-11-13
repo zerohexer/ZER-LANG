@@ -1,0 +1,26 @@
+// BUG-1575 boundary: globals receiving call results, reset before the frees.
+struct T { u32 v; }
+struct H { *T p; *T q; }
+?*T g;
+struct GS { ?*T p; }
+GS gs;
+*T pick(*T x, *T y, bool c) { if (c) { return x; } return y; }
+*T getq(H h) { return h.q; }
+*T id(*T x) { return x; }
+u32 rd() { if (g) |q| { return q.v; } return 0; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T b = alloc(T) orelse { free(a); return 1; };
+    a.v = 3; b.v = 4;
+    g = pick(a, b, true);
+    u32 r = rd();
+    H h = { .p = a, .q = b };
+    g = getq(h);
+    r += rd();
+    gs = { .p = id(a) };
+    g = null;
+    gs.p = null;
+    free(a);
+    free(b);
+    return r - 7;
+}

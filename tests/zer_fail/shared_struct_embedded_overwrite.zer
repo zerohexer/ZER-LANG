@@ -1,0 +1,18 @@
+// expect-error: CONTAINS a shared struct
+// BUG-1587: overwriting a struct EMBEDDING a shared struct zeroed a held mutex.
+shared struct C { u32 v; }
+struct O { C c; u32 z; }
+O go;
+shared struct Done { u32 n; }
+Done done;
+void worker(*C c) {
+    for (u32 i = 0; i < 200000; i += 1) { c.v += 1; }
+    done.n = 1;
+}
+u32 main() {
+    spawn worker(&go.c);
+    for (u32 i = 0; i < 200000; i += 1) { go = { .z = i }; }
+    u32 d = 0;
+    while (d == 0) { d = done.n; }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// zerc-flags: --no-strict-mmio
+// expect-trap
+// expect-trap-msg: unaligned address
+// Promoted from tests/zer_gaps/audit_2026-06-02_nostrict_mmio_no_runtime.zer (2026-11-13):
+// --no-strict-mmio relaxes the DECLARATION requirement only; the runtime alignment
+// check on a variable address is still emitted (BUG-736).
+u64 external_addr() { u64 a = 0x40000001; for (u32 i = 0; i < 1; i += 1) { a = 0x40000001; } return a; }
+u32 main() {
+    u64 addr = external_addr();
+    volatile *u32 reg = @inttoptr(*u32, addr);
+    return *reg;
+}

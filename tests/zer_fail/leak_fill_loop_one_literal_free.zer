@@ -1,0 +1,12 @@
+// expect-error: never freed
+// BUG-1603: a free through a LITERAL-index read (arr[0]) used to mark the whole array
+// drained, silencing the leak of the three other slots filled by the loop.
+struct N { u32 v; }
+u32 main() {
+    ?*N[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        arr[i] = alloc(N);
+    }
+    if (arr[0]) |p| { free(p); }
+    return 0;
+}

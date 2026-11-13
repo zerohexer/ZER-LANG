@@ -1,0 +1,20 @@
+// expect-trap
+// expect-trap-msg: @ptrcast type mismatch
+// Promoted from tests/zer_gaps/prec2_opaque_wrong_type.zer (2026-11-13): this was filed as a gap but
+// the guarantee holds — the program compiles and the runtime check fires.
+// Precision note: the second cast is refused at RUN time, not compile time — an
+// opaque from C (type_id 0) passes both casts, so neither is statically wrong.
+struct A { u32 x; }
+struct B { u32 y; }
+
+void use_both(*opaque o) {
+    *A a = @ptrcast(*A, o);
+    *B b = @ptrcast(*B, o);    // conflicts with above — same *opaque
+    a.x = b.y;
+}
+
+u32 main() {
+    A v; v.x = 1;
+    use_both(@ptrcast(*opaque, &v));
+    return 0;
+}

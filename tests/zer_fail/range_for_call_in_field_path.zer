@@ -1,0 +1,7 @@
+// expect-error: for-in collection must be a variable or a field path
+// BUG-1581: the collection's OBJECT was re-evaluated per iteration (a call ran n+1 times).
+struct H { u32[4] a; }
+H hs;
+u32 calls;
+*H pick() { calls += 1; return &hs; }
+u32 main() { u32 n = 0; for (u32 x in pick().a) { n += 1; } return calls * 10 + n; }

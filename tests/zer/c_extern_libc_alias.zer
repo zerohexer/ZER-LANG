@@ -1,0 +1,12 @@
+// BUG-1602: a C function the preamble's headers already declare (strcmp, atoi,
+// snprintf...) can be declared in ZER. Its prototype used to be emitted with
+// ZER's spelling (uint8_t *) and GCC refused it as "conflicting types" against
+// <string.h> / <stdlib.h>; only a hand-kept list of names worked.
+i32 strcmp(const *u8 a, const *u8 b);
+i32 atoi(const *u8 s);
+u32 main() {
+    if (strcmp("abc", "abc") != 0) { return 1; }
+    if (strcmp("abc", "abd") >= 0) { return 2; }
+    if (atoi("1234") != 1234) { return 3; }
+    return 0;
+}

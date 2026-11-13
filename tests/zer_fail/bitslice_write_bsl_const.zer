@@ -1,0 +1,7 @@
+// expect-error: does not fit the
+// BUG-1578: a bit-slice write of a constant that folds negative / differently untyped was silently cut.
+u32 main() {
+    u32 a = 0;
+    a[3..0] = 0 - 16;
+    return a;
+}

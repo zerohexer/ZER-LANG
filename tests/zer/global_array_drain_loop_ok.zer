@@ -1,0 +1,13 @@
+// BUG-1605: the free-every-slot loop over a GLOBAL array (filled in another function)
+// compiles, as it already did over a slice parameter. The temp holding the 'gs[i]' read
+// kept the previous iteration's FREED state across the back edge ("double free 'p'").
+struct N { u32 v; }
+?*N[4] gs;
+void fill() { for (u32 i = 0; i < 4; i += 1) { gs[i] = alloc(N); } }
+void drain() {
+    for (u32 i = 0; i < 4; i += 1) {
+        if (gs[i]) |p| { free(p); }
+        gs[i] = null;
+    }
+}
+u32 main() { fill(); drain(); return 0; }

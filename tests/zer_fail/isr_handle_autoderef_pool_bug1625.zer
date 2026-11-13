@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: is used from both interrupt and main code
+// BUG-1625: the interrupt twin — `h.v` in a handler uses the Pool.
+struct T { u32 v; }
+Pool(T, 4) pl;
+volatile u64 raw;
+interrupt T1 { Handle(T) h = @bitcast(Handle(T), raw); h.v += 1; }
+u32 main() {
+    Handle(T) h = pl.alloc() orelse return;
+    raw = @bitcast(u64, h);
+    h.v += 1;
+    return 0;
+}

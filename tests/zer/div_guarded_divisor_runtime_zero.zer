@@ -1,0 +1,7 @@
+// Promoted from tests/zer_gaps/ast_div_by_zero_runtime.zer (2026-11-13): filed as a gap, measured correct.
+// A divisor guarded by an early return is proven nonzero; divide(10, 0) returns 0.
+u32 divide(u32 a, u32 b) {
+    if (b == 0) { return 0; }
+    return a / b;
+}
+u32 main() { return divide(10, 0); }

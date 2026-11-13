@@ -1,0 +1,45 @@
+// BUG-1618: an assignment evaluates its TARGET (every index, every bit
+// position) before its value — also when the value is an `orelse`, when the
+// target is a bit-slice, and in a for-step. Each case below moved the index
+// inside the value; the store must land where the index pointed BEFORE that.
+// Pre-fix: an unchecked write far outside the array (the proven index's check
+// is elided), observable here as a clobbered neighbour or a wrong element.
+u32 launder(u32 x) { u32 r = 0; for (u32 i = 0; i < x; i += 1) { r += 1; } return r; }
+?u32 mb(*u32 p) { *p = launder(4); return 7; }
+u32 bump(*u32 p) { *p = launder(4); return 7; }
+struct S { u32[4] a; u32 secret; }
+u32 cnt;
+u32 f() { cnt += 1; return cnt; }
+?u32 mf() { cnt += 1; return cnt; }
+
+u32 main() {
+    S s;
+    s.secret = 5;
+    u32 i = launder(1);
+    if (i < 4) { s.a[i] = mb(&i) orelse 0; }        // a[1] = 7, not a[4] (= secret)
+    if (s.secret != 5) { return 1; }
+    if (s.a[1] != 7) { return 2; }
+
+    i = launder(2);
+    if (i < 4) { s.a[i][3..0] = @truncate(u4, bump(&i)); }   // bits of a[2]
+    if (s.secret != 5) { return 3; }
+    if (s.a[2] != 7) { return 4; }
+
+    u32[4] arr;
+    cnt = 0;
+    arr[f()] = mf() orelse 9;                        // target first: arr[1] = 2
+    if (arr[1] != 2) { return 5; }
+    cnt = 0;
+    u32[4] brr;
+    brr[f()][3..0] = @truncate(u4, f());             // brr[1] bits = 2
+    if (brr[1] != 2) { return 6; }
+
+    S t;
+    t.secret = 5;
+    u32 n = 0;
+    for (u32 k = launder(3); k < 4; t.a[k] = mb(&k) orelse 0) { n += 1; }   // a[3] = 7
+    if (t.secret != 5) { return 7; }
+    if (t.a[3] != 7) { return 8; }
+    if (n != 1) { return 9; }
+    return 0;
+}

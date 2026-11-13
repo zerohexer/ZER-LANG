@@ -1,0 +1,23 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1632: a teardown loop that frees each element through a VIEW of it
+// (`*H h = &s[i]`). The element-source walk stopped at the `&`, the callee's
+// summary said it frees nothing of `s`, and the caller's alias stayed ALIVE —
+// the write below landed in the recycled slot of a different live object.
+struct T { u32 v; }
+struct H { ?*T p; }
+void drop([*]H s) {
+    for (u32 i = 0; i < s.len; i += 1) {
+        *H h = &s[i];
+        if (h.p) |q| { free(q); }
+        h.p = null;
+    }
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    hs[0].p = a;
+    drop(hs);
+    a.v = 99;
+    return 0;
+}

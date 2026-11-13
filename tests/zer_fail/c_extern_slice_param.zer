@@ -1,0 +1,9 @@
+// expect-error: a slice is a {ptr, len} struct C cannot spell
+// BUG-1606: a C function (no ZER body anywhere) with a slice parameter would be
+// handed ZER's {ptr,len} struct where C reads a pointer. Since BUG-1602 binds the
+// declaration to the C symbol, this linked and compared garbage in silence.
+i32 strcmp(const [*]u8 a, const [*]u8 b);
+u32 main() {
+    if (strcmp("a", "a") != 0) { return 1; }
+    return 0;
+}

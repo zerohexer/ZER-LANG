@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot write through const pointer
+// BUG-1614: a bit-slice store into an element of a const slice parameter.
+void f(const [*]u32 s) { s[0][7..4] = 3; }
+u32 main() { u32[2] a; f(a); return a[0]; }

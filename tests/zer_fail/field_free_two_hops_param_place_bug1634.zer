@@ -1,0 +1,24 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is freed
+// BUG-1634: a callee forwards the address of a place UNDER its parameter to a
+// helper that frees a field of it. Only a bare-parameter forward (`drop2(c)`)
+// carried the "frees a field" fact into the outer summary, so the second hop
+// lost the free: `a` stayed ALIVE and the write below landed in the recycled
+// slot of `b` (the program returned 99).
+struct T { u32 v; }
+struct H { *T p; }
+struct Ctx { H h; }
+void drop2(*H h) { free(h.p); }
+void drop(*Ctx c) { drop2(&c.h); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    Ctx c;
+    c.h.p = a;
+    drop(&c);
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    a.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

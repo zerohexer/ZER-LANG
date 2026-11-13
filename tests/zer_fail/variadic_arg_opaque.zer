@@ -1,0 +1,9 @@
+// expect-error: '*opaque' is not a C pointer here
+i32 printf(const *u8 fmt, ...);
+struct S { u32 v; }
+S gs;
+u32 main() {
+    *opaque o = (*opaque)&gs;
+    printf("%p\n", o);
+    return 0;
+}

@@ -1,0 +1,15 @@
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1574: free(call(...)) whose result names several params / a field of a by-value struct freed nothing.
+struct T { u32 v; }
+*T pick(*T x, *T y, bool c) { if (c) { return x; } return y; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    free(pick(a, a, false));
+    *T b = alloc(T) orelse { free(a); return 1; };
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    free(a);
+    return r;
+}

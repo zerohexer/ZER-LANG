@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot write through const pointer
+// BUG-1614: the field arm of the const walk compared the raw type kind, so a
+// distinct typedef of a const pointer reached no const test.
+struct C { u32 v; }
+const C K;
+distinct typedef const *C CP;
+u32 main() { CP p = @cast(CP, &K); p.v = 1; return 0; }

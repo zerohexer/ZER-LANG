@@ -1,0 +1,11 @@
+// expect-trap
+// expect-trap-msg: outside mmio range
+// Promoted from tests/zer_gaps/ast_inttoptr_mmio.zer (2026-11-13): this was filed as a gap but
+// the guarantee holds — the program compiles and the runtime check fires.
+mmio 0x40000000..0x40000FFF;
+u32 main() {
+    u64 addr = 0x50000000;
+    for (u32 i = 0; i < 1; i += 1) { addr = 0x50000000; }
+    volatile *u32 p = @inttoptr(*u32, addr);
+    return *p;
+}

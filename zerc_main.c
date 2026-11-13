@@ -68,6 +68,17 @@ static char *read_file(const char *path) {
     }
     buf[size] = '\0';
     fclose(f);
+    /* BUG-1582: a NUL byte ends the source for the scanner (strlen), so
+     * everything after one was silently not compiled. Refuse the file. */
+    if (memchr(buf, '\0', (size_t)size) != NULL) {
+        size_t at = (size_t)((char *)memchr(buf, '\0', (size_t)size) - buf);
+        int line = 1;
+        for (size_t i = 0; i < at; i++) if (buf[i] == '\n') line++;
+        fprintf(stderr, "%s:%d: error: the file contains a NUL byte — everything after "
+                "it would be silently ignored\n", path, line);
+        free(buf);
+        exit(1);
+    }
     return buf;
 }
 

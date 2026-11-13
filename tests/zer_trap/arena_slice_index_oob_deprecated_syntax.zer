@@ -1,0 +1,16 @@
+// expect-trap
+// expect-trap-msg: out of bounds
+// Promoted from tests/zer_gaps/audit2_slice_oob.zer (2026-11-13): this was filed as a gap but
+// the guarantee holds — the program compiles and the runtime check fires.
+struct Cell { u32 v; }
+
+u32 main() {
+    u8[4096] buf;
+    Arena ar = Arena.over(buf[0..]);
+    ?[]Cell ms = ar.alloc_slice(Cell, 5);
+    []Cell s = ms orelse return;
+
+    u32 idx = 10;  // out of bounds
+    u32 r = s[idx].v;
+    return r;
+}

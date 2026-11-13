@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: which may already be freed
+// BUG-1632: the callee already freed the element through its view; freeing the
+// caller's alias afterwards is a double free.
+struct T { u32 v; }
+struct H { ?*T p; }
+void drop_one([*]H s, u32 k) {
+    if (k >= s.len) { return; }
+    *H h = &s[k];
+    ?*T m = h.p;
+    h.p = null;
+    if (m) |q| { free(q); }
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    hs[0].p = a;
+    drop_one(hs, 0);
+    free(a);
+    return 0;
+}

@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: cannot assign to const variable
+const u32 K = 5;
+u32 main() { K[3..0] += 1; return 0; }

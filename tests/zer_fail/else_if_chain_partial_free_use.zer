@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free: 't' is maybe-freed
+// Promoted from tests/zer_gaps/audit2_nested_if_chain.zer (2026-11-13), rewritten so the
+// wrong-pool rule no longer masks it: four arms of an else-if chain free, one does not.
+struct Task { u32 id; }
+u32 main() {
+    u32 mode = 4;
+    for (u32 i = 0; i < 1; i += 1) { mode = 4; }
+    *Task t = alloc(Task) orelse return;
+    if (mode == 0) { free(t); } else if (mode == 1) { free(t); } else if (mode == 2) { free(t); } else if (mode == 3) { free(t); } else { u32 a = t.id; }
+    u32 x = t.id;
+    return x;
+}

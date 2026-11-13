@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1632: the drain runs over a SUB-SLICE of the parameter. Only a bare copy
+// of the param (`[*]H b = s;`) was followed back to it.
+struct T { u32 v; }
+struct H { ?*T p; }
+void drop_sub([*]H s) {
+    [*]H t = s[0..s.len];
+    for (u32 i = 0; i < t.len; i += 1) {
+        if (t[i].p) |q| { free(q); }
+        t[i].p = null;
+    }
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    hs[1].p = a;
+    drop_sub(hs);
+    a.v = 99;
+    return 0;
+}

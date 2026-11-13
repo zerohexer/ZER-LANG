@@ -30,6 +30,149 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1643; measured, reproducers in `tests/zer_gaps/`)
+
+Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
+executed reproducer in `tests/zer_gaps/` (compile-clean = the gap still holds; the runner
+fails loudly when one closes). "exit 99" = a stale pointer wrote a recycled slot and the
+program returned the corrupted value.
+
+**A. Allocation tracker — a free / store / move the caller cannot see (MEDIUM, accept-unsafe).**
+The view work of BUG-1620..1626 resolves a view whose root is a local aggregate, a pointer
+that holds one value (a parameter, a local bound once), a whole or nested global slot, and a
+stable global pointer — in the function AND in the summaries built from it. What is left is
+each a missing SUMMARY fact, not a missing key:
+1. ~~A variable-index view in a callee~~ — CLOSED (BUG-1632 the free through `*H h =
+   &s[i]` / a sub-slice local; BUG-1633 the store into a slice parameter's element, direct or
+   through a view, and a slice local handed to either kind of callee).
+2. **A field free the summary cannot NAME.** `frees_param_field` is one bit per parameter —
+   "frees some field". The two-hop forwards are CLOSED (BUG-1634: `drop2(&c.h)`,
+   `drop2(&g.h)`), but the bit carries neither WHICH field nor whether the callee RESET it:
+   - inside a function, a pointer param's field freed by a callee stays ALIVE for a direct
+     read (`drop(h); h.p.v = 99;` — no entry exists under `h` to mark, and marking every
+     pointer field read after the call would refuse `free_a(h); free(h.b);`).
+     `alloc_param_field_freed_by_callee_then_used`.
+   - (over-rejection, loud) a teardown that frees AND resets its fields, called again after a
+     PARTIAL refill, is "handed 'c', which carries a freed pointer at 'c.h2.p'" — one hop or
+     two. Refill every field, or reset them in the caller.
+   The durable fix is a per-path list (`{param, path, must, reset}`, the shape `param_store`
+   and `ret_field` already have) in place of the two bool arrays.
+3. ~~A getter of an ADDRESS~~ — CLOSED (BUG-1642: `return &g`; BUG-1641: a field read through
+   a local view of a pointer param). Residual: a getter returning `&g.sub` (a projection of a
+   global, not the bare global), a getter reading a field through a by-value COPY of the param's
+   struct (`H h = c.h; return h.p;` — no slot entry exists to match), and a getter with two
+   different `&G` returns (not summarised, so the result is an unrelated value).
+4. ~~A global reached through a COPY or a capture~~ — CLOSED (BUG-1640) for a struct copy and
+   an optional-struct capture. Residual: a copy of a global ARRAY of structs (the leaf path
+   contains a variable-index family `g[*].p`, deliberately not minted as one slot) and a copy
+   made through a pointer-to-global that is reassigned.
+5. ~~A carrier forwarded to a funcptr PARAMETER~~ — CLOSED (BUG-1638).
+6. ~~A `?*T` read out of a slice view of a local array~~ — CLOSED (BUG-1635).
+   Residual precision (loud): a VARIABLE index through a view that does not start at 0
+   (`[*]?*T u = arr[1..3]; for (i..) { free(u[i]); u[i] = null; }`) is "some element", so
+   the reset reaches no specific slot and the loop is refused — the same answer as the
+   direct `arr[i + 1]` spelling. Iterate the array, or a view starting at 0.
+7. ~~An async task holding a pointer the FUNCTION was given~~ — CLOSED (BUG-1643, parameter and
+   global-task-in-helper).
+8. ~~`move struct` across a pointer / slice parameter~~ — CLOSED (BUG-1639). Residual
+   (over-rejection, loud, unchanged): the crude call-site rule still transfers a ROOT written
+   `&w` / `w` passed to ANY function — `peek(&w); peek(&w);` on a struct containing a move
+   field is "use after move" although `peek` only reads. The summary bit 32 now exists to
+   relax it; doing so is an accept-unsafe change (every way a callee can consume must be in
+   the bit) and needs its own audit.
+9. **Silent leaks** — ~~`use(alloc(T) orelse return)`~~ (CLOSED, BUG-1636/1637), a
+   `goto` that jumps over a `defer free(a)`, and a GLOBAL slot overwritten with null
+   (`g.p = alloc(T); g.p = null;` — global entries are escaped, so the overwrite query stays
+   silent; the LOCAL-slot form is reported since BUG-1627).
+10. **Over-rejections seen (loud):** a field freed through a getter-returned pointer marks the
+   POINTER freed (`*H h = geth(); if (h.p) |q| { free(q); } h.p = null;`); a callee that frees
+   and RESETS a global's field through its pointer param is "left dangling" at the caller
+   (`drop(&g_h)`); the destructor `if (t.l) |q| { free(q); } ... free(t);` is "returning while
+   't.l' holds a freed pointer" (the non-optional spelling compiles); the grow idiom
+   `nd.v = old.v; free(old); v.data = nd;` infers `keep` on the vector parameter; `*H h =
+   &c.h; free(h.p);` on a HEAP `c` reports "wrong pool"; `return get2(&c.h)` with `c` a pointer
+   parameter is "local-derived"; a range-for teardown over an array of structs is a false
+   use-after-free; `defer th.join();` in a function with a label is "not joined".
+
+**B. Concurrency (MEDIUM, accept-unsafe — each TSan- or ASan-confirmed).**
+1. ~~A re-entrant `_poll` of the same task~~ — CLOSED (BUG-1628): the poll traps on re-entry.
+2. ~~Funcptr reach through a POINTER / SLICE spawn argument~~ — CLOSED (BUG-1631).
+3. **The scoped-borrow window is textual under `goto`** — a `goto` runs an access inside a
+   spawn..join window it is written before (`conc_goto_orders_access_into_borrow_window`; the
+   atomic-downgrade check likewise, and its `defer` form: thread `g += 1; @atomic_store(&f,
+   1);` against `{ defer { g += 1; } spawn w(); }`). `Symbol.is_borrowed_by_thread` is linear
+   in the text; the escape fixpoint's answer (a labelled function is flow-insensitive) is the
+   model to copy — but a flow-insensitive borrow also refuses the read AFTER the join, so it
+   needs a per-label join of the borrow set, not a blanket latch. (The atomic-cell rule's
+   `defer`-before-spawn form is CLOSED, BUG-1629.)
+4. ~~A helper lends its pointer param and touches the same global by NAME~~ — CLOSED
+   (BUG-1645: per-parameter lent-global fact, call-site check), and ~~"same object" by name
+   misses a plain local alias~~ — CLOSED (BUG-1646: the pair root follows a pointer local's
+   borrow root through a projection). **Residual (precision, loud):** the pair is keyed on the
+   ROOT object, so two arguments naming DISJOINT fields of one struct (`sp(&t.x, &t.y)`) are
+   refused as "both reach 't'"; a field-path disjointness test would recover it.
+5. ~~A lent global reached by the parent's callee through a pointer FIELD of a global
+   struct~~ — CLOSED (BUG-1647: the write-target query walks PART-writes of an aggregate name
+   and follows the assigned `&g`).
+6. ~~The spin-lock recogniser accepts a loop that does not lock~~ — CLOSED (BUG-1644: a
+   `break`, a wrong expected value or a non-CAS condition is not a lock).
+7. **ISR split read-modify-write through MEMORY** (checker only; an `interrupt` block does not
+   build hosted, so no gap file): `mem = g; g = mem + 1;` through a global, through two
+   functions, through `*p`, and across a loop back edge (`g = x + 1; x = g;`). The local-copy
+   spellings are refused.
+8. **BUG-1625 sees a CHECKED body only** — the Handle auto-deref's allocator is recorded by
+   the checker on the node, so a spawn target declared AFTER its spawn site (body not yet
+   checked when the scan runs) is still unseen. A post-pass over `Checker.sync_spawns` would
+   close it.
+
+**C. Values / bare metal (LOW, loud).**
+- A shift COUNT literal is typed against the LEFT operand: `u3 y = x << 8;` is "cannot
+  initialize 'u3' with 'u32'" while `x << 7` compiles (the documented result is 0).
+- ~~A comptime shift by exactly 63~~ — CLOSED (BUG-1630).
+- Shift typing: a shift's result is the COMMON type of its operands (by design), and a lone
+  literal count adopts the left operand's type — so `u8 s; u32 d = s << 12;` shifts at u8
+  width and is 0. Cast the value first (`(u32)s << 12`).
+- `if (i < 8) { return reg[i]; }` on an MMIO pointer with max index 7 still gets the
+  auto-guard (precision).
+- `@cpu_save_context` / `@cpu_restore_context` emit `sd` / `ld` for riscv32 (RV64-only
+  instructions): the build fails on a 32-bit RISC-V target.
+- `**u32 hold = &(&X);` (address of an rvalue) is accepted by the checker and refused by GCC.
+
+**D. Recorded design decisions (not defects).**
+- A local array passed to a funcptr PARAMETER of type `[*]T` is not `keep` (a retaining
+  callback then holds a dangling slice): the deliberate, measured exemption in
+  `keep_edge_callee_keeps` — an unknown callback that takes a buffer is the read/fill idiom.
+- `@container` on a pointer PARAMETER has unknown provenance and is allowed (CLAUDE.md
+  "Provenance Tracking"); a caller passing `&whole_object` is the caller's bug to see.
+
+## OPEN — residuals of the 2026-10-12 audit (BUG-1566..1596; measured)
+
+1. **The `*opaque` C bridge (BUG-1594).** A C extern with an `*opaque` / `?*opaque` in its
+   signature is called through a static inline wrapper selected by a function-like macro.
+   (A VARIADIC extern with an `*opaque` is refused since BUG-1601.) Not bridged: TAKING THE
+   ADDRESS of a bridged
+   function (`fp = sensor_read`) names the C function, whose `void *` signature differs from
+   the ZER function-pointer type — GCC refuses it (loud). With any `cinclude` in the
+   program the bridge emits no prototype of its own (the header is the authority); a
+   bridged function the header does not declare is then GCC's "implicit declaration"
+   (loud). Without a `cinclude`, a non-bridged extern binds to its C symbol under a private
+   name (BUG-1602), so the hard-coded stdlib skip list in `emit_top_level_decl` is now only
+   needed WITH a `cinclude`, where ZER's prototype must still agree with the user's header
+   (a mismatch is GCC's "conflicting types", loud). The bridge's own `void *` prototype is
+   aliased the same way.
+2. ~~The volatile-flag RMW rule refused a spawner's RMW against a thread that only READS the
+   flag~~ — CLOSED 2026-10-13 (BUG-1604: thread STORES are recorded by the sync walk).
+3. **Condition facts (BUG-1566/1607) are taken from EFFECT-FREE conditions only.** Since
+   BUG-1607 `i < n` reads `n`'s CURRENT range (`if (n < 8 && i < n)` proves `i <= 6`, either
+   conjunct order). Still not used: a bound that is an expression (`i < n - 1`, `i < s.len`
+   of a slice) and a relation between two variables that have no range yet (no relational
+   domain: `i < n` stored as a fact and applied when `n` is narrowed later is not kept).
+4. **Range-for over an element** (`for (x in hs[k].s)`) is refused (BUG-1581) — assign the
+   collection to a local. A relaxation would need a snapshot of the collection itself.
+5. **`can_detach` (BUG-1589) follows direct calls, module-qualified calls and function
+   names passed as arguments**; an indirect call through a funcptr reaches its candidate
+   set through `func_props_merge_reached` only where the existing FuncProps machinery does.
+
 ## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
 
 1. **What the atomic/barrier downgrade check (BUG-1562/1563/1565) still trusts.** The
@@ -46,20 +189,34 @@ repeated.
    through pointers (global, local, parameter), forwarding and call cycles. Not followed: a
    value passed back through memory a pointer argument points at (an out-parameter
    `void rd(*u32 o) { *o = g; }`), which the per-object summary does not model.
-3. **A helper called only from an interrupt handler counts as MAIN code** for the
-   ISR-sharing rule: `void bump() { count = 5; } interrupt T { bump(); }` is refused
-   "must be declared volatile" though main never touches `count` (over-rejection). Needs
-   reachability from the non-ISR roots (main, spawn targets, funcptr-taken and exported
-   functions) — a relaxation, so it needs the accept-unsafe discipline.
-5. **Over-rejections from the allocation tracker:** the free-every-slot loop over a GLOBAL
-   array (`for (i) { if (gs[i]) |p| { free(p); } gs[i] = null; }`) is refused ("double free
-   'p'"), though the same loop over a slice parameter compiles; freeing a heap linked list
+3. ~~A helper called only from an interrupt handler counts as MAIN code~~ — CLOSED
+   2026-10-15 (BUG-1608). Still conservative: a function is ISR-only only when it is `static`
+   or the program has a ZER `main` (a `--lib` build keeps every non-static helper as main
+   code, because C may call it), and names are matched across modules as one set (two
+   modules' `bump` share their callers).
+5. **Over-rejections from the allocation tracker:** (the free-every-slot loop over a GLOBAL
+   array compiles since BUG-1605.) Freeing a heap linked list
    built from `alloc(Node)` + `?*Node next` is refused in the iterative and recursive forms.
+   **Why it is a design change, not a patch (analysed 2026-10-15).** Every node comes from ONE
+   allocation site, so they share one identity (`aid = local + 1`), and `n.next = head`
+   aliases the field to that identity: freeing the first node marks them all freed. The
+   tempting fix — give a read of `p.next` a FRESH identity — is UNSOUND three ways: a cycle
+   (`last.next = first`, or `n.next = n`) makes `p.next` an already-freed node; a second
+   pointer into the list (`tail`, a global) frees a node the traversal later reaches; two lists
+   sharing a tail free it twice. A sound version needs a proven OWNERSHIP invariant on the
+   link field — every object has at most one incoming `next` and the chain is acyclic — checked
+   at EVERY store to that field program-wide (`n.next = head; head = n;` with `n` fresh and
+   `head` dead afterwards preserves it; `tail.next = n; tail = n;` keeps a second pointer and
+   needs `tail` treated as a borrow that dies before any free), plus recency abstraction in
+   zercheck_ir (the node being freed is a materialised singleton taken out of the "rest of the
+   list" summary, which stays alive). That is shape analysis: oracle first
+   (`handle_flow_lattice.v`-style, with the ownership invariant as an explicit precondition —
+   the Level B lesson), then the C. Workarounds today: a `Pool`/`Slab` with `Handle(Node)`
+   links, or nodes in an array with index links.
    The variable-index global free (BUG-1530) widens a caller's `gs[0]` even when the
    callee's index provably differs.
-6. **Leak false negatives:** after filling an array at a variable index, ONE free at a
-   literal index silences every leak; an allocation consumed inline (`(alloc(T) orelse
-   return).v = 3;`) is never registered.
+6. ~~Leak false negatives~~ — CLOSED 2026-10-13: one free at a literal index after a
+   variable-index fill (BUG-1603), and an allocation consumed inline (BUG-1597).
 7. **Block lifetimes (BUG-1554) are compared at ASSIGNMENTS only.** The other two ways a
    pointer to a local leaves its block — a callee storing it (`set(&outer, &x)`) and a
    store through a pointer (`*pp = &x`) — are refused by the stricter FRAME rules
@@ -87,9 +244,8 @@ repeated.
    is not retyped wider and still wraps at 64 bits (BUG-1505 residual — pre-existing).
 3. **Label functions widen VRP over the whole body** when anything takes an address (BUG-1499):
    sound, but a function with a label and an `&` anywhere loses ranges it could keep.
-4. **Every call inside an async body widens every frame-local range** (BUG-1503) — the price of
-   a possible re-entrant `_poll`. A whole-program "does this call reach a poll of this task?"
-   query would recover it.
+4. ~~Every call inside an async body widens every frame-local range (BUG-1503)~~ — CLOSED
+   2026-11-13 (BUG-1628): a re-entrant `_poll` traps, so the widening is removed.
 
 ## OPEN — residuals of the 2026-09-28 MMIO / parser / compile-time round (BUG-1480..1487)
 
@@ -107,8 +263,8 @@ repeated.
 
 1. ~~A callee that `@cond_wait`s is not refused when reached from inside `@critical` or an
    interrupt handler~~ — CLOSED 2026-10-10 (BUG-1512, with every blocking wait in an ISR).
-2. A lock root whose place is a SLICE is not hoisted by `hoist_place_effects` (non-packed
-   bit-slice writes are evaluated once through the emitter's pointer hoist).
+2. ~~A lock root whose place is a SLICE is not hoisted by `hoist_place_effects`~~ — CLOSED
+   2026-11-13 (BUG-1618): a bit-slice place hoists its object's parts and both bit positions.
 3. The moved volatile predicates resolve a root name in the checker's CURRENT module; the
    emitter calls them after checking, so a module global shadowed by a same-named main
    global could be judged by the wrong declaration's qualifier (unprobed).
@@ -258,7 +414,7 @@ measured at zero corpus cost; its precision residue, each an over-rejection:
    `<avr/io.h>` (loud).
 4. **Over-rejections seen (loud):** ~~a `const` global read from an ISR and from main is refused
    "must be declared volatile"~~ (CLOSED 2026-09-27, BUG-1369); a function
-   returning an `@inttoptr` pointer is reported as a leak; `volatile f32` is "not single-word"
+   ~~returning an `@inttoptr` pointer is reported as a leak~~ (CLOSED 2026-10-12, BUG-1599); `volatile f32` is "not single-word"
    on a 32-bit target.
 5. **reference.md "use a packed struct for named bit-fields" is misleading**: `packed struct
    CR { u3 mode; u5 prio; }` lays the fields out in byte CARRIERS (u3 -> u8), not as bits —
@@ -317,16 +473,12 @@ measured at zero corpus cost; its precision residue, each an over-rejection:
 
 ## OPEN — residuals of the 2026-09-25f audit (BUG-1308..1325; measured)
 
-1. **`lib/` does not compile as shipped** (LOW — loud). `fmt.zer` calls `fmt_u64`/`fmt_i64`
-   that it never declares (it assumes concatenation with `str.zer`), `io.zer` calls `fputc`
-   it does not declare, and `io_open` is refused — `return fopen(&path_buf[0], …)`: a bodyless
-   extern handed a LOCAL buffer may return a pointer into it, so the result is frame-bound.
-   That rejection is the C-FFI floor working as designed (a C function CAN return its
-   argument); the library, not the checker, needs restructuring (a static path buffer, or
-   an `io_open` that takes a caller buffer). `compat.zer` is C-conversion scaffolding and is
-   not meant to compile without `--no-strict-mmio`. Only `str.zer` compiles (fixed by
-   BUG-1317). Imports resolve from the entry file's directory only, so `lib/` must be copied
-   beside the program. reference.md deliberately does not document the library until it builds.
+1. ~~**`lib/` does not compile as shipped**~~ — CLOSED 2026-10-12: fmt imports str, io
+   declares its C functions, the module-prefixed C externs (BUG-1593), the `*opaque` C ABI
+   (BUG-1594), the const `*opaque` temp (BUG-1595) and the param-view false leak (BUG-1596)
+   are fixed, and `tests/test_lib.sh` (in `make check`) builds and runs a program importing
+   every module. Imports still resolve from the entry file's directory only, so `lib/` is
+   copied beside the program; reference.md documents the library now that it builds.
 2. ~~**Two literal-typing over-rejections.**~~ — CLOSED 2026-09-26 (BUG-1326, BUG-1327).
 3. **BUG-1310 precision.** An indirect call through a funcptr LOCAL / param / mutable global
    reaches every function of its SIGNATURE (the BUG-1290 end), so a helper calling a callback
@@ -722,7 +874,16 @@ it. The literals keep their old spelling so a grep for a grid's file still finds
 second `make check` running in another worktree at the same time, and no directory left behind.
 A NEW grid must include `zer_tmp.h` and wrap its paths — a fixed path is the defect back.
 
-## OPEN — an interrupt handler's own read-modify-write is refused even when only main READS (2026-09-23, LOW/MEDIUM — over-rejection of the tick-counter idiom)
+## CLOSED 2026-11-13 (BUG-1610) — an interrupt handler's own read-modify-write was refused even when only main READS (the tick-counter idiom)
+
+**Closed** by `isr_rmw_regular_code_only_reads`: accepted when one handler reaches the cell,
+no regular-code body assigns it (whole / compound / bit-slice) and its address is taken
+nowhere. The reason given below for not shipping it ("unsound on a multi-core part") does not
+apply to a reader: with ONE writer there is no update to lose on any number of cores, and the
+`@critical` exemptions already assume a handler does not run concurrently with itself. A main
+that WRITES the cell (even a plain `ticks = 0;`) is still refused — put both updates in
+`@critical`. Original text:
+
 
 `volatile u32 ticks; interrupt TIM2 { ticks += 1; } u32 main() { u32 t = ticks; ... }` is
 refused ("read-modify-written and is shared"). On a single core the ISR's RMW cannot be split
@@ -3943,7 +4104,8 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 
 ### Reported but NOT fixed on any branch — carry as OPEN, do not "harvest"
 
-- **extern `*opaque` crosses the C boundary with an UNINITIALISED `type_id`** (4z36e0,
+- ~~**extern `*opaque` crosses the C boundary with an UNINITIALISED `type_id`**~~ — CLOSED
+  2026-10-12 (BUG-1594, the `void *` bridge). Original text: (4z36e0,
   HIGH). ZER emits `_zer_opaque zzz_ptr(void);` where the real C function is
   `void *zzz_ptr(void);`. `.ptr` arrives correctly by ABI luck; `.type_id` is register
   residue. `@ptrcast`'s `!= 0` escape then either FALSE-TRAPS on correct code (measured,

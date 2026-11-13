@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: is transferred
+// BUG-1639: a callee moves out of an element of a SLICE parameter; the array was
+// handed over as `ts[..]`, a spelling that names no root, so the caller moved the
+// same element again.
+move struct Tok { u32 k; }
+void consume(Tok t) { }
+void eat([*]Tok s) { consume(s[0]); }
+u32 main() {
+    Tok[2] ts;
+    eat(ts);
+    consume(ts[0]);
+    return 0;
+}

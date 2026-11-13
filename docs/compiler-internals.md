@@ -162,6 +162,370 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
+## The 2026-11-13 audit (BUG-1609..1643) — what took a loop to find
+
+Read with BUGS-FIXED.md "Session 2026-11-13". Only what is not obvious from the diff.
+
+**1. "Is this name ever written?" has TWO answers, chosen by the name's TYPE (BUG-1609).**
+`ast_name_writes_r` (zercheck_ir.c) is the one exhaustive walk behind
+`ast_name_mutated_or_addrd`, `ast_name_addr_taken`, the aim visitors and
+`global_name_never_mutated`. It reported a bare `name = v` and `&name` only — correct for a
+POINTER name (`r[i] = x` and `p.f = x` write the pointee; the MMIO-bound and stable-aim rules
+need exactly that) and wrong for everything else, where the same spellings write the object.
+The walk now takes a mode:
+
+| mode | reports in addition | used by |
+|---|---|---|
+| `ANW_PARTS_NONE` | nothing — the historical walk | every visitor that existed (`ast_name_writes`) |
+| `ANW_PARTS_AGGREGATE` | `name.f = v`, `name[i] = v`, `&name.f`, a view `name.arr[a..b]`, a `\|*v\|` capture of `name.opt` | `ast_name_part_mutated_or_addrd(…, false)` |
+| `ANW_PARTS_SCALAR` | the same, except a `name[hi..lo]` READ is a bit extract, not a view | `…(…, true)` — an integer name |
+
+`ANW_CAPTURE` (`if (name) |*v|`, a `|*v|` switch arm on `name`) is reported in EVERY mode: it
+is a pointer into the object, so the object can change with no assignment or `&` naming it.
+It is deliberately not an `&name` for `ast_name_addr_taken` — the capture cannot leave its
+arm, and the async "task-private union" test (BUG-1234) asks precisely whether anything ELSE
+can reach the union (`tests/zer/async_switch_capture_yield` fails if you count it).
+`global_name_never_mutated` picks the mode from `Symbol.type` and additionally answers "may be
+mutated" for a non-const global holding an ARRAY by value: an array becomes a slice, or is
+handed to an array parameter (which ALIASES its argument), with no `&` and no slice
+expression in the source, and a body that has not been checked yet has not had its implicit
+view made explicit (BUG-1516), so no walk over names can prove such a global untouched.
+**A new visitor must decide what the PART and CAPTURE kinds mean for it** — the three existing
+aim / handle-source visitors treat anything that is not `ANW_ASSIGN` as "cannot follow".
+
+**2. A relaxation's conjuncts each need a cell (BUG-1610, the tick counter).** The licence is
+"one writer", proved by four whole-program facts. The first draft used the AGGREGATE mode on
+the integer and refused `u32 b = flags[1..1];` in main — a bit EXTRACT read as a view. The
+SCALAR mode exists for that. The single-writer grid in `tests/test_hw_matrix.c` has one
+negative cell per conjunct (main plain store, main helper store, main bit-slice store, `&t`
+to a callee, a global pointer `&t`, the handler publishing `&t`, a second handler reading, a
+second handler writing); deleting any conjunct turns one of them into a false negative.
+Changing the rule also changed what the RMW FORM grid's ISR cells MEAN: with a reader-only
+main their programs became correct, so the ISR site's partner now also stores.
+
+**3. Escape taint: three ways a "kill" was not one (BUG-1611..1613).** The assignment sink
+clears the target's flags when the assignment REPLACES the value on every path
+(`bk_replaces`). It does not when (a) the value mentions the target — the flags were being
+cleared before the value that reads them was examined; (b) the function has a label (the
+fixpoint's `sticky` mode is flow-insensitive, and a kill is the one flow-SENSITIVE act);
+(c) the statement may not run: `Checker.branch_depth` is the test, and an orelse BLOCK
+fallback and a `for` STEP were walked at the enclosing depth. **When you add a construct whose
+body runs conditionally, walk it with `check_stmt_cond_body` (or bump `branch_depth`).**
+
+**4. `value_escaping_call` is the one "which call is this value a view of?" peel
+(BUG-1615).** Five sinks each peeled `.f` / `[i]` by hand; one also knew a slice, two an
+orelse subject, none a launder or `&place`. Do not write a sixth walk. The helper returns the
+call node (the keep-call sink names its callee) and reports a depth give-up, which callers
+read as an escape. `arg_is_local_derived` has the same peel for a NESTED call
+(`id(&view(a)[1])`), and `propagate_escape_from_value` asks it for a field store into a
+local carrier (`h.p = &view(a)[1]; return h;` — the walk there ended at the call node and
+found no symbol to copy flags from).
+
+**5. An assignment has THREE lowering sites, and the target hoists must be at each
+(BUG-1618).** `lower_expr`'s NODE_ASSIGN arm (the hoists were here), the statement-level
+"Case A" for `target = X orelse Y` with a non-local target, and the `for` STEP (a
+passthrough). "The target is evaluated before the value" is `hoist_place_effects` (when a
+part may write or reads volatile) plus `hoist_target_indices` (when the value may write).
+A bit-slice TARGET (`NODE_SLICE`) was a leaf to both — its object's indices and its two bit
+positions are parts like any other. The symptom is an unchecked out-of-bounds store, because
+the checker proves the index at the statement's START.
+
+**6. Allocation views: which roots resolve, and the over-rejection that bounds them
+(BUG-1620..1626).** A view is a pointer formed by `&place`; `ir_extract_compound_key`
+re-roots projections through it. Roots that resolve now: a local aggregate (BUG-984/1396), a
+pointer that holds one value — a parameter never reassigned, a local bound once
+(`ir_is_stable_aggregate_ptr_local`) — a whole global (BUG-1462), a nested global slot, and
+a stable global pointer's aim (`ir_global_projection_key`). Three things cost loops:
+- **A view keyed on a VARIABLE index re-breaks the teardown loop.** `*H h = &tbl[i]; if
+  (h.p) |q| { free(q); } h.p = null;` — with the view keyed "tbl[i]" the next iteration's read
+  met the previous iteration's freed entry ("use of an unnamed temporary, which may be a view
+  of 'q'"). The per-iteration slot facts (BUG-1130/1302) live on the DIRECT spelling. New view
+  roots are therefore restricted to places fixed below the root (`ir_place_fixed_below_root`:
+  fields and literal elements); the variable-index callee forms stay open (limitations.md).
+- **Making a view resolve exposes every sink that asked a syntactic question about its
+  target.** Once `&gc.h` was a view, `h.p = null;` no longer reset the slot (G5 asked "is the
+  target SPELLED from a global?", BUG-1622) and a callee's free through it recorded no freed
+  global (the trace was syntactic, BUG-1623) — the first surfaced as a FALSE "global left
+  dangling", which had been MASKING the second. Fixing only the first turned a wrong-worded
+  rejection into an accepted use-after-free. **After teaching a key query a new root, re-run
+  the valid idioms AND the hazard through every sink: store, reset, read, free, summary.**
+- **A PARAMETER has zero bindings in the body.** `ast_name_bind_count(body, param) == 0`; a
+  "bound once" test written for locals (`== 1`) silently refuses every parameter root
+  (`ir_local_view_place` — the flow-insensitive twin of the view fact, for summaries that
+  read the AST rather than a path state).
+
+**7. A literal TREE has a width only where it flows (BUG-1619).** Every value-flow sink
+retypes a pure literal tree to its destination (BUG-939). A binary OPERAND retyped it only
+when its exact value fit the other side, so `~0xFFF` against a `u64` stayed u32 and was
+zero-extended. `widen_literal_tree_operand` applies the var-decl sink's own licence
+(`value_flows_to_ex`), so the operand position and `u64 m = <tree>;` cannot disagree; in a
+shift only the LEFT operand (the value) is widened — a shift's result is the COMMON type of
+its operands by design, so `~0 << n` with a u64 `n` was u32 ones zero-extended. Measured consequence: `x > 0 - 1` on a
+u64 now compares against all-ones (as `u64 k = 0 - 1;` always produced), not 0xFFFFFFFF.
+
+**8. A runtime guard can DISCHARGE a static precondition — and then the conservative
+widening it forced can go (BUG-1628).** BUG-1503 kept VRP sound under a re-entrant `_poll`
+by widening every async frame local at every call, because "refusing re-entrant polling
+would need a whole-program call-graph question". The other reading of the same sentence:
+make re-entry impossible at run time. `_poll` is now a wrapper around `_zer_pollrun_NAME`
+(the Duff's-device body) that tests and sets `_zer_running`; wrapping means none of the
+body's six exit forms (yield, await-not-ready, return, auto-guard early-out, orelse return,
+fall-off) had to be found. With that guard the precondition "no callee runs this task's
+body while this activation is live" is a fact, the handle states are sound across calls
+(the double free that prompted this), and the VRP widening is a pure over-rejection, so it
+was removed in the same change. Two things to keep: (a) the argument needs EVERY door to
+the frame closed — the task type exposes no fields, a task cannot be copied / punned, and
+`&local` already drops the range; a new way to name a frame field re-opens BUG-1503;
+(b) an existing POSITIVE test exercised the re-entry on purpose
+(`vrp_async_reentrant_poll_bug1503`) — it is a trap test now, and that is the tell that a
+"fix" changed the language: re-entrant polling used to be defined (and unsound), and is
+now a trap.
+
+**9. "What a thread can reach from this argument" is not "what the argument carries"
+(BUG-1631).** `funcptr_first_carried` answers by-value containment (optional / array /
+struct) and is right for a GLOBAL's binding. The spawn-argument fallback needs reach:
+through a pointer and a slice too (`funcptr_first_reached`, with a stack of structs being
+walked so `struct N { ?*N next; *() f; }` terminates). Do not widen `funcptr_first_carried`
+itself — `global_bound_functions` uses it to decide which globals have an initializer
+binding at all.
+
+**10. Running `make check` while editing: use a snapshot.** `make check` takes 15-30 minutes
+here and reads `./zerc`, so the tree cannot be rebuilt under it. Copy the working tree
+(`git ls-files -co --exclude-standard | tar …`) into a scratch directory and run it there;
+keep a second scratch build of the pre-change compiler for A/B. A probe subagent given a
+prebuilt compiler path and a read-only repo cannot disturb either.
+
+**11. A summary APPLIER resolves its argument by KEY — and three argument spellings have no
+key (BUG-1632..1634).** Every cross-function fact (`param_store`, `frees_param_elems`,
+`frees_param_field`) is computed on the callee and APPLIED at the call through the argument's
+compound key. The callee half was right in all three bugs; the applier dropped the fact
+because the argument was not a keyed place:
+- a SLICE of an array (`f(hs)` is `f(hs[..])` in the AST since BUG-1516, and `f(hs[1..3])`) —
+  peel to the array; a view that does not start at 0 shifts the callee's literal index, so
+  the store lands on the any-index slot `[*]`;
+- a slice LOCAL bound once to such a view — `ir_stable_slice_local_def` (BUG-1463) already
+  answered this for a projection `sl[1]`; the bare name as an ARGUMENT did not ask it;
+- a place under the function's OWN parameter or under a global, when the function has no
+  entry there to mark (`drop2(&c.h)`, `drop2(&g.h)`) — the fact must be re-recorded against
+  the outer function's root (the `\x01` field sentinel for a param, a freed-global PREFIX key
+  for a global), or the second hop loses it.
+When adding a summary fact, write the applier's argument resolution FIRST and test it with:
+the array itself, `&agg`, `&agg.field`, a sub-slice, a slice local, a forwarded parameter,
+and a global place. A fact that is right in the callee and applied to nothing looks exactly
+like "the callee does nothing".
+
+**11b. The key query and the slot SPLIT must rebase the same way (BUG-1635).**
+`ir_extract_compound_key` rebases `s[0]` through a slice view onto `arr[0]`;
+`ir_slot_decompose` (if-captures, element reads, the overwrite / reset sinks) split `A[i].f`
+by keying `A` ALONE — so a view local was a stranger there while the same expression keyed
+correctly everywhere else. Any new consumer that takes an element access apart instead of
+keying it whole must call `ir_rebase_slice_index` first; that is the one place a view's
+index is translated (a zero-start view keeps a variable index, a shifted one becomes
+"some element").
+
+**11c. An allocation's NAMES decide who owes the free — count them (BUG-1636..1638).** The exit
+leak pass skips temps and skips `escaped` entries because both are copies / hand-offs of an
+owner that is reported elsewhere. That is only right while the OWNER exists: an allocation held
+only by temps (`f(alloc(T))`), or whose only owner slot was marked escaped by an applier
+(`put(&h, alloc(T))`), has no one left to report it. When teaching a store / hand-off applier
+to mark `escaped`, ask whether the destination is this frame's own storage
+(`ir_key_path_in_frame`) — if so the slot keeps the duty. And a hand-off applier keyed on the
+BARE handle (`ir_find_handle(arg_local)`) does nothing for a by-value struct argument, whose
+allocations are compound entries `(local, ".f")`: descend explicitly.
+
+**11d. Where a summary bit lives: `transfers_param` is a FLAG BYTE (BUG-1639).** 1/2 spawn
+(some / every path), 4 hand-off to an unseen callee, 8/16 a FIELD handed to a thread, 32 moves
+out of the pointee. A new per-parameter fact that fits a bit goes there — the allocation,
+change-detection in the fixpoint and the free are already wired; a new array means four more
+sites. A fact about a POINTER that is not a handle STATE (it must not make ordinary reads of
+the pointer an error) is a flag on `IRHandleInfo` joined in `ir_merge_entry_flags`, never a new
+`IR_HS_*`: every state is consulted by ~40 use checks.
+
+**11e. A fact keyed on a slot's ENTRY dies when the slot is reset — record the identity
+separately (BUG-1640).** The freed-global note asks "which global entries hold this
+allocation?" at the free. A callee that copies a global and then resets it
+(`H c = g; g.p = null; free(c.p)`) has dropped the entry by the time it frees, so the state
+holds nothing to find. Anything a SUMMARY wants to say about "what the global held at entry"
+needs a flow-insensitive side table written at the READ (`cur_minted_global`), not a query of
+the state at the free. Mint per LEAF with its own id: one id for a whole struct makes a free of
+one field look like a free of all of them.
+
+**11f. A call at the BASE of a projection has three consumers, not one (BUG-1642).** `geth().p`
+reaches the allocation tracker as (a) the key query (`ir_rebase_slice_index` call arm — the
+read), (b) the stable-aim query (`ir_ptr_stable_aim` — a pointer LOCAL the call was copied
+into), and (c) the view binding of the call RESULT (`view_root_gkey`, set at the call). The
+store spelling is hoisted into a temp by the target-before-value rule (BUG-1618), so only (b)
+and (c) see it. Teaching one consumer a new getter fact and testing the read spelling proves
+nothing about the other two. Also: a debugging trap — `ir_slot_read` runs AFTER the alias arms
+of IR_FIELD_READ and re-binds the destination to the slot entry's id, so an alias set by an
+earlier arm of the same handler is silently undone; fix such a gap where the fact is
+CONSUMED (the summary builder), not by re-ordering the transfer.
+
+**11g. A generated call is a STORE the summaries must know about (BUG-1643).** The async
+`_zer_async_T_init(&task, args…)` is emitted by the checker, has no `FuncSummary`, and writes
+its arguments into the task value. Every analysis that asks "where did this argument go?" —
+the store summary (`ir_ps_scan`), the carried entries (`ir_async_task_call`) — has to name it
+explicitly; a generated function the summary tables do not list is a function that stores
+nothing, so a helper wrapping it looked like a read-only call. When a new builtin writes a
+caller-supplied value into a caller-supplied object, add it to `ir_ps_scan` in the same change.
+
+**11h. A write-target query must see PART-writes of an aggregate (BUG-1647) and a lent
+parameter is a fact on the FUNCTION (BUG-1645).** `write_targets_of_node` follows a pointer
+name through its initializer and every reassignment; for a name that holds a struct / union /
+array BY VALUE the pointer lives in a FIELD, written by `gh.p = &g` — a part-write that the
+whole-name walk (`ast_name_writes`) never reports. `ast_name_writes_parts` hands the visitor the
+assigned value of a plain part-assignment; use it whenever the name is an aggregate (a
+pointer / slice / Handle name keeps the plain walk — its projections write the POINTEE). For
+the spawn-window rules, "g is lent" is not only a local fact: a helper that lends its pointer
+PARAMETER and touches a global by name is recorded per parameter (`Symbol.lent_globals`,
+fixpoint through callees) and the caller's argument is checked at the call
+(`check_alias_spawn_calls`). The BUG-1303 pair root must be resolved through a pointer local's
+borrow root (`alias_arg_root`), or a plain alias of the same object is a stranger.
+
+**12. Two strictness levels for "a place a view names" — do not merge them.**
+`ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key
+built from `&tbl[i]` names a different slot per evaluation and re-broke the valid teardown
+loop. `ir_place_summary_nameable` (flow-insensitive SUMMARIES, BUG-1633) accepts it, because
+`ir_ps_target_rec` spells a non-literal index `[*]` — "some element" — and a summary never
+claims more. A slice is nameable only as the ROOT (`&s[i]` with `s` a parameter that is
+never reassigned or address-taken): its elements are the caller's. Using the strict rule
+for summaries is the hole of BUG-1633; using the loose one for state keys is the regression
+of BUG-1621.
+
+**13. A promoted negative must be re-measured against the compiler just BEFORE the fix, not
+the session's oldest baseline.** Several BUG-1632..1634 negatives were already REJECTED by
+the previous compiler — for a different reason (a false "never freed" on the same program).
+`expect-error` is what makes them discriminate; a bare exit-code negative would have passed
+before and after. Likewise a `// expect-trap-at:` line is an offset into the FILE: adding a
+directive line above the code moves it (two trap tests failed the full run for exactly that).
+
+## Reachability for the interrupt-sharing rules (BUG-1608, 2026-10-15)
+
+**"Which context runs this body?" is a reachability question, and both ISR sharing sinks asked
+"which body was being checked?" instead.** A regular-code access is recorded while the checker
+walks each function body in turn, so a helper's own body is checked as regular code even when
+only an interrupt handler calls it. The interrupt side was already right (the ISR walk descends
+direct calls with `current_body` = the HANDLER's body, which is also what keeps two handlers
+sharing a helper distinct for `multi_isr`). The fix records the BODY with every regular-code
+access (`IsrGlobal.facc`; `MmioAccess.isr_body` already held it) and decides in the post pass,
+where the whole program is visible (`isrref_compute`). Two rules that keep it sound:
+- **Any reference that is not a DIRECT call disqualifies** — a funcptr value, a spawn target, a
+  global initializer. The walk records references by NAME across modules, so a collision can
+  only over-count callers (the conservative side).
+- **C must not be able to call it** — `static`, or the program has a ZER `main`. In a `--lib`
+  build the C side owns the entry point and may call any non-static function.
+A third sink that classifies code by context (the next one will appear) must ask the same
+`isrref_body_isr_only` question, not re-derive it.
+
+## The C variadic boundary and C-extern prototypes (BUG-1600..1602, 2026-10-13)
+
+**A variadic argument is converted to NOTHING — it crosses with its emitted C representation.**
+The fixed parameters of a C call get the usual coercions (slice -> `.ptr` for a `*T` param, the
+`*opaque` bridge), but the `...` tail has no parameter type, so whatever the emitter spells is
+what C receives. For a ZER aggregate that is a struct: `printf("%s %d", "ok", 5)` printed
+`ok 2` (the slice's `len` landed in `%d`'s slot) — and that was the DOCUMENTED example, passing
+its own test, because the test only checked the exit code. `variadic_arg_is_c_scalar` (checker,
+exhaustive) refuses every non-scalar; a STRING LITERAL is rewritten in the AST to `"…".ptr`
+(one spelling for all three call emitters — the same make-it-explicit-in-the-AST device as
+BUG-1516's array views). When a test exercises output, assert the OUTPUT (or an `snprintf`
+buffer), not the exit code.
+
+**Binding a C extern to its symbol under a private C name (BUG-1602).** A ZER declaration of a
+libc function is emitted as `T _zer_c_NAME(params) __asm__(USER_LABEL_PREFIX "NAME");` then
+`#undef NAME` / `#define NAME _zer_c_NAME`. Same linker symbol, different C identifier — so it
+can never be "conflicting types" with `<stdio.h>`/`<string.h>`/`<stdlib.h>`, which spell `char *`
+where ZER spells `uint8_t *`. Works with `--wrap=malloc` (the reference is still to `malloc`)
+and with GCC builtins/fortify (the alias bypasses the fortify wrapper; it calls the real
+function). NOT used with a `cinclude`: a user/vendor header may define the function as `static
+inline` (CMSIS `NVIC_EnableIRQ`), which has no symbol to bind to — a link error where today the
+header's definition is used. The hand-kept `is_cstdlib` skip list therefore still matters, but
+only in the `cinclude` case.
+
+**Removing an accidental refusal can turn a hole silent — re-probe what the old error was
+covering (BUG-1606).** The plain prototype's "conflicting types" error had been the ONLY thing
+refusing `i32 strcmp(const [*]u8 a, ...)` — a slice passed where C reads `char *`. BUG-1602
+removed the conflict, and the shape would have linked and run on garbage. Whenever a fix makes
+a previously loud failure compile, list what that failure was rejecting and check each shape
+is still refused for the RIGHT reason (`check_c_extern_signatures` now does, by intent).
+
+## The allocation tracker: a temp's dead entry, and ids that must be the same on every pass (BUG-1605)
+
+**A compiler temp redefined in a loop keeps its LAST iteration's entry unless something
+rebinds it.** Most transfers bind a destination only when it has no entry (`if (prev) return;`
+in the global-read mint), so on the back edge the temp still held the previous slot's FREED
+state and `if (gs[i]) |p| { free(p); }` over a global array was a "double free". Fix: an
+instruction that defines a TEMP drops the temp's entry first (temps are never leak-checked).
+Do NOT detect "stale" by comparing the entry before/after the transfer — that makes the
+transfer depend on the destination's own incoming state, and the fixpoint oscillated.
+
+**An id minted inside a loop must be the same on every pass.** A per-pass `_ir_next_alloc_id++`
+for an entry the loop's index write deletes (`gs[i]`, then `i += 1`) never converges ("did not
+converge within 96 iterations", which is itself a refusal). Mint from a stable source — the
+reading local (`IR_GLOBAL_READ_AID_BASE + dest`), the allocation's local (`local + 1`) —
+never from the counter, for anything re-created per iteration.
+
+## The 2026-10-12 audit (BUG-1566..1596) — what took a loop to find
+
+**"Is this a global?" is an IDENTITY question, never a NAME question (BUG-1568).** ~48 checker
+sites wrote `global_decl_lookup(c, name) != NULL`: "does a global of this name exist?". A local
+or parameter that merely shares a global's name (in this module or ANY imported one) was then
+program storage to every frame-escape sink — the shadowed name returned a dangling stack address
+at seven sinks. Use **`name_is_global_here(c, name, len)`**: the first declaration of the name on
+the current scope chain must BE the global's symbol (`== global_decl_lookup(...)`). Exception: a
+whole-program SCAN that walks ANOTHER function's body runs with the caller's scope chain, so there
+the name lookup (over-approximating "global") is the right call — do not convert scan sites. A
+site that already holds the resolved `Symbol *s` should compare `global_decl_lookup(...) == s`.
+
+**A fact recorded BY NAME is re-resolved where it is used, and a shadowing declaration in
+between re-aims it (BUG-1569).** `Symbol.borrow_root_name` (BUG-969), `th_borrow_names` and the
+block-lifetime carrier root are all names. A `static u32 v` nested between the record and the use
+made `v` mean the static, which "lends nothing". `name_is_shadowed_here` (distinct declarations of
+the name on the visible chain, the global counted when it is not the visible one) is the guard:
+refuse / treat conservatively where the answer matters. The durable fix is recording the Symbol.
+
+**Range narrowing from a CONDITION must come from an effect-free condition (BUG-1566).** The first
+draft of `vrp_push_cond_facts` proved `a[9]` from `if (i < 4 && (i = 9) > 0) { a[i] }`: the fact of
+the left conjunct was stale by the time the body ran. `vrp_cond_effect_free` (exhaustive, answers NO
+for any call / assignment / orelse / intrinsic) gates the whole condition. In the RHS of `&&`, the
+LHS facts are pushed and the count restored after; a store inside the RHS reaches every entry of
+its variable (BUG-1430), so the restore cannot resurrect a stale range. The new matrix cells pin it.
+
+**The emitter and the typed fold must compute the SAME shift (BUG-1577).** C does not apply the
+usual arithmetic conversions to `<<` / `>>`: the result has the PROMOTED LEFT operand's type. ZER
+types a shift like `+` (common type), and `tfold` folded at that width — so `u32 << u64` was
+proven at 64 bits and ran at 32, and VRP elided a check for an index the program never computed.
+Any operator whose C typing differs from ZER's needs its operand CONVERTED in the emitted C
+(`emit_shift_left_open`); grep the fold for every operator and confirm the emitter matches.
+
+**`*opaque` is a 16-byte struct in ZER and `void *` in C (BUG-1594).** A C extern declared in ZER
+with `*opaque` was called with the struct ABI. The fix cannot touch call sites (two emitter paths,
+plus funcptr guards): a C extern with an `*opaque` / `?*opaque` gets a `void *` C prototype, a
+`static inline _zer_xw_NAME` wrapper with the ZER signature, and `#define NAME(...)
+_zer_xw_NAME(__VA_ARGS__)` — every call site of every path is redirected by the preprocessor. With
+a `cinclude`, no prototype is emitted (the header's own `FILE *` / `char *` spelling would
+conflict); the wrapper's conversions are implicit C conversions. Related: **a bodyless function no
+module defines is a C symbol and has no module prefix** (BUG-1593, `unprefix_c_externs`, run at
+the end of the whole-program post passes) — before it, every extern declared in an imported
+module was emitted `mod__name` and could not link. `tests/test_lib.sh` is the gate.
+
+**A view set on a GLOBAL entry means different things for different producers (BUG-1575).** The
+global-store helper gives `(IR_GLOBAL_ROOT_ID, "g")` a view set for a call result that may be any
+of several allocations, and the dangling-global checks consult it — but Ring wildcard entries
+(BUG-1414) ALSO carry views, of values the Ring may no longer hold. Checking every global view set
+broke `ring_pop_read_ok_bug1414`. Views are honoured only on entries the helper marked
+(`IRHandleInfo.gstore_views`), and every re-binding of the entry clears the mark.
+
+**The atomic-cell window is a property of the THREADS, not of the text (BUG-1589).** It opened only
+at a spawn written earlier in the same function. `FuncProps.can_detach` (a fire-and-forget spawn,
+transitive) opens it after a call, at the top of a loop whose subtree can detach (the next
+iteration runs after the spawn), and at a label when anything in the function can detach (a
+backward goto). A helper that spawns and joins does not detach.
+
+**A bare `orelse return` returns NULL, not "something unclassifiable" (BUG-1596).** The return
+summary bailed on any return without a value local, which made one `x orelse return` in a
+function returning a param view register every call result as a fresh allocation (false leaks
+in every caller). A valueless return in a value-returning function is the null it returns.
+
 ## Merge-back methodology — consuming the `claude/*` fix tracker (2026-07-13..15)
 
 There are **41 unique soundness/miscompile/crash fixes** already FOUND + FIXED across

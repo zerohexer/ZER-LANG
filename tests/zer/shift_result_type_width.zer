@@ -1,0 +1,19 @@
+// BUG-1577: a shift is computed in its RESULT (common) type, like +; C shifted the narrower operand.
+u32 main() {
+    u8 a = 255;
+    u32 n = 8;
+    u32 x = a << n;
+    u32 n4 = 4;
+    u32 y = a << n4;
+    u32 c = 0xFFFFFFFF;
+    u64 m = 4;
+    u64 z = c << m;
+    u64 m40 = 40;
+    u32 one = 1;
+    u64 w = one << m40;
+    if (x != 65280) { return 1; }
+    if (y != 4080) { return 2; }
+    if (z != 0xFFFFFFFF0) { return 3; }
+    if (w != 1099511627776) { return 4; }
+    return 0;
+}

@@ -1,0 +1,9 @@
+// expect-error: task 't' would keep pointing at 'x'
+// BUG-1570: an async _init into an outer-block task with an inner-block pointer
+async void rd(*u32 p) { yield; *p += 1; }
+u32 main() {
+    _zer_async_rd t;
+    { u32 x = 7; _zer_async_rd_init(&t, &x); }
+    { u32 x = 100; _zer_async_rd_poll(&t); _zer_async_rd_poll(&t); return x; }
+    return 0;
+}

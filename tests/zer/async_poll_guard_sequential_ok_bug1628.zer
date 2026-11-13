@@ -1,0 +1,34 @@
+// BUG-1628 boundary: the re-entry guard is cleared at every exit of a poll — a
+// yield, an await that is not ready, a return, and an `orelse return` — so
+// ordinary sequential polling, re-`_init`, and one task polling ANOTHER task
+// from its body all keep working.
+u32 ticks;
+?u32 maybe(u32 v) { if (v > 100) { return null; } return v; }
+
+async u32 inner(u32 n) {
+    u32 acc = 0;
+    for (u32 i = 0; i < n; i += 1) { acc += i; yield; }
+    return acc;
+}
+
+async void outer() {
+    _zer_async_inner t;
+    _zer_async_inner_init(&t, 4);
+    while (_zer_async_inner_poll(&t) == 0) { ticks += 1; yield; }   // polls ANOTHER task
+    ticks += _zer_async_inner_result(&t);
+    u32 v = maybe(200) orelse return;                                 // early exit
+    ticks += v;
+}
+
+u32 main() {
+    _zer_async_outer o;
+    _zer_async_outer_init(&o);
+    u32 guard = 0;
+    while (_zer_async_outer_poll(&o) == 0) { guard += 1; if (guard > 100) { return 1; } }
+    if (ticks != 4 + 6) { return 2; }
+    _zer_async_outer_init(&o);          // re-init a FINISHED task
+    ticks = 0;
+    while (_zer_async_outer_poll(&o) == 0) { }
+    if (ticks != 10) { return 3; }
+    return 0;
+}

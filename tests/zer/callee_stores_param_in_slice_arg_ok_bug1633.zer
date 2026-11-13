@@ -1,0 +1,27 @@
+// BUG-1633 boundary: a callee stores its parameter into the caller's array
+// (directly and through an element view); the caller reads it back while it is
+// alive, resets the slot and frees — or frees through the slot.
+struct T { u32 v; }
+struct H { ?*T p; }
+void link([*]H s, *T p) { s[1].p = p; }
+void linkv([*]H s, *T p, u32 k) {
+    if (k >= s.len) { return; }
+    *H h = &s[k];
+    h.p = p;
+}
+u32 main() {
+    H[2] hs;
+    *T a = alloc(T) orelse return;
+    link(hs, a);
+    a.v = 3;
+    u32 r = 0;
+    if (hs[1].p) |z| { r = z.v - 3; }
+    hs[1].p = null;
+    free(a);
+
+    *T b = alloc(T) orelse return;
+    linkv(hs, b, 0);
+    if (hs[0].p) |z| { free(z); }
+    hs[0].p = null;
+    return r;
+}

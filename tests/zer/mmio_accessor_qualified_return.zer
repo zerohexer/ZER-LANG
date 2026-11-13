@@ -1,0 +1,16 @@
+// BUG-1598/1599: a top-level 'volatile *R reg()' parses as a function, and a
+// function returning @inttoptr is not reported as a leaked allocation.
+mmio 0x40000000..0x40000FFF;
+struct R { u32 v; }
+struct Cfg { u32 b; }
+Cfg gcfg;
+const *Cfg cfg() { return &gcfg; }
+volatile *R reg() { return @inttoptr(*R, 0x40000000); }
+const u32 K = 3;
+volatile u32 vflag;
+const [*]u8 msg = "hi";
+u32 main() {
+    const *Cfg c = cfg();
+    if (vflag == 99) { volatile *R r = reg(); r.v = 1; }
+    return c.b + K + (u32)msg.len - 5;
+}

@@ -1,0 +1,22 @@
+// BUG-1631 boundary: a struct with a callback handed to a thread BY POINTER is
+// accepted when every function the callback could be is race-free (here: they
+// touch only their argument, a shared struct, or nothing).
+shared struct Acc { u32 n; }
+Acc acc;
+struct Job { *(u32) -> u32 f; u32 arg; u32 out; }
+u32 twice(u32 x) { return x * 2; }
+u32 note(u32 x) { acc.n = x; return x; }
+void run(*Job j) { *(u32) -> u32 f = j.f; j.out = f(j.arg); }
+u32 main() {
+    Job a = { .f = twice, .arg = 21, .out = 0 };
+    ThreadHandle th = spawn run(&a);
+    th.join();
+    if (a.out != 42) { return 1; }
+    Job b = { .f = note, .arg = 7, .out = 0 };
+    ThreadHandle t2 = spawn run(&b);
+    t2.join();
+    if (b.out != 7) { return 2; }
+    u32 seen = acc.n;
+    if (seen != 7) { return 3; }
+    return 0;
+}

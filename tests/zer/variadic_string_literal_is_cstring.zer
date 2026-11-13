@@ -1,0 +1,12 @@
+// BUG-1600: a string literal in a variadic tail crosses as a C string. It used to
+// cross as the {ptr,len} slice struct, so `%d` after a `%s` read the literal's
+// hidden LENGTH: snprintf("%s %d", "ok", 5) produced "ok 2".
+i32 snprintf(*u8 buf, usize n, const *u8 fmt, ...);
+u8[32] buf;
+u32 main() {
+    i32 n = snprintf(&buf[0], 32, "%s %d", "ok", 5);
+    if (n != 4) { return 1; }
+    if (buf[0] != 'o' || buf[1] != 'k' || buf[2] != ' ') { return 2; }
+    if (buf[3] != '5') { return 3; }
+    return 0;
+}

@@ -1,0 +1,6 @@
+// expect-error: cannot store pointer to local 'x' in static/global variable 'gp'
+// BUG-1568: a local / param sharing a GLOBAL name was program storage to the escape sinks.
+u32 x = 1;
+?*u32 gp = null;
+void f() { u32 x = 7; gp = &x; }
+u32 main() { f(); return 0; }

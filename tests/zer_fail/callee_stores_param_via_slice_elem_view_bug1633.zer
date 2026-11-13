@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'hs[1].p' is freed
+// BUG-1633: the same store written through a VIEW of the element. A store
+// summary could name a view of a pointer param's field (BUG-1624) but not a
+// view of a slice param's element.
+struct T { u32 v; }
+struct H { ?*T p; }
+void link([*]H s, *T p) { *H h = &s[1]; h.p = p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    link(hs, a);
+    free(a);
+    if (hs[1].p) |z| { z.v = 99; }
+    return 0;
+}

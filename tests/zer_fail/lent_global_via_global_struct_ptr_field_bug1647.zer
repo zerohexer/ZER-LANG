@@ -1,0 +1,13 @@
+// expect-error: is lent to a scoped spawn
+struct H { ?*u32 p; }
+u32 g;
+H gh;
+void w(*u32 p) { for (u32 i = 0; i < 100000; i += 1) { *p += 1; } }
+void poke() { if (gh.p) |q| { for (u32 i = 0; i < 100000; i += 1) { *q += 1; } } }
+u32 main() {
+    gh.p = &g;
+    ThreadHandle th = spawn w(&g);
+    poke();
+    th.join();
+    return 0;
+}

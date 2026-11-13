@@ -1,0 +1,12 @@
+// BUG-1576: pool.free_ptr passed a generation-0 'handle' — the null-handle no-op — so it never freed.
+struct T { u32 v; }
+Pool(T, 1) pool;
+u32 main() {
+    *T a = pool.alloc_ptr() orelse return;
+    a.v = 1;
+    pool.free_ptr(a);
+    *T b = pool.alloc_ptr() orelse { return 7; };
+    b.v = 2;
+    pool.free_ptr(b);
+    return 0;
+}

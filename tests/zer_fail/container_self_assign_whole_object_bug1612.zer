@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: @container: the pointer is the address of a whole object
+// BUG-1612: `p = p;` erased the whole-object fact, and @container then read
+// before the object (ASan stack-buffer-underflow).
+struct L { u32 n; }
+struct E { u64 q; u64 r; L l; }
+u32 main() { L solo; *L p = &solo; p = p; *E e = @container(*E, p, l); e.q = 1; return 0; }

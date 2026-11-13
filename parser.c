@@ -145,6 +145,51 @@ static size_t tok_len(Token *t) { return t->length; }
 /* ---- Forward declarations ---- */
 static Node *parse_expression(Parser *p);
 static Node *parse_unary(Parser *p);
+/* BUG-1581: a fresh copy of a range-for collection path (ident / field chain). */
+static Node *range_for_clone_path(Parser *p, Node *src) {
+    if (!src) return NULL;
+    Node *c = new_node(p, src->kind);
+    c->loc = src->loc;
+    if (src->kind == NODE_IDENT) {
+        c->ident.name = src->ident.name;
+        c->ident.name_len = src->ident.name_len;
+    } else if (src->kind == NODE_FIELD) {
+        c->field.object = range_for_clone_path(p, src->field.object);
+        c->field.field_name = src->field.field_name;
+        c->field.field_name_len = src->field.field_name_len;
+    } else {
+        *c = *src;   /* rejected before the clone is used */
+    }
+    return c;
+}
+
+static TypeNode *parse_type(Parser *p);
+/* BUG-1598: at top level, `const` / `volatile` starts either a global or a function
+ * with a qualified return type. Parse the type for real (errors suppressed, state
+ * restored) and ask whether a name and `(` follow. */
+static bool qualified_toplevel_is_func(Parser *p) {
+    Scanner saved_sc = *p->scanner;
+    Token saved_cur = p->current;
+    Token saved_prev = p->previous;
+    bool saved_error = p->had_error;
+    bool saved_panic = p->panic_mode;
+    p->had_error = false;
+    p->panic_mode = true;          /* suppress diagnostics of the speculative parse */
+    advance(p);                    /* the qualifier */
+    parse_type(p);
+    bool is_func = !p->had_error && check(p, TOK_IDENT);
+    if (is_func) {
+        advance(p);
+        is_func = check(p, TOK_LPAREN);
+    }
+    *p->scanner = saved_sc;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    p->had_error = saved_error;
+    p->panic_mode = saved_panic;
+    return is_func;
+}
+
 static Node *parse_statement(Parser *p);
 static Node *parse_block(Parser *p);
 static Node *parse_declaration(Parser *p);
@@ -1739,23 +1784,26 @@ static Node *parse_for_stmt(Parser *p) {
              * __ri was silently shadowed. Reserved prefix makes it a compile error
              * for the user to declare a colliding name. */
 
-            /* Reject non-trivial collection expressions — must be ident or field access */
-            if (collection->kind != NODE_IDENT && collection->kind != NODE_FIELD) {
-                error(p, "for-in collection must be a variable or field — "
-                      "assign complex expression to a variable first");
+            /* Reject non-trivial collection expressions — must be a variable or a
+             * field PATH of one. BUG-1581: only the OUTER node was checked, so
+             * `pick().a` / `hs[k].s` passed and the desugar re-evaluated the
+             * object at the length snapshot AND at every iteration (`pick()`
+             * called n+1 times; `hs[k].s` indexed a different collection once
+             * the body changed k, against the length captured at the start). */
+            {
+                Node *cr = collection;
+                while (cr && cr->kind == NODE_FIELD) cr = cr->field.object;
+                if (!cr || cr->kind != NODE_IDENT) {
+                    error(p, "for-in collection must be a variable or a field path of "
+                          "one (a.b.c) — assign a call / element / complex expression to "
+                          "a variable first");
+                }
             }
 
-            /* Helper: clone collection ident/field for separate AST positions */
-            #define CLONE_COLLECTION() ({ \
-                Node *_c = new_node(p, collection->kind); \
-                if (collection->kind == NODE_IDENT) { \
-                    _c->ident.name = collection->ident.name; \
-                    _c->ident.name_len = collection->ident.name_len; \
-                } else { \
-                    _c->field.object = collection->field.object; \
-                    _c->field.field_name = collection->field.field_name; \
-                    _c->field.field_name_len = collection->field.field_name_len; \
-                } _c; })
+            /* Helper: DEEP-clone the ident / field path for each AST position (a
+             * shared sub-node is the anti-pattern CLAUDE.md forbids: a later
+             * in-place rewrite of one copy would change the others). */
+            #define CLONE_COLLECTION() range_for_clone_path(p, collection)
             #define MKREF_RI() ({ Node *_r = new_node(p, NODE_IDENT); _r->ident.name = "_zer_ri"; _r->ident.name_len = 7; _r->ident.is_synthetic = true; _r; })
 
             /* for init: usize _zer_ri = 0 */
@@ -3271,84 +3319,18 @@ static Node *parse_declaration_rest(Parser *p) {
         return n;
     }
 
-    /* const global variable or function with const return type */
-    if (check(p, TOK_CONST)) {
-        /* peek ahead: const TYPE NAME '(' → function with const return type */
-        Scanner saved_sc = *p->scanner;
-        Token saved_cur = p->current;
-        Token saved_prev = p->previous;
-        advance(p); /* consume const */
-        int depth = 0;
-        bool found_func = false;
-        while (!check(p, TOK_EOF)) {
-            if (check(p, TOK_LBRACKET)) { depth += 1; advance(p); continue; }
-            if (check(p, TOK_RBRACKET)) { if (depth > 0) depth -= 1; advance(p); continue; }
-            if (depth == 0 && check(p, TOK_IDENT)) {
-                advance(p);
-                found_func = check(p, TOK_LPAREN);
-                break;
-            }
-            if (check(p, TOK_STAR) || check(p, TOK_QUESTION)) { advance(p); continue; }
-            if (p->current.type >= TOK_U8 && p->current.type <= TOK_VOID) { advance(p); continue; }
-            break;
-        }
-        *p->scanner = saved_sc;
-        p->current = saved_cur;
-        p->previous = saved_prev;
-        if (found_func) {
+    /* const / volatile global variable, or a function with a qualified return type.
+     * BUG-1598: decided by a SPECULATIVE parse of the real type. The two hand-rolled
+     * lookaheads took the FIRST identifier as the declared name, so a user type
+     * (`volatile *Reg reg() { … }`, `const *Cfg get() { … }`), a container stamp or
+     * a function-pointer type parsed as a variable and the program was a syntax
+     * error ("expected ';' after variable declaration"). */
+    if (check(p, TOK_CONST) || check(p, TOK_VOLATILE)) {
+        bool is_const = check(p, TOK_CONST);
+        if (qualified_toplevel_is_func(p))
             return parse_func_or_var(p, false);
-        } else {
-            advance(p); /* re-consume const */
-            Node *n = parse_var_decl(p, true, false, false);
-            n->kind = NODE_GLOBAL_VAR;
-            return n;
-        }
-    }
-
-    /* volatile global variable or function with volatile return type */
-    if (check(p, TOK_VOLATILE)) {
-        /* peek ahead: volatile TYPE NAME '(' → function with volatile return type.
-         * Otherwise → volatile variable declaration. */
-        Scanner saved_sc = *p->scanner;
-        Token saved_cur = p->current;
-        Token saved_prev = p->previous;
-        advance(p); /* consume volatile */
-        /* skip the type tokens */
-        int depth = 0;
-        while (!check(p, TOK_EOF)) {
-            if (check(p, TOK_LBRACKET)) { depth += 1; advance(p); continue; }
-            if (check(p, TOK_RBRACKET)) { if (depth > 0) depth -= 1; advance(p); continue; }
-            if (depth == 0 && check(p, TOK_IDENT)) {
-                advance(p); /* consume the name */
-                bool is_func = check(p, TOK_LPAREN);
-                /* restore scanner */
-                *p->scanner = saved_sc;
-                p->current = saved_cur;
-                p->previous = saved_prev;
-                if (is_func) {
-                    return parse_func_or_var(p, false);
-                } else {
-                    advance(p); /* re-consume volatile */
-                    Node *n = parse_var_decl(p, false, false, true);
-                    n->kind = NODE_GLOBAL_VAR;
-                    return n;
-                }
-            }
-            if (check(p, TOK_STAR) || check(p, TOK_QUESTION)) {
-                advance(p); continue;
-            }
-            /* type keyword — skip */
-            if (p->current.type >= TOK_U8 && p->current.type <= TOK_VOID) {
-                advance(p); continue;
-            }
-            break;
-        }
-        /* fallback: restore and treat as var decl */
-        *p->scanner = saved_sc;
-        p->current = saved_cur;
-        p->previous = saved_prev;
-        advance(p); /* re-consume volatile */
-        Node *n = parse_var_decl(p, false, false, true);
+        advance(p); /* consume the qualifier */
+        Node *n = parse_var_decl(p, is_const, false, !is_const);
         n->kind = NODE_GLOBAL_VAR;
         return n;
     }

@@ -1,0 +1,32 @@
+// BUG-1634 boundary: a two-hop teardown that frees and resets each field of the
+// caller's struct. Before the fix the outer summary recorded no free, so this
+// valid program was refused as a LEAK ("never freed" / "overwritten while
+// alive"). A read-only two-hop walk must leave the entries usable, and a free
+// under one global slot must not touch a sibling slot.
+struct T { u32 v; }
+struct H { ?*T p; }
+struct Ctx { H h; H h2; }
+Ctx g;
+void zap(*H h) { if (h.p) |q| { free(q); } h.p = null; }
+u32 peek(*H h) { if (h.p) |q| { return q.v; } return 0; }
+void cleanup(*Ctx c) { zap(&c.h); zap(&c.h2); }
+u32 look(*Ctx c) { return peek(&c.h); }
+void dropg() { zap(&g.h); }
+u32 main() {
+    Ctx c;
+    c.h.p = alloc(T);
+    c.h2.p = alloc(T);
+    cleanup(&c);
+    c.h.p = alloc(T);
+    c.h2.p = alloc(T);
+    if (c.h.p) |z| { z.v = 4; }
+    u32 r = look(&c) - 4;
+    cleanup(&c);
+
+    g.h.p = alloc(T);
+    dropg();
+    g.h.p = alloc(T);
+    r += peek(&g.h);
+    dropg();
+    return r;
+}

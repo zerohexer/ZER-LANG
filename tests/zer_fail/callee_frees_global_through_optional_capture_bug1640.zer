@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1640: the same through the capture of an OPTIONAL struct global
+// (`if (g_h) |c| { free(c.p); }`).
+struct T { u32 v; }
+struct H { *T p; u32 n; }
+?H g_h;
+void drop() { if (g_h) |c| { free(c.p); } g_h = null; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H h = { .p = a, .n = 1 };
+    g_h = h;
+    drop();
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    a.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

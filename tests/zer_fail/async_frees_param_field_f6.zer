@@ -1,0 +1,16 @@
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1573: an async body freeing a FIELD of its param was invisible to the caller.
+struct T { u32 v; }
+struct H { *T p; }
+async void rel(H h) {
+    free(h.p);
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H h = { .p = a };
+    _zer_async_rel task;
+    _zer_async_rel_init(&task, h);
+    _zer_async_rel_poll(&task);
+    free(a);
+    return 0;
+}

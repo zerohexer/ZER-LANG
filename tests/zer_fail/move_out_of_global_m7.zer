@@ -1,0 +1,11 @@
+// expect-error: a move struct out of global 'g'
+// BUG-1572: a move out of a GLOBAL move struct was untracked (double move / UAF of the moved payload).
+move struct Tok { u32 k; }
+Tok g;
+void consume(Tok t) { }
+u32 main() {
+    g.k = 5;
+    consume(g);
+    consume(g);
+    return g.k;
+}

@@ -1,0 +1,20 @@
+// BUG-1640 boundary: a read-only copy of a global struct, a copy whose OTHER field
+// is freed (per-field slots, not the whole struct), and a copy the caller frees
+// itself afterwards — none of them frees what `a` points at in the caller.
+struct T { u32 v; }
+struct H { ?*T p; ?*T r; }
+H g_h;
+u32 look() { H c = g_h; if (c.p) |q| { return q.v; } return 0; }
+void drop_r() { H c = g_h; if (c.r) |q| { free(q); } g_h.r = null; }
+void drop_p() { H c = g_h; if (c.p) |q| { free(q); } g_h.p = null; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 4;
+    g_h.p = a;
+    u32 r = look();
+    drop_r();
+    r += a.v;
+    drop_p();
+    if (r != 8) { return 1; }
+    return 0;
+}

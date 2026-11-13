@@ -1,0 +1,15 @@
+// BUG-1596: a bare 'orelse return' (null) no longer makes a param-view return look like a fresh allocation.
+?*opaque op() { return null; }
+void cl(*opaque x) { }
+u8[8] g;
+?[*]u8 head([*]u8 b, usize n) {
+    ?*opaque mx = op();
+    *opaque x = mx orelse return;
+    cl(x);
+    if (n > b.len) { return null; }
+    return b[0..n];
+}
+u32 main() {
+    if (head(g, 3)) |s| { if (s.len != 3) { return 1; } }
+    return 0;
+}

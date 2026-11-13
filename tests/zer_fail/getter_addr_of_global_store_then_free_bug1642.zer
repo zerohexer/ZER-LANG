@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'g_h.p' is freed
+// BUG-1642: the STORE spelling — `geth().p = a;` (and `*H hp = geth(); hp.p = a;`)
+// fills the global's slot through the getter; freeing `a` then reading the global
+// reads a recycled object. The pointer returned by the getter is a view of g_h.
+struct T { u32 v; }
+struct H { ?*T p; }
+H g_h;
+*H geth() { return &g_h; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *H hp = geth();
+    hp.p = a;
+    free(a);
+    if (g_h.p) |z| { z.v = 1; }
+    return 0;
+}

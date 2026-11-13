@@ -1,0 +1,15 @@
+// expect-error: but the cell is 'u16'
+// BUG-1586: atomic VALUE operands were never typed against the cell (silent narrowing, float->int UB).
+u16 g16;
+u32 g32;
+u32 main() {
+    u32 big = 70000;
+    @atomic_store(&g16, big);
+    i32 n = -5;
+    @atomic_store(&g32, n);
+    f64 f = 1.0e20;
+    @atomic_store(&g32, f);
+    u32 a = g32;
+    @atomic_store(&g32, true);
+    return (u32)g16 + a;
+}

@@ -1,0 +1,21 @@
+// Promoted from tests/zer_gaps/audit_2026-06-17_defer_goto_fallthrough_drops.zer (2026-11-13): filed as a gap, measured correct.
+// A defer in a scope with a goto exit still fires on the sibling fall-through exit.
+i32 g_called = 0;
+void mark() { g_called += 1; }
+
+u32 multi_path(u32 x) {
+    if (x > 0) {
+        defer mark();
+        if (x == 1) { goto done; }
+        // fall-through here — should fire mark()
+    }
+    return 100;
+done:
+    return 200;
+}
+i32 main() {
+    multi_path(5);
+    multi_path(1);
+    if (g_called != 2) { return 1; }
+    return 0;
+}

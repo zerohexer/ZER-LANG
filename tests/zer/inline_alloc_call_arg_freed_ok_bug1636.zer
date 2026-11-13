@@ -1,0 +1,13 @@
+// BUG-1636 boundary: the callee frees the inline allocation (drop), or keeps it
+// in a global the caller then frees — neither is a leak.
+struct T { u32 v; }
+?*T g;
+void drop(*T p) { free(p); }
+void keep_it(*T p) { g = p; }
+u32 main() {
+    drop(alloc(T) orelse return);
+    keep_it(alloc(T) orelse return);
+    if (g) |q| { free(q); }
+    g = null;
+    return 0;
+}

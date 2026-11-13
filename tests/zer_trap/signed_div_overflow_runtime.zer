@@ -1,0 +1,9 @@
+// expect-trap
+// expect-trap-msg: signed division overflow
+// Promoted from tests/zer_gaps/ast_signed_div_overflow.zer (2026-11-13): this was filed as a gap but
+// the guarantee holds — the program compiles and the runtime check fires.
+i32 main() {
+    i32 a = -2147483648;
+    i32 b = -1;
+    return a / b;
+}

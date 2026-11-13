@@ -1,0 +1,8 @@
+// BUG-1583: a string literal spanning a line keeps the newline byte (emitted as an escape).
+u32 main() {
+    const [*]u8 s = "ab
+cd";
+    if (s.len != 5) { return 1; }
+    if (s[2] != 10) { return 2; }
+    return 0;
+}

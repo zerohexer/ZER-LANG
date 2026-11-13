@@ -1,0 +1,5 @@
+// expect-error: unterminated block comment
+// BUG-1582: an unterminated /* silently swallowed the rest of the file.
+u32 main() { return 0; }
+/* unterminated
+static_assert(1 == 2, "must fail");

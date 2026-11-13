@@ -339,6 +339,12 @@ struct Symbol {
      * object as both is a race the callee's own borrow check cannot see. */
     unsigned short *alias_pairs;   /* (lent i << 8) | used j */
     int alias_pair_n, alias_pair_cap;
+    /* BUG-1645: pairs (param i, GLOBAL g) — param i is lent to a scoped spawn (here
+     * or in a callee) while the function touches the plain global g BY NAME before
+     * the join. A caller that passes `&g` as param i hands the thread the very
+     * object the window writes: the borrow check sees only the param side. */
+    struct LentGlobal { unsigned char param; Symbol *g; } *lent_globals;
+    int lent_glob_n, lent_glob_cap;
     /* BUG-1303: a pointer / slice LOCAL that holds this function's param n-1
      * (`*u32 q = b;`); 0 = none. */
     int param_alias_pos1;
@@ -403,6 +409,7 @@ struct Symbol {
         bool in_progress;    /* true = DFS in progress (cycle detection) */
         bool can_yield;      /* body contains yield/await (directly or transitively) */
         bool can_spawn;      /* body contains spawn (directly or transitively) */
+        bool can_detach;     /* BUG-1589: a FIRE-AND-FORGET spawn (no ThreadHandle), directly or transitively — a thread still running when the call returns */
         bool can_alloc;      /* body contains slab.alloc/Task.new (directly or transitively) */
         bool has_sync;       /* body contains @atomic_* or @barrier (absorbs has_atomic_or_barrier) */
         bool can_enable_int; /* BUG-1251: re-enables / waits for interrupts (directly or transitively) */

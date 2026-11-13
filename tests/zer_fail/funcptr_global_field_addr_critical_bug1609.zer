@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: cannot spawn inside @critical block
+// BUG-1609: `&ops.f` hands out the address of PART of the global; the store
+// through it rebinds the function pointer with no assignment naming `ops`.
+void w() { }
+void nop() { }
+void sp() { spawn w(); }
+struct Ops { *() f; }
+Ops ops = { .f = nop };
+void rebind(**() slot) { *slot = sp; }
+u32 main() {
+    rebind(&ops.f);
+    @critical { ops.f(); }
+    return 0;
+}

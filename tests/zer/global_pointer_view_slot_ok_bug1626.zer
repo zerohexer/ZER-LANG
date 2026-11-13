@@ -1,0 +1,15 @@
+// BUG-1626 boundary: store / read / free / reset through a stable global pointer
+// and through the global it designates are one slot — valid teardown compiles.
+struct T { u32 v; }
+struct H { ?*T p; }
+H g_h;
+*H gp = &g_h;
+void drop() { if (gp.p) |q| { free(q); } gp.p = null; }
+u32 main() {
+    gp.p = alloc(T);
+    if (gp.p) |q| { q.v = 4; }
+    u32 r = 0;
+    if (g_h.p) |q| { r = q.v; }
+    drop();
+    return r - 4;
+}

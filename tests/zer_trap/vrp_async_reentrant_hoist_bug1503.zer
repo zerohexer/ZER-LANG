@@ -1,7 +1,9 @@
 // expect-trap
-// expect-trap-at: 14
-// BUG-1503: the hoisted guard tested i BEFORE f() re-polled this task and set
-// i = 4 in the other arm; the access carries its own inline check now.
+// expect-trap-at: 13
+// expect-trap-msg: polled while it is already running
+// BUG-1503 -> BUG-1628: f() re-polls this task; that used to set i = 4 in the
+// other arm before the access ran. The re-entrant poll itself traps now (the
+// reported line is the async function's declaration).
 u32[4] arr;
 u32[64] pad;
 u32 get(u32 a) { return a; }

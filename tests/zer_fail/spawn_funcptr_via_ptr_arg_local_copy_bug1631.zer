@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: carries a function pointer whose target the compiler cannot resolve
+// BUG-1631: a callback reached through a POINTER spawn argument, called through a
+// local copy of the field — the thread can run any function of that type.
+u32 g;
+void bump() { for (u32 i = 0; i < 100000; i += 1) { g += 1; } }
+struct O { *() f; }
+void w(*O p) { *() f = p.f; f(); }
+u32 main() {
+    O o = { .f = bump };
+    ThreadHandle th = spawn w(&o);
+    bump();
+    th.join();
+    return 0;
+}

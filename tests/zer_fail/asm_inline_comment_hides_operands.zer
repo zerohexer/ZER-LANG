@@ -1,0 +1,8 @@
+// expect-error: asm operands in the inline asm
+// BUG-1580: a C comment in inline asm text hid the operand colons from the raw-text check.
+struct S { u32[4] a; u32 victim; }
+S s;
+naked void f() {
+    asm("movl $99, %0" /* " */ : "=r"(s.a[4]) /* " */);
+}
+u32 main() { f(); return s.victim; }

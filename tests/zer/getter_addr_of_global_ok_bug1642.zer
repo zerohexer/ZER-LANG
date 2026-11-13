@@ -1,0 +1,30 @@
+// BUG-1642 boundary: freeing through the getter and resetting the global is fine; a
+// DIFFERENT global's slot is untouched; a getter with two different returns is not
+// summarised (no claim); a scalar field read through the getter aliases nothing.
+struct T { u32 v; }
+struct H { ?*T p; u32 n; }
+H g_h;
+H g_o;
+*H geth() { return &g_h; }
+*H pick(u32 c) { if (c > 1) { return &g_h; } return &g_o; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    g_o.p = a;
+    *T b = alloc(T) orelse return;
+    g_h.p = b;
+    *T q = geth().p orelse return;
+    free(q);
+    g_h.p = null;
+    u32 r = a.v;
+    if (g_o.p) |z| { free(z); }
+    g_o.p = null;
+    g_h.n = 3;
+    r += geth().n;
+    *T c = alloc(T) orelse return;
+    g_h.p = c;
+    *T d = pick(1).p orelse return;
+    free(d);
+    g_h.p = null;
+    g_o.p = null;
+    return r - 3;
+}

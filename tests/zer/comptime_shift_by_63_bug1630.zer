@@ -1,0 +1,20 @@
+// BUG-1630: a comptime shift by exactly 63 on a 64-bit operand folds (it was
+// "could not be evaluated" while counts 62 and 64 worked).
+comptime u64 top(u64 v) { return v >> 63; }
+comptime u64 lowtop(u64 v) { return (v << 63) >> 63; }
+comptime i64 sgn(i64 v) { return v >> 63; }
+comptime u64 two(u64 v) { return v << 63; }
+u64 rt_top(u64 v) { return v >> 63; }
+u64 hide(u64 x) { u64 r = 0; for (u32 i = 0; i < 64; i += 1) { r = r | (x & ((u64)1 << i)); } return r; }
+u32 main() {
+    u64 a = top(8);
+    if (a != 0) { return 1; }
+    u64 b = top(0xFFFF_FFFF_FFFF_FFFF);
+    if (b != 1) { return 2; }
+    if (b != rt_top(hide(0xFFFF_FFFF_FFFF_FFFF))) { return 3; }
+    u64 c = two(2);                 // 2 << 63 == 0 at u64
+    if (c != 0) { return 4; }
+    i64 d = sgn(5);
+    if (d != 0) { return 5; }
+    return 0;
+}

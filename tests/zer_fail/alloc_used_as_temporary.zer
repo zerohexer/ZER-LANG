@@ -1,0 +1,8 @@
+// expect-error: this allocation is used only as a temporary
+// BUG-1597: an allocation consumed inline was never registered — a silent leak.
+struct T { u32 v; }
+u32 main() {
+    (alloc(T) orelse return).v = 3;
+    u32 r = (alloc(T) orelse return).v;
+    return r;
+}

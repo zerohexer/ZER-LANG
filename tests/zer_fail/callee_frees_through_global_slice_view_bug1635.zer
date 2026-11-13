@@ -1,0 +1,27 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1635: a callee frees through a slice VIEW of a global array. `s[i]`
+// (a view starting at element 0) is `tbl[i]` — before the fix the free keyed
+// the slice local, the callee's summary named no freed global, and `a` stayed
+// ALIVE: the write below landed in the recycled slot of `b` (returned 99).
+struct T { u32 v; }
+struct H { ?*T p; }
+H[4] tbl;
+void drop() {
+    [*]H s = tbl[0..];
+    for (u32 i = 0; i < 4; i += 1) {
+        if (s[i].p) |q| { free(q); }
+        s[i].p = null;
+    }
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    tbl[1].p = a;
+    drop();
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    a.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

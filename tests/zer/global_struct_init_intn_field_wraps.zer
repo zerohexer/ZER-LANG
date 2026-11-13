@@ -1,0 +1,13 @@
+// BUG-1579: a uN/iN FIELD of a global struct initializer is folded and wrapped to the field's width.
+struct S { u3 b; i5 d; u32 w; }
+const u3 C3 = 7;
+const i5 D5 = 15;
+S gs = { .b = C3 * 3, .d = D5 + 1, .w = 4000000000 };
+u32 main() {
+    u32 b = (u32)gs.b;
+    i32 d = (i32)gs.d;
+    if (b != 5) { return 1; }
+    if (d != -16) { return 2; }
+    if (gs.w != 4000000000) { return 3; }
+    return 0;
+}

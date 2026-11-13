@@ -717,10 +717,29 @@ static void hoist_target_indices(LowerCtx *ctx, Node *t, Node *value, Node *body
     }
     case NODE_FIELD: hoist_target_indices(ctx, t->field.object, value, body); return;
     case NODE_UNARY: hoist_target_indices(ctx, t->unary.operand, value, body); return;
+    case NODE_SLICE: {
+        /* BUG-1618: a BIT-SLICE store `a[i][hi..lo] = v` is a target too — its
+         * object's indices and its own bit positions are evaluated before the
+         * value. The slice was a leaf here, so `a[i][3..0] = @truncate(u4,
+         * bump(&i));` read `i` after `bump` moved it: a read-modify-write of
+         * a[4000] with the proven index's check elided. */
+        hoist_target_indices(ctx, t->slice.object, value, body);
+        Node **bp[2] = { &t->slice.start, &t->slice.end };
+        for (int k = 0; k < 2; k++) {
+            Node *bx = *bp[k];
+            if (bx && index_clobbered_by(ctx, bx, value, body)) {
+                int id = lower_expr(ctx, bx);
+                id = snapshot_operand(ctx, id, t->loc.line);
+                if (id >= 0)
+                    *bp[k] = make_local_ident(ctx, &ctx->func->locals[id], bx->loc);
+            }
+        }
+        return;
+    }
     case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
     case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
-    case NODE_SLICE: case NODE_STRUCT_INIT: case NODE_TYPECAST: case NODE_CAST:
+    case NODE_STRUCT_INIT: case NODE_TYPECAST: case NODE_CAST:
     case NODE_SIZEOF:
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
@@ -929,9 +948,19 @@ static void hoist_place_effects(LowerCtx *ctx, Node *n) {
         /* a value computed at the root (`pick()`, `mk()`): once, here */
         if (lower_value_needs_single_eval(ctx, n)) hoist_place_to_temp(ctx, n, false);
         return;
+    case NODE_SLICE:
+        /* BUG-1618: a bit-slice place `obj[hi..lo]` — the object's parts, then
+         * the two bit positions, once each and in source order
+         * (`brr[f()][3..0] = g()`, `r[f()+2 .. f()-1] = v`). */
+        hoist_place_effects(ctx, n->slice.object);
+        if (n->slice.start && !hoist_place_part_const(n->slice.start))
+            hoist_place_to_temp(ctx, n->slice.start, true);
+        if (n->slice.end && !hoist_place_part_const(n->slice.end))
+            hoist_place_to_temp(ctx, n->slice.end, true);
+        return;
     case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
-    case NODE_SLICE: case NODE_STRUCT_INIT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_STRUCT_INIT: case NODE_CAST: case NODE_SIZEOF:
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
@@ -3772,6 +3801,24 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                             }
                             if (!rt) rt = ty_i32;
                         }
+                        /* BUG-1618: THE TARGET IS EVALUATED BEFORE THE VALUE here
+                         * too. This path lowered the orelse into a temp and then
+                         * stored through the untouched target, skipping both
+                         * hoists the ordinary assignment arm makes (BUG-1184 /
+                         * BUG-1372) — so `a[i] = mb(&i) orelse 0;` ran `mb` first
+                         * and stored at the index it left behind: the checker had
+                         * proven `i` at the statement's start, the check was
+                         * elided, and the write landed at a[4000]. */
+                        pre_lower_orelse(ctx, &expr->assign.target, node->loc.line);
+                        tgt = expr->assign.target;
+                        if (lower_place_needs_single_eval(ctx, tgt))
+                            hoist_place_effects(ctx, tgt);
+                        if (lower_may_write(orelse)) {
+                            Node *fb = (ctx->func->ast_node &&
+                                        ctx->func->ast_node->kind == NODE_FUNC_DECL)
+                                ? ctx->func->ast_node->func_decl.body : ctx->func->ast_node;
+                            hoist_target_indices(ctx, tgt, orelse, fb);
+                        }
                         int tmp = create_temp(ctx, rt, node->loc.line);
                         lower_orelse_to_dest(ctx, tmp, orelse, node->loc.line);
                         IRLocal *tloc = &ctx->func->locals[tmp];
@@ -4054,6 +4101,22 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * step typically writes its primary root). */
             CondLock step_lock = emit_shared_lock_around_cond_ex(ctx,
                 node->for_stmt.step, node->loc.line, true);
+            /* BUG-1618: a step that is an assignment evaluates its TARGET before
+             * its value like any other (`for (..; ..; a[i] = mb(&i) orelse 0)`).
+             * The step is a passthrough, so it makes the two target hoists of
+             * the ordinary assignment arm here, before the value's orelse is
+             * pre-lowered. */
+            if (node->for_stmt.step->kind == NODE_ASSIGN) {
+                Node *sa = node->for_stmt.step;
+                if (lower_place_needs_single_eval(ctx, sa->assign.target))
+                    hoist_place_effects(ctx, sa->assign.target);
+                if (lower_may_write(sa->assign.value)) {
+                    Node *fb = (ctx->func->ast_node &&
+                                ctx->func->ast_node->kind == NODE_FUNC_DECL)
+                        ? ctx->func->ast_node->func_decl.body : ctx->func->ast_node;
+                    hoist_target_indices(ctx, sa->assign.target, sa->assign.value, fb);
+                }
+            }
             /* Step may contain orelse: `for (..; ..; x = next() orelse 0)` */
             pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);

@@ -1,0 +1,18 @@
+// expect-error: dangling global
+// BUG-1575: a CALL result stored into a global registered no alias / view of the allocation.
+struct T { u32 v; }
+?*T g;
+*T id(*T x) { return x; }
+u32 rd() { if (g) |q| { return q.v; } return 0; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    g = id(a);
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = rd();
+    free(b);
+    g = null;
+    return r;
+}

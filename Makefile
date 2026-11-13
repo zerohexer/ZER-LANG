@@ -217,6 +217,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_ir_validate
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh
+	@echo "=== Standard library self-test ==="
+	@bash tests/test_lib.sh
 	@echo "=== ZER integration tests ==="
 	@bash tests/test_zer.sh
 	@echo "=== Rust-equivalent safety tests ==="

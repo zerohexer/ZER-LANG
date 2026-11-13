@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: is transferred
+// BUG-1639: the move goes through a pointer LOCAL viewing `w` (`*W p = &w;
+// eat(p);`), then the original name consumes the same field again.
+move struct Tok { u32 k; }
+struct W { Tok t; }
+void consume(Tok t) { }
+void eat(*W w) { consume(w.t); }
+u32 main() {
+    W w;
+    *W p = &w;
+    eat(p);
+    consume(w.t);
+    return 0;
+}

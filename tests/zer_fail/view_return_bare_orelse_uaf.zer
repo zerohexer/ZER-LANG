@@ -1,0 +1,18 @@
+// expect-error: use of freed value 'h'
+// BUG-1596 guard: a view returned through a function with a bare orelse return still aliases its argument.
+?*opaque op();
+void cl(*opaque x);
+?[*]u8 head([*]u8 b, usize n) {
+    ?*opaque mx = op();
+    *opaque x = mx orelse return;
+    cl(x);
+    if (n > b.len) { return null; }
+    return b[0..n];
+}
+u32 main() {
+    [*]u8 a = alloc(u8, 8) orelse return;
+    ?[*]u8 h = head(a, 3);
+    free(a);
+    if (h) |s| { return (u32)s[0]; }
+    return 0;
+}

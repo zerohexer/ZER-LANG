@@ -1,0 +1,13 @@
+// BUG-1568: a LOCAL named like a global is a local — storing &local into it is fine.
+?*u32 q = null;
+u32 g = 5;
+u32 main() {
+    u32 x = 7;
+    ?*u32 q = null;
+    q = &x;
+    if (q) |p| { if (*p != 7) { return 1; } }
+    u32 g = 9;
+    *u32 pg = &g;
+    *pg = 10;
+    return 0;
+}

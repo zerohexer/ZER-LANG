@@ -1,0 +1,5 @@
+// expect-error: cannot return pointer to local 'p'
+// BUG-1568: a local / param sharing a GLOBAL name was program storage to the escape sinks.
+u32 x = 1;
+*u32 f() { u32 x = 7; *u32 p = &x; return p; }
+u32 main() { return *f(); }

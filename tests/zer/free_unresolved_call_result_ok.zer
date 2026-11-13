@@ -1,0 +1,13 @@
+// BUG-1574 boundary: freeing what a call hands back, used no further.
+struct T { u32 v; }
+struct H { *T p; }
+*T getp(H h) { return h.p; }
+*T pick(*T x, *T y, bool c) { if (c) { return x; } return y; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H h = { .p = a };
+    free(getp(h));
+    *T b = alloc(T) orelse return;
+    free(pick(b, b, true));
+    return 0;
+}

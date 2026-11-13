@@ -1,0 +1,11 @@
+// BUG-1577: u32 << u64 folded at 64 bits for VRP and ran at 32 — the proven index must be the run one.
+u32[4] arr;
+u32 canary;
+const u32 A = 0xFFFFFFFF;
+const u64 M = 4;
+u32 main() {
+    u64 i = ((A << M) >> 33) ^ 7;
+    if (i != 0) { return 1; }          // the run value must be the folded one
+    arr[i] = 0xDEAD;
+    return 0;
+}

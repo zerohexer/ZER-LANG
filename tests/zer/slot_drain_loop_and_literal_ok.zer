@@ -1,0 +1,13 @@
+// BUG-1603 boundary: a drain loop through a variable index and a single literal
+// slot freed through its own index both stay accepted.
+struct N { u32 v; }
+u32 main() {
+    ?*N[4] arr;
+    for (u32 i = 0; i < 4; i += 1) { arr[i] = alloc(N); }
+    for (u32 j = 0; j < 4; j += 1) { if (arr[j]) |p| { free(p); } arr[j] = null; }
+    ?*N[2] b;
+    b[0] = alloc(N);
+    if (b[0]) |q| { free(q); }
+    b[0] = null;
+    return 0;
+}

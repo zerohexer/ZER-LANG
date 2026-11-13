@@ -1,0 +1,4 @@
+// expect-error: does not fit its 32-bit counter
+// BUG-1590
+Semaphore(5000000000) s;
+u32 main() { return 0; }

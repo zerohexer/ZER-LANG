@@ -1,0 +1,12 @@
+// BUG-1602: an *opaque-bridged libc function (memcmp) without a cinclude: the bridge's
+// own void * prototype binds to the C symbol under a private name, so it no longer
+// conflicts with <string.h>.
+struct S { u32 v; }
+S gs;
+i32 memcmp(*opaque a, *opaque b, usize n);
+S gd;
+u32 main() {
+    gs.v = 7; gd.v = 7;
+    if (memcmp((*opaque)&gd, (*opaque)&gs, 4) != 0) { return 1; }
+    return 0;
+}

@@ -1,0 +1,7 @@
+// expect-error: unwrap it first
+i32 printf(const *u8 fmt, ...);
+u32 main() {
+    ?u32 m = 5;
+    printf("%d\n", m);
+    return 0;
+}

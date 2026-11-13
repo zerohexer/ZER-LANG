@@ -1,0 +1,29 @@
+// BUG-1635 boundary: a teardown of a global table through a slice view,
+// refilled and torn down again, and a read-only walk through the view.
+struct T { u32 v; }
+struct H { ?*T p; }
+H[4] tbl;
+void drop() {
+    [*]H s = tbl[0..];
+    for (u32 i = 0; i < 4; i += 1) {
+        if (s[i].p) |q| { free(q); }
+        s[i].p = null;
+    }
+}
+u32 total() {
+    [*]H s = tbl;
+    u32 n = 0;
+    for (u32 i = 0; i < s.len; i += 1) {
+        if (s[i].p) |q| { n += q.v; }
+    }
+    return n;
+}
+u32 main() {
+    tbl[1].p = alloc(T);
+    drop();
+    tbl[2].p = alloc(T);
+    if (tbl[2].p) |z| { z.v = 6; }
+    u32 r = total() - 6;
+    drop();
+    return r;
+}

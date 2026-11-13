@@ -1,0 +1,15 @@
+// expect-trap
+// expect-trap-msg: slice start > end
+// Promoted from tests/zer_gaps/ast_slice_empty_range.zer (2026-11-13): this was filed as a gap but
+// the guarantee holds — the program compiles and the runtime check fires.
+void check(u32 lo, u32 hi) {
+    u32[10] arr;
+    [*]u32 s = arr[lo..hi];
+    // don't return s; just use it
+    u32 x = 0;
+    if (s.len > 0) { x = 1; }
+}
+u32 main() {
+    check(5, 2);  // lo > hi
+    return 0;
+}

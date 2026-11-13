@@ -1,0 +1,4 @@
+// BUG-1568: a local named like an IMPORTED global was program storage to the escape sinks.
+import m1568_glob;
+*u32 f() { u32 x1568 = 7; return &x1568; }
+u32 main() { return *f() + m1568_get(); }

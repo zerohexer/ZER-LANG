@@ -1,0 +1,13 @@
+// Promoted from tests/zer_gaps/gap4_async_shared_across_yield.zer (2026-11-13): filed as a gap, measured correct.
+// Shared access in an async body is per-statement: s.v = 1; yield; s.v = 2; holds no
+// lock across the suspend, so it is accepted (a statement CONTAINING a yield is refused).
+shared struct S { u32 v; }
+S s;
+
+async void task() {
+    s.v = 1;
+    yield;
+    s.v = 2;
+}
+
+u32 main() { return 0; }

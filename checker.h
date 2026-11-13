@@ -398,6 +398,14 @@ typedef struct {
      * function. */
     Symbol **lent_globals;
     int lent_global_count, lent_global_cap;
+    /* BUG-1591: VOLATILE globals a spawned thread touches under the single-word
+     * exemption, and the spawner's read-modify-writes of volatile globals inside
+     * its concurrent window — the post pass refuses their intersection (the RMW
+     * can overwrite the thread's store). Arena-grown, whole-program. */
+    Symbol **thr_vol;
+    int thr_vol_n, thr_vol_cap;
+    struct ParVolRmw { Symbol *s; int line; const char *file; const char *src; } *par_vol_rmw;
+    int par_vol_rmw_n, par_vol_rmw_cap;
     /* BUG-1276: globals a RUNNING scoped thread writes inside a @once block, and
      * which @once node owns each. While the spawn window is open the parent may
      * touch them only inside that same @once (directly or through a callee). */
@@ -471,6 +479,16 @@ typedef struct {
          * `volatile static local` idiom to point at; the fix is to pass the value). */
         bool is_static_local;
         int  decl_line;
+        /* BUG-1608: the regular-code accesses, per FUNCTION BODY that made them
+         * (NULL = outside any body). A body only an interrupt handler can reach
+         * is not main code: its accesses are dropped from the from_func /
+         * compound / uncritical / opaque facts by check_interrupt_safety (the
+         * ISR walk already recorded them on the interrupt side). */
+        struct IsrFuncAcc {
+            const Node *body;
+            bool compound, uncritical, opaque;
+        } *facc;
+        int nfacc, facc_cap;
     } *isr_globals;
     int isr_global_count;
     int isr_global_capacity;
@@ -711,12 +729,31 @@ void check_keep_inference(Checker *c);
 bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len);
 /* BUG-1184: is `&name` formed anywhere in `n` (a reassignment does not count)? */
 bool ast_name_addr_taken(Node *n, const char *name, uint32_t len);
+/* BUG-1609: as ast_name_mutated_or_addrd, plus writes of / addresses into PART
+ * of the object (field / element / bit-slice / view / pointer capture). For a
+ * name that is not itself a pointer, slice or Handle. */
+bool ast_name_part_mutated_or_addrd(Node *n, const char *name, uint32_t len, bool scalar);
+/* BUG-1610: an address / view of the object or of part of it (no assignment). */
+/* `scalar`: the name holds an integer, so `name[hi..lo]` read is a bit extract. */
+bool ast_name_part_addr_taken(Node *n, const char *name, uint32_t len, bool scalar);
 /* BUG-1124: the visitor form — fn(value-or-NULL, ud) per write; true stops. */
 /* `kind`: ANW_ASSIGN (`value` is the assigned value for `=`, NULL for a compound
  * operator), ANW_ADDR (`&name`), ANW_OPAQUE (a node the walk cannot see into). */
-enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2 };
+enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2,
+       /* BUG-1609, reported by the PARTS walk only: a write of part of the
+        * object (`name.f = v`), an address / view into part of it (`&name.f`,
+        * `name.arr[a..b]`, a `|*v|` capture of `name.opt`). */
+       ANW_PART_ASSIGN = 3, ANW_PART_ADDR = 4,
+       /* BUG-1609: `if (name) |*v|` / `switch (name) { .a => |*v| ... }` — the
+        * capture is a pointer INTO the object, so the object can be written
+        * through it with no assignment or `&` naming it. Reported by every
+        * walk; it is not an `&name` (ast_name_addr_taken: the capture cannot
+        * leave its arm), but it is a possible mutation. */
+       ANW_CAPTURE = 5 };
 typedef bool (*AstNameWriteFn)(Node *value, int kind, void *ud);
 bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud);
+bool ast_name_writes_parts(Node *n, const char *name, uint32_t len, AstNameWriteFn fn,
+                           void *ud, bool scalar);
 int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */
 /* BUG-1366: is this GLOBAL never assigned or address-taken anywhere in the
  * program (every registered body AND every global initializer)? The one query

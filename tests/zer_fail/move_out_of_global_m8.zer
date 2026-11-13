@@ -1,0 +1,18 @@
+// expect-error: a move struct out of global 'g'
+// BUG-1572: a move out of a GLOBAL move struct was untracked (double move / UAF of the moved payload).
+struct T { u32 v; }
+move struct Own { ?*T p; }
+Own g;
+void consume(Own o) { if (o.p) |q| { free(q); } }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    g.p = a;
+    consume(g);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (g.p) |q| { r = q.v; }
+    free(b);
+    return r;
+}

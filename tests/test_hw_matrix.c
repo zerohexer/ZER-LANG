@@ -1086,6 +1086,49 @@ int main(void) {
         }
     }
 
+    /* BUG-1650 — the read-modify-write split THROUGH MEMORY. The copy of the
+     * volatile global sits in a global, behind a local pointer, in a callee's
+     * out-parameter, or arrives on a loop back edge — not in a named local, which
+     * is all the BUG-1010 taint table held. MAIN side (the lost update: the
+     * handler's store lands between the two halves). The positive cells pin the
+     * boundary: the same carriers holding something else, and @critical. */
+    fprintf(stderr, "\n--- RMW split through memory (BUG-1650) ---\n");
+    {
+        #define MEMPRE "volatile u32 g;\nvolatile u32 h;\ninterrupt TIMER { g = 5; h = 6; }\n"
+        static const struct { const char *name; int neg; const char *body; } mc[] = {
+            { "global carrier", 1, MEMPRE "u32 mem;\nu32 main(){ mem = g; g = mem + 1; return 0; }\n" },
+            { "two functions", 1, MEMPRE "u32 mem;\nvoid rd(){ mem = g; }\nvoid wr(){ g = mem + 1; }\n"
+                                         "u32 main(){ rd(); wr(); return 0; }\n" },
+            { "write declared first", 1, MEMPRE "u32 mem;\nvoid wr(){ g = mem + 1; }\nvoid rd(){ mem = g; }\n"
+                                         "u32 main(){ rd(); wr(); return 0; }\n" },
+            { "two-hop carrier", 1, MEMPRE "u32 m1;\nu32 m2;\nu32 main(){ m1 = g; m2 = m1; g = m2 + 1; return 0; }\n" },
+            { "local pointer", 1, MEMPRE "u32 main(){ u32 m = 0; *u32 p = &m; *p = g; g = *p + 1; return 0; }\n" },
+            { "pointee read by name", 1, MEMPRE "u32 main(){ u32 m = 0; *u32 p = &m; *p = g; g = m + 1; return 0; }\n" },
+            { "callee out-param", 1, MEMPRE "void st(*u32 p){ *p = g; }\n"
+                                         "u32 main(){ u32 m = 0; st(&m); g = m + 1; return 0; }\n" },
+            { "callee out-param 2 hops", 1, MEMPRE "void st(*u32 p){ *p = g; }\nvoid mid(*u32 q){ st(q); }\n"
+                                         "u32 main(){ u32 m = 0; mid(&m); g = m + 1; return 0; }\n" },
+            { "loop back edge", 1, MEMPRE "u32 main(){ u32 x = 0; for (u32 i = 0; i < 2; i += 1) { g = x + 1; x = g; } return 0; }\n" },
+            { "ok: other global", 0, MEMPRE "u32 mem;\nu32 main(){ mem = g; h = mem + 1; return 0; }\n" },
+            { "ok: carrier holds no copy", 0, MEMPRE "u32 mem;\nu32 main(){ mem = 7; g = mem + 1; return 0; }\n" },
+            { "ok: @critical", 0, MEMPRE "u32 mem;\nu32 main(){ @critical { mem = g; g = mem + 1; } return 0; }\n" },
+            { "ok: loop local rebound", 0, MEMPRE "u32 main(){ u32 x = 0; for (u32 i = 0; i < 2; i += 1) { x = i; g = x + 1; } return 0; }\n" },
+            { "ok: pointer, other local", 0, MEMPRE "u32 main(){ u32 m = 0; u32 k = 3; *u32 p = &m; *p = g; g = k + 1; return 0; }\n" },
+            { "ok: out-param constant", 0, MEMPRE "void st(*u32 p){ *p = 4; }\n"
+                                         "u32 main(){ u32 m = 0; st(&m); g = m + 1; return 0; }\n" },
+        };
+        #undef MEMPRE
+        for (size_t mi = 0; mi < sizeof(mc) / sizeof(mc[0]); mi++) {
+            valid_cells++;
+            char mnm[192];
+            snprintf(mnm, sizeof(mnm), "rmw-mem/%s", mc[mi].name);
+            int ok = run_vol(mnm, mc[mi].body, "", mc[mi].neg);
+            fprintf(stderr, "  [%-26s][%s] %s\n", mc[mi].name, mc[mi].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
     fprintf(stderr, "\n=== hw-matrix: %d/%d cells correct ===\n", passed, valid_cells);
     fprintf(stderr, "    false negatives: %d | invalid probes: %d | over-rejections: %d\n",
             false_neg, invalid_probe, over_reject);

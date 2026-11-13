@@ -302,6 +302,12 @@ struct Symbol {
      * after the branch, on paths that never joined. `th_spawn_branch_depth`
      * below is the guard that makes the branch case genuinely conservative. */
     bool is_borrowed_by_thread;
+    /* BUG-1648: in a function with a label / goto the borrow is LATCHED — held from
+     * the declaration (control may reach any point from the spawn), released only
+     * by a join after the last jump. `lend_live` is the textual spawn..join fact
+     * the double-lend check reads, which the latch must not trip. */
+    bool borrow_latched;
+    bool lend_live;
     const char *th_borrows_name;
     uint32_t th_borrows_name_len;
     /* 2026-08-03: Checker.branch_depth at the SPAWN. A join is only allowed to

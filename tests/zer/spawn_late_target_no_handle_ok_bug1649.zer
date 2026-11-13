@@ -1,0 +1,14 @@
+// BUG-1649: a late-declared spawn target that touches no allocator stays accepted.
+struct T { u32 v; }
+Pool(T, 4) pl;
+u32 total;
+u32 main() {
+    Handle(T) h = pl.alloc() orelse return;
+    h.v = 7;
+    ThreadHandle th = spawn w(h.v);
+    th.join();
+    h.v += total;
+    pl.free(h);
+    return 0;
+}
+void w(u32 x) { u32 y = x + 1; if (y == 0) { return; } }

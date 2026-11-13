@@ -1384,6 +1384,67 @@ int main(void) {
                 }
     }
 
+    /* ---- jump x spawn-window grid (BUG-1648) + late spawn target (BUG-1649) ----
+     * The spawn..join window was a TEXT-ORDER fact: a goto runs code written
+     * before the spawn inside it, and code written after the join before it. Each
+     * negative crosses one window fact (lent local / global / param pair /
+     * atomic cell / two lend sites) with a jump; the positives pin the boundary —
+     * a CLOSED spawn..join pair (no jump between) keeps the plain rule. */
+    fprintf(stderr, "\n  -- jump x spawn-window grid --\n");
+    {
+        #define JW "void w(*u32 p) { *p = 5; }\n"
+        static const struct { const char *name; int neg; const char *code; } jc[] = {
+            { "write lent local before spawn", 1, JW
+              "u32 main() { u32 x = 0; goto S;\nW: x = 3; goto J;\nS: ThreadHandle th = spawn w(&x); goto W;\nJ: th.join(); return 0; }\n" },
+            { "label after the join", 1, JW
+              "u32 main() { u32 x = 0; ThreadHandle th = spawn w(&x); goto P;\nJ: th.join(); return 0;\nP: x = 3; goto J; }\n" },
+            { "write lent global", 1, "u32 g;\n" JW
+              "u32 main() { goto S;\nW: g = 3; goto J;\nS: ThreadHandle th = spawn w(&g); goto W;\nJ: th.join(); return 0; }\n" },
+            { "param pair", 1, JW
+              "void f(*u32 p, *u32 q) { goto S;\nW: *q = 3; goto J;\nS: ThreadHandle th = spawn w(p); goto W;\nJ: th.join(); }\n"
+              "u32 main() { u32 x = 0; f(&x, &x); return 0; }\n" },
+            { "plain atomic cell", 1, "u32 cell;\nvoid wa() { @atomic_add(&cell, 1); }\n"
+              "u32 main() { goto S;\nW: cell = 3; goto J;\nS: ThreadHandle th = spawn wa(); goto W;\nJ: th.join(); return 0; }\n" },
+            { "two lend sites", 1, JW
+              "u32 main() { u32 x = 0; goto S;\nA: ThreadHandle t2 = spawn w(&x); t2.join(); goto E;\n"
+              "S: ThreadHandle t1 = spawn w(&x); goto A;\nE: t1.join(); return 0; }\n" },
+            { "ok: closed pair after a loop label", 0, JW
+              "u32 main() { u32 x = 0; u32 n = 0;\nagain: n += 1; if (n < 3) { goto again; }\n"
+              "ThreadHandle th = spawn w(&x); th.join(); if (x != 5) { return 1; } return 0; }\n" },
+            { "ok: closed pair inside a goto loop", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 v = 0; u32 i = 0;\nagain: ThreadHandle t2 = spawn wi(&v); t2.join(); i += 1;\n"
+              "if (i < 3) { goto again; } if (v != 3) { return 1; } return 0; }\n" },
+            { "ok: two closed pairs, one local", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 v = 0; for (u32 k = 0; k < 2; k += 1) { ThreadHandle th = spawn wi(&v); th.join(); }\n"
+              "u32 i = 0;\nagain: ThreadHandle t2 = spawn wi(&v); t2.join(); i += 1; if (i < 2) { goto again; }\n"
+              "if (v != 4) { return 1; } return 0; }\n" },
+            { "late target: Handle auto-deref", 1,
+              "struct T { u32 v; }\nPool(T, 4) pl;\nshared struct Reg { Handle(T) h; }\nReg reg;\n"
+              "u32 main() { Handle(T) h = pl.alloc() orelse return; reg.h = h;\n"
+              "ThreadHandle th = spawn wl(); h.v += 1; th.join(); return 0; }\n"
+              "void wl() { Handle(T) h = reg.h; h.v += 1; }\n" },
+            { "late callee: Handle auto-deref", 1,
+              "struct T { u32 v; }\nSlab(T) sl;\nshared struct Reg { Handle(T) h; }\nReg reg;\n"
+              "void wl() { bump(); }\n"
+              "u32 main() { Handle(T) h = sl.alloc() orelse return; reg.h = h;\n"
+              "ThreadHandle th = spawn wl(); h.v += 1; th.join(); return 0; }\n"
+              "void bump() { Handle(T) h = reg.h; h.v += 1; }\n" },
+            { "ok: late target, no allocator", 0,
+              "u32 main() { ThreadHandle th = spawn wl(3); th.join(); return 0; }\n"
+              "void wl(u32 x) { u32 y = x + 1; if (y == 0) { return; } }\n" },
+        };
+        #undef JW
+        for (size_t ji = 0; ji < sizeof(jc) / sizeof(jc[0]); ji++) {
+            valid_cells++;
+            char nm[160];
+            snprintf(nm, sizeof(nm), "jump-window/%s", jc[ji].name);
+            int ok = jc[ji].neg ? run_neg(nm, jc[ji].code) : run_pos(nm, jc[ji].code);
+            fprintf(stderr, "  [%-36s][%-3s] %s\n", jc[ji].name, jc[ji].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);
     fprintf(stderr, "    false negatives: %d | invalid probes: %d | over-rejections: %d\n",
             false_neg, invalid_probe, over_reject);

@@ -382,6 +382,30 @@ fixpoint through callees) and the caller's argument is checked at the call
 (`check_alias_spawn_calls`). The BUG-1303 pair root must be resolved through a pointer local's
 borrow root (`alias_arg_root`), or a plain alias of the same object is a stranger.
 
+**11i. A fact kept in TEXT ORDER is wrong under a jump — and the fix is two-sided
+(BUG-1648).** The spawn..join window (borrow flags, `after_spawn_in_func`, the lent-param
+mask) is set at the spawn and cleared at the join as the checker walks the text. A goto makes
+text order and execution order differ, so in a labelled function an OPEN window is latched
+for the whole function (`esc_latch_*`, facts on the escape fixpoint). The first draft latched
+EVERY spawn and broke two corpus positives: a spawn whose join follows in the same statement
+list with no jump between is a CLOSED window no jump can enter or leave, and must keep the
+textual rule (`esc_mark_closed_spawns`). When you latch a text-order fact, name the shape that
+stays exact and pin it with a positive cell. The same applies to any new per-function window
+fact: it must be added to `esc_latch_enter` / the join's release.
+
+**11j. A scan that runs at a use site may see a body the checker has not visited
+(BUG-1649).** The spawn race scan runs at the spawn statement; a target declared later has no
+checker annotations yet (`field.handle_alloc`). `func_decl.body_checked_seq` tells a post-pass
+which bodies were finished after a recorded site. A new node annotation read by an at-site
+scan needs the same late re-read.
+
+**11k. Value taint has three carriers besides a named local (BUG-1650):** a global (whole
+program, flow-insensitive: `mem_edge_add`), the object behind a local pointer
+(`rmw_taint_maintain`, through the borrow root), and a callee's out-parameter
+(`VfSummary.gin`). A loop back edge carries a local's taint to the top (`EscState.rmw`). A new
+"copy of a volatile global" sink must consult all of them — `rmw_value_sources` is the read
+side they all feed.
+
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key
 built from `&tbl[i]` names a different slot per evaluation and re-broke the valid teardown

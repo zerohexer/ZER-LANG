@@ -321,6 +321,36 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   assignment, and an aggregate name (struct / union / array) is walked with it. Test:
   `lent_global_via_global_struct_ptr_field_bug1647`.
 
+- **BUG-1648 — the scoped-spawn window was a text-order fact; a `goto` reorders it.**
+  `goto S; W: x = 3; goto J; S: th = spawn w(&x); goto W; J: th.join();` wrote `x` while the
+  thread held it (TSan); the same held for a lent global, a lent-param pair, a plain access to
+  an atomic cell, and two spawn sites lending one local. In a function with a jump an OPEN
+  window is now LATCHED (riding the escape fixpoint: `ESC_LENT` facts, `EscState.has_spawn`,
+  `esc_latch_*`): borrowed from the declaration / function entry, released only by a join
+  after the last jump at branch depth 0; one variable, one lend site. A CLOSED pair
+  (`spawn_stmt.window_closed`, set by `esc_mark_closed_spawns`) keeps the textual rule —
+  found by the corpus sweep, which the first draft over-rejected twice. `Symbol.lend_live`
+  is the textual lend the double-lend check reads. Tests: six `goto_*_bug1648` negatives,
+  positive `goto_then_spawn_join_tail_ok_bug1648`; conc-matrix "jump x spawn-window" grid.
+- **BUG-1649 — a spawn target declared AFTER its spawn site hid Handle auto-derefs from the
+  race scan.** The scan reads the checker's `field.handle_alloc` annotation (BUG-1625), which
+  an unchecked body does not have yet. `func_decl.body_checked_seq` orders body completion;
+  the `check_sync_spawn_writers` post-pass (`sync_late_alloc`) reports a Pool / Slab reached
+  through `h.field` in any body finished after the site (target or callee, read or write).
+  Tests: `spawn_handle_autoderef_late_{target,callee}_bug1649`, positive
+  `spawn_late_target_no_handle_ok_bug1649`; conc-matrix late-target cells.
+- **BUG-1650 — a read-modify-write of a volatile global split THROUGH MEMORY.** `mem = g;
+  g = mem + 1;` (a global carrier, in one function or two, in either order), `*p = g;
+  g = *p + 1;` / `g = m + 1` (a local behind a pointer), `st(&m); g = m + 1;` (a callee's
+  out-parameter, any number of hops) and `g = x + 1; x = g;` in a loop were plain stores to
+  the ISR/main rule — the BUG-1010 taint table held named locals in text order only. Four
+  additions: a whole-program memory relation (`mem_edge_add` / `mem_cand_add`, resolved by
+  `check_mem_split_rmw` before `check_interrupt_safety`); `rmw_taint_maintain` taints a local
+  pointer and its borrow root on a write through it; `VfSummary.gin[j]` (globals stored into
+  argument j's pointee) applied by `main_call_gin`; the loop back edge joins value taints in
+  `esc_check_loop` (`EscState.rmw`). Gate: hw-matrix "RMW split through memory" (9 negative
+  cells, all false negatives on the pre-fix build; 6 boundary positives).
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

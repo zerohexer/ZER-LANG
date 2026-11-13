@@ -1,0 +1,15 @@
+// expect-error: both reach 'x'
+// BUG-1648: a goto runs the use of the second param inside the window of the first
+void w(*u32 p) { *p = 5; }
+void f(*u32 p, *u32 q) {
+    goto S;
+W:
+    *q = 3;
+    goto J;
+S:
+    ThreadHandle th = spawn w(p);
+    goto W;
+J:
+    th.join();
+}
+u32 main() { u32 x = 0; f(&x, &x); return 0; }

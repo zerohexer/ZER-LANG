@@ -97,14 +97,17 @@ each a missing SUMMARY fact, not a missing key:
 **B. Concurrency (MEDIUM, accept-unsafe — each TSan- or ASan-confirmed).**
 1. ~~A re-entrant `_poll` of the same task~~ — CLOSED (BUG-1628): the poll traps on re-entry.
 2. ~~Funcptr reach through a POINTER / SLICE spawn argument~~ — CLOSED (BUG-1631).
-3. **The scoped-borrow window is textual under `goto`** — a `goto` runs an access inside a
-   spawn..join window it is written before (`conc_goto_orders_access_into_borrow_window`; the
-   atomic-downgrade check likewise, and its `defer` form: thread `g += 1; @atomic_store(&f,
-   1);` against `{ defer { g += 1; } spawn w(); }`). `Symbol.is_borrowed_by_thread` is linear
-   in the text; the escape fixpoint's answer (a labelled function is flow-insensitive) is the
-   model to copy — but a flow-insensitive borrow also refuses the read AFTER the join, so it
-   needs a per-label join of the borrow set, not a blanket latch. (The atomic-cell rule's
-   `defer`-before-spawn form is CLOSED, BUG-1629.)
+3. ~~The scoped-borrow window is textual under `goto`~~ — CLOSED (BUG-1648): in a function
+   with a goto / label an OPEN spawn window is latched from the function's entry (lent
+   locals from their declaration; lent params / globals, the atomic-cell window and the
+   lent-param mask from the entry) and released only by a join written after the last jump,
+   outside any conditional body. A CLOSED pair (`th = spawn ..; ...; th.join();` in one
+   statement list with no jump between) keeps the plain rule. **Residual (precision, loud):**
+   with an open window in a labelled function, the lent variable cannot be touched anywhere
+   before that final join (a write before the spawn included), and one variable cannot be
+   lent from two spawn sites. Move the spawn..join into its own function. The
+   atomic-DOWNGRADE check's own window (`sync_walk`, SW_BEFORE / SW_IN / SW_AFTER) is still
+   textual under a goto.
 4. ~~A helper lends its pointer param and touches the same global by NAME~~ — CLOSED
    (BUG-1645: per-parameter lent-global fact, call-site check), and ~~"same object" by name
    misses a plain local alias~~ — CLOSED (BUG-1646: the pair root follows a pointer local's
@@ -116,14 +119,20 @@ each a missing SUMMARY fact, not a missing key:
    and follows the assigned `&g`).
 6. ~~The spin-lock recogniser accepts a loop that does not lock~~ — CLOSED (BUG-1644: a
    `break`, a wrong expected value or a non-CAS condition is not a lock).
-7. **ISR split read-modify-write through MEMORY** (checker only; an `interrupt` block does not
-   build hosted, so no gap file): `mem = g; g = mem + 1;` through a global, through two
-   functions, through `*p`, and across a loop back edge (`g = x + 1; x = g;`). The local-copy
-   spellings are refused.
-8. **BUG-1625 sees a CHECKED body only** — the Handle auto-deref's allocator is recorded by
-   the checker on the node, so a spawn target declared AFTER its spawn site (body not yet
-   checked when the scan runs) is still unseen. A post-pass over `Checker.sync_spawns` would
-   close it.
+7. ~~ISR split read-modify-write through MEMORY~~ — CLOSED for regular (main-side) code and
+   for a handler's own body (BUG-1650): a global carrier (any order, any number of hops, two
+   functions), a local reached through a pointer, a callee's out-parameter, a loop back edge.
+   **Residuals:** (a) the global carrier relation is flow-INSENSITIVE, so `mem = g; mem = 0;
+   g = mem + 1;` is refused (loud); (b) the split done in HELPERS called only from a handler
+   (`interrupt T { rd(); wr(); }`) is not attributed to the handler — the handler side of the
+   rule (a handler is not preempted by main) is the conservative half, the main side is the
+   lost update and is covered; (c) the SPAWN scan's sink does not read the global carrier
+   relation (a thread doing `vmem = g; g = vmem + 1` through a VOLATILE carrier; a
+   non-volatile carrier is already a refused plain access).
+8. ~~BUG-1625 sees a CHECKED body only~~ — CLOSED (BUG-1649): the post-pass over
+   `Checker.sync_spawns` re-reads Handle auto-derefs in every body the checker finished after
+   the spawn site. **Residual (precision, loud):** that late check does not apply the `@once`
+   single-owner exemption — declare the spawn target above its spawn site.
 
 **C. Values / bare metal (LOW, loud).**
 - A shift COUNT literal is typed against the LEFT operand: `u3 y = x << 8;` is "cannot

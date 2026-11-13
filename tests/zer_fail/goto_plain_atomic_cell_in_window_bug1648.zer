@@ -1,0 +1,16 @@
+// expect-error: plain access to 'cell' in a concurrent context
+// BUG-1648: a goto runs a plain access to an atomic cell inside the window
+u32 cell;
+void w() { @atomic_add(&cell, 1); }
+u32 main() {
+    goto S;
+W:
+    cell = 3;
+    goto J;
+S:
+    ThreadHandle th = spawn w();
+    goto W;
+J:
+    th.join();
+    return 0;
+}

@@ -1,0 +1,17 @@
+// expect-error: spawn target 'w' accesses non-shared global 'sl'
+// BUG-1649: the Handle auto-deref is in a CALLEE of the target, declared after the spawn site.
+struct T { u32 v; }
+Slab(T) sl;
+shared struct Reg { Handle(T) h; }
+Reg reg;
+void w() { for (u32 i = 0; i < 1000; i += 1) { bump(); } }
+u32 main() {
+    Handle(T) h = sl.alloc() orelse return;
+    reg.h = h;
+    ThreadHandle th = spawn w();
+    for (u32 i = 0; i < 1000; i += 1) { h.v += 1; }
+    th.join();
+    sl.free(h);
+    return 0;
+}
+void bump() { Handle(T) h = reg.h; u32 x = h.v; if (x == 9) { return; } }

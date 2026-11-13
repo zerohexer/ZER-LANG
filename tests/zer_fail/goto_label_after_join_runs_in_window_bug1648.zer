@@ -1,0 +1,14 @@
+// expect-error: while it is borrowed by a scoped spawn
+// BUG-1648: a label written after the join is reached from inside the spawn..join window
+void w(*u32 p) { *p = 5; }
+u32 main() {
+    u32 x = 0;
+    ThreadHandle th = spawn w(&x);
+    goto P;
+J:
+    th.join();
+    return x;
+P:
+    x = 3;
+    goto J;
+}

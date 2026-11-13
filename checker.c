@@ -1658,6 +1658,11 @@ static Type *check_expr(Checker *c, Node *node);
 static void check_stmt(Checker *c, Node *node);
 static void check_stmt_cond_body(Checker *c, Node *body);
 static bool esc_fn_is_sticky(Checker *c);   /* BUG-1611: the body has a label / goto */
+static void esc_note_spawn(Checker *c);    /* BUG-1648 */
+static bool esc_latch_holds(Checker *c, int line);
+static void esc_latch_release_all(Checker *c);
+static void esc_latch_suspend(Checker *c, bool resume);
+static bool esc_note_lent(Checker *c, Symbol *vs, int param_pos, bool is_global, const void *site, bool closed);
 static Type *resolve_type(Checker *c, TypeNode *tn);
 static void register_builtin_pair_types(Checker *c);
 
@@ -7270,14 +7275,30 @@ static void rmw_taint_maintain(Checker *c, RmwTaintEnt **tab, int *n, int *cap,
         return;
     }
     Node *rt = tg;
-    while (rt && (rt->kind == NODE_FIELD || rt->kind == NODE_INDEX)) {
+    bool through_ref = false;
+    while (rt && (rt->kind == NODE_FIELD || rt->kind == NODE_INDEX ||
+                  (rt->kind == NODE_UNARY && rt->unary.op == TOK_STAR))) {
+        if (rt->kind == NODE_UNARY) { through_ref = true; rt = rt->unary.operand; continue; }
         Node *ob = rt->kind == NODE_FIELD ? rt->field.object : rt->index_expr.object;
         TypeKind ok = type_dispatch_kind(checker_get_type(c, ob));
         if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE)
-            return;   /* writes through a reference: not the local's own storage */
+            through_ref = true;   /* writes through a reference */
         rt = ob;
     }
     if (!rt || rt->kind != NODE_IDENT) return;
+    if (through_ref) {
+        /* BUG-1650: `*p = g; g = *p + 1;` — the copy sits in the object a LOCAL
+         * pointer designates. The pointer's name carries it (a read through it
+         * finds it), and so does the local it was aimed at, when that is known
+         * (BUG-969's borrow root). A global pointer's pointee is the write-target
+         * query's (the memory relation above). */
+        Symbol *ps = scope_lookup(c->current_scope, rt->ident.name,
+                                  (uint32_t)rt->ident.name_len);
+        if (ps && global_decl_lookup(c, ps->name, ps->name_len) == ps) return;
+        if (ps && ps->borrow_root_name)
+            for (int i = 0; i < srcs.n; i++)
+                rmw_tab_add(tab, n, cap, ps->borrow_root_name, ps->borrow_root_len, srcs.v[i]);
+    }
     for (int i = 0; i < srcs.n; i++)
         rmw_tab_add(tab, n, cap, rt->ident.name, (uint32_t)rt->ident.name_len, srcs.v[i]);
 }
@@ -7403,6 +7424,7 @@ struct VfSummary {
     VfDest val_dest[VF_MAX_PARAMS];   /* argument i's value stored there */
     VfDest ptd_dest[VF_MAX_PARAMS];   /* argument j's pointee stored there */
     VfSet writes;                     /* every global the body writes (opaque fallback) */
+    VfSet gin[VF_MAX_PARAMS];         /* BUG-1650: globals whose value lands in arg j's pointee */
     bool opaque;
     int np;
 };
@@ -7413,7 +7435,8 @@ static uint64_t vf_summary_size(const struct VfSummary *s) {
                  (uint64_t)vf_popcount64(s->ret.ptd) + (uint64_t)s->writes.n + (s->opaque ? 1u : 0u);
     for (int i = 0; i < VF_MAX_PARAMS; i++)
         z += (uint64_t)s->val_dest[i].g.n + (uint64_t)vf_popcount64(s->val_dest[i].via) +
-             (uint64_t)s->ptd_dest[i].g.n + (uint64_t)vf_popcount64(s->ptd_dest[i].via);
+             (uint64_t)s->ptd_dest[i].g.n + (uint64_t)vf_popcount64(s->ptd_dest[i].via) +
+             (uint64_t)s->gin[i].n;
     return z;
 }
 static void vfdest_union(Checker *c, VfDest *d, const VfDest *s) {
@@ -7628,11 +7651,19 @@ static void vf_value(VfCtx *x, Node *e, VfSrc *out, int depth) {
 }
 
 /* Record that every source in `src` may be stored into `dst`. */
+static void mem_edge_add(Symbol *m, Symbol *s);
 static void vf_store(VfCtx *x, const VfSrc *src, const VfDest *dst) {
     for (int i = 0; i < VF_MAX_PARAMS; i++) {
         if (src->val & (1ULL << i)) vfdest_union(x->c, &x->s->val_dest[i], dst);
         if (src->ptd & (1ULL << i)) vfdest_union(x->c, &x->s->ptd_dest[i], dst);
+        /* BUG-1650: a GLOBAL's value stored through pointer parameter i
+         * (`void st(*u32 p) { *p = g; }`) — the caller's object now holds it */
+        if ((dst->via & (1ULL << i)) && src->g.n)
+            vfset_union(x->c, &x->s->gin[i], &src->g);
     }
+    /* ... and into a global: the whole-program memory relation */
+    for (int a = 0; a < dst->g.n; a++)
+        for (int b = 0; b < src->g.n; b++) mem_edge_add(dst->g.v[a], src->g.v[b]);
 }
 /* Where a store through argument expression `arg` lands, in this function's
  * terms (the pointee of `arg`). */
@@ -7723,6 +7754,15 @@ static void vf_call_callee(Checker *c, struct VfSummary *s, void *ud) {
             if (kind == 0) vf_value(x, call->call.args[b], &src, 0);
             else vf_arg_pointee(x, call->call.args[b], &src);
             vfset_union(c, &x->s->writes, &d.g);
+            vf_store(x, &src, &d);
+        }
+        if (s->gin[b].n) {   /* BUG-1650: the callee leaves globals in arg b's pointee */
+            VfDest d;
+            memset(&d, 0, sizeof(d));
+            vf_arg_dest(x, call->call.args[b], &d);
+            VfSrc src;
+            memset(&src, 0, sizeof(src));
+            vfset_union(c, &src.g, &s->gin[b]);
             vf_store(x, &src, &d);
         }
     }
@@ -8938,6 +8978,120 @@ static void mmio_opaque_arg_record(Checker *c, Node *arg, int line) {
     mmio_access_record(c, ab.addr, MMIO_SPAN_OPEN, false, true, line);
 }
 
+/* ---- BUG-1650: a read-modify-write split THROUGH MEMORY --------------------
+ * `mem = g; g = mem + 1;` is the same lost update as `u32 t = g; g = t + 1;`
+ * (BUG-1010), but the carrier is a GLOBAL: the local taint table never held it,
+ * and the two halves may sit in two functions, in either order. Two whole-
+ * program facts, both recorded while every body is checked:
+ *   edge (M <- S): an assignment stored a value with source global S into
+ *                  global M (M may hold a copy of S);
+ *   candidate (G, M): a plain store into G whose value read global M.
+ * After the last body, a candidate whose M reaches G over the edges IS the
+ * read-modify-write of G, in the context its store was checked in. */
+static struct MemEdge { Symbol *m, *s; } *_mem_edges = NULL;
+static int _mem_edge_n = 0, _mem_edge_cap = 0;
+static struct MemCand {
+    Symbol *g, *m; bool isr; Node *body; int line;
+    const char *file, *source, *module; uint32_t module_len;
+} *_mem_cands = NULL;
+static int _mem_cand_n = 0, _mem_cand_cap = 0;
+static void mem_edge_add(Symbol *m, Symbol *s) {
+    if (!m || !s || m == s || s->is_function || m->is_function) return;
+    for (int i = 0; i < _mem_edge_n; i++)
+        if (_mem_edges[i].m == m && _mem_edges[i].s == s) return;
+    if (_mem_edge_n >= _mem_edge_cap) {
+        int nc = _mem_edge_cap ? _mem_edge_cap * 2 : 16;
+        struct MemEdge *nb = (struct MemEdge *)realloc(_mem_edges, (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _mem_edges = nb; _mem_edge_cap = nc;
+    }
+    _mem_edges[_mem_edge_n].m = m; _mem_edges[_mem_edge_n].s = s; _mem_edge_n++;
+}
+static void mem_cand_add(Checker *c, Symbol *g, Symbol *m, int line) {
+    if (!g || !m || g == m || m->is_function || c->critical_depth > 0) return;
+    for (int i = 0; i < _mem_cand_n; i++)
+        if (_mem_cands[i].g == g && _mem_cands[i].m == m &&
+            _mem_cands[i].isr == c->in_interrupt && _mem_cands[i].body == c->current_body)
+            return;
+    if (_mem_cand_n >= _mem_cand_cap) {
+        int nc = _mem_cand_cap ? _mem_cand_cap * 2 : 16;
+        struct MemCand *nb = (struct MemCand *)realloc(_mem_cands, (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _mem_cands = nb; _mem_cand_cap = nc;
+    }
+    struct MemCand *k = &_mem_cands[_mem_cand_n++];
+    k->g = g; k->m = m; k->isr = c->in_interrupt; k->body = c->current_body; k->line = line;
+    k->file = c->file_name; k->source = c->source;
+    k->module = c->current_module; k->module_len = c->current_module_len;
+}
+/* Does global `m` (transitively) hold a copy of `g`? A visited set ends cycles. */
+static bool mem_reaches(Symbol *m, Symbol *g, Symbol **seen, int *nseen, int cap) {
+    for (int i = 0; i < *nseen; i++) if (seen[i] == m) return false;
+    if (*nseen >= cap) return true;   /* cannot track: the rejecting answer */
+    seen[(*nseen)++] = m;
+    for (int i = 0; i < _mem_edge_n; i++) {
+        if (_mem_edges[i].m != m) continue;
+        if (_mem_edges[i].s == g) return true;
+        if (mem_reaches(_mem_edges[i].s, g, seen, nseen, cap)) return true;
+    }
+    return false;
+}
+static void check_mem_split_rmw(Checker *c) {
+    if (_mem_cand_n == 0 || _mem_edge_n == 0) { _mem_cand_n = 0; _mem_edge_n = 0; return; }
+    int cap = _mem_edge_n + 2;
+    Symbol **seen = (Symbol **)malloc((size_t)cap * sizeof(Symbol *));
+    bool sv_isr = c->in_interrupt; Node *sv_body = c->current_body;
+    int sv_crit = c->critical_depth;
+    const char *sv_fn = c->file_name, *sv_src = c->source, *sv_mod = c->current_module;
+    uint32_t sv_ml = c->current_module_len;
+    for (int i = 0; i < _mem_cand_n; i++) {
+        struct MemCand *k = &_mem_cands[i];
+        int ns = 0;
+        if (seen && !mem_reaches(k->m, k->g, seen, &ns, cap)) continue;
+        c->in_interrupt = k->isr; c->current_body = k->body; c->critical_depth = 0;
+        c->file_name = k->file; c->source = k->source;
+        c->current_module = k->module; c->current_module_len = k->module_len;
+        track_isr_global(c, k->g->name, k->g->name_len, true);
+    }
+    free(seen);
+    c->in_interrupt = sv_isr; c->current_body = sv_body; c->critical_depth = sv_crit;
+    c->file_name = sv_fn; c->source = sv_src;
+    c->current_module = sv_mod; c->current_module_len = sv_ml;
+    _mem_cand_n = 0; _mem_edge_n = 0;   /* one program per run (LSP re-checks) */
+}
+
+/* BUG-1650: a callee that stores a global's value through a pointer parameter
+ * leaves that copy in the caller's object — a LOCAL (the value-taint table) or a
+ * GLOBAL (the memory relation). `st(&m); g = m + 1;` is the split read-modify-
+ * write with the read done by the callee. */
+static void main_call_gin(Checker *c, struct VfSummary *s, void *ud) {
+    Node *call = (Node *)ud;
+    if (!s || s->opaque) return;
+    for (int k = 0; k < call->call.arg_count && k < VF_MAX_PARAMS; k++) {
+        if (!s->gin[k].n) continue;
+        Node *a = call->call.args[k] ? unwrap_ptr_launder(call->call.args[k]) : NULL;
+        VfSet pg = {0};
+        if (call->call.args[k]) call_arg_pointees(c, call->call.args[k], &pg);
+        for (int i = 0; i < pg.n; i++)
+            for (int j = 0; j < s->gin[k].n; j++) mem_edge_add(pg.v[i], s->gin[k].v[j]);
+        /* the local the argument points into: `&m`, `&m.f`, or a pointer local */
+        Node *r = a;
+        if (r && r->kind == NODE_UNARY && r->unary.op == TOK_AMP) r = r->unary.operand;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE))
+            r = r->kind == NODE_FIELD ? r->field.object
+              : r->kind == NODE_INDEX ? r->index_expr.object : r->slice.object;
+        if (!r || r->kind != NODE_IDENT) continue;
+        Symbol *ls = scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len);
+        if (!ls || global_decl_lookup(c, ls->name, ls->name_len) == ls) continue;
+        for (int j = 0; j < s->gin[k].n; j++) {
+            rmw_tab_add(&c->rmw_taints, &c->rmw_taint_count, &c->rmw_taint_capacity,
+                        ls->name, ls->name_len, s->gin[k].v[j]);
+            if (ls->borrow_root_name)
+                rmw_tab_add(&c->rmw_taints, &c->rmw_taint_count, &c->rmw_taint_capacity,
+                            ls->borrow_root_name, ls->borrow_root_len, s->gin[k].v[j]);
+        }
+    }
+}
 /* The main-checker RMW sink, per target (BUG-1124). `ud` is the NODE_ASSIGN. */
 static bool target_is_bit_range(Checker *c, Node *target);
 static void main_rmw_visit(Checker *c, Symbol *g, void *ud) {
@@ -8949,6 +9103,13 @@ static void main_rmw_visit(Checker *c, Symbol *g, void *ud) {
                   rmw_value_taints_global(c, c->rmw_taints, c->rmw_taint_count,
                                           node->assign.value, g, 0);  /* BUG-1010 */
     if (is_rmw) track_isr_global(c, g->name, g->name_len, true);
+    /* BUG-1650: what this store leaves in `g`, and whose copies it read */
+    VfSet srcs = {0};
+    rmw_value_sources(c, c->rmw_taints, c->rmw_taint_count, node->assign.value, 0, &srcs);
+    for (int i = 0; i < srcs.n; i++) {
+        mem_edge_add(g, srcs.v[i]);
+        if (!is_rmw) mem_cand_add(c, g, srcs.v[i], (int)node->loc.line);
+    }
 }
 
 /* The spawn-scan RMW sink, per target (BUG-1124). Reads the scan's value-taint
@@ -17282,7 +17443,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             if (cs && cs->is_function && cs->func_node) {
                 ensure_func_props(c, cs);
                 if (cs->props.can_detach) {
-                    c->after_spawn_in_func = true;
+                    c->after_spawn_in_func = true; esc_note_spawn(c);
                     c->unbounded_spawn_in_func = true;
                 }
             }
@@ -17485,6 +17646,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
          * it (`wr(t + 1)` after `u32 t = rd();`, `wr(&g, g + 1)`, a forwarding
          * helper, an indirect call's candidates) read-modify-writes it. */
         call_rmw_globals(c, c->rmw_taints, c->rmw_taint_count, node, main_call_rmw_hit, NULL);
+        vf_for_each_callee(c, node, main_call_gin, node);   /* BUG-1650 */
         if (node->call.callee) {
             Node *cal = node->call.callee;
             Symbol *rc = (cal->kind == NODE_IDENT)
@@ -17821,13 +17983,17 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                          * conditional-nesting check above, so a join on SOME paths
                          * leaves the window open — the same conservative direction
                          * that check already takes for the borrow. */
+                        /* BUG-1648: in a function with a goto / label the window
+                         * is latched — only a join after the last jump, outside any
+                         * conditional body, releases anything. */
+                        bool latch_holds = esc_latch_holds(c, (int)node->loc.line);
                         if (osym2->th_live) {
                             osym2->th_live = false;
                             if (c->live_scoped_threads > 0) c->live_scoped_threads--;
-                            if (c->live_scoped_threads == 0)
+                            if (c->live_scoped_threads == 0 && !latch_holds)
                                 c->lent_param_live_mask = 0;   /* BUG-1303 */
                             if (c->live_scoped_threads == 0 &&
-                                !c->unbounded_spawn_in_func) {
+                                !c->unbounded_spawn_in_func && !latch_holds) {
                                 c->after_spawn_in_func = false;
                                 c->once_lent_count = 0;   /* BUG-1276 */
                             }
@@ -17836,16 +18002,26 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrow_names[bi],
                                 osym2->th_borrow_lens[bi]);
-                            if (bv) bv->is_borrowed_by_thread = false;
+                            if (bv) {
+                                bv->lend_live = false;
+                                if (!bv->borrow_latched)   /* a latched one: esc_latch_release_all */
+                                    bv->is_borrowed_by_thread = false;
+                            }
                         }
                         osym2->th_borrow_count = 0;
                         if (osym2->th_borrows_name) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrows_name, osym2->th_borrows_name_len);
-                            if (bv) bv->is_borrowed_by_thread = false;
+                            if (bv) {
+                                bv->lend_live = false;
+                                if (!bv->borrow_latched)   /* a latched one: esc_latch_release_all */
+                                    bv->is_borrowed_by_thread = false;
+                            }
                             osym2->th_borrows_name = NULL;
                             osym2->th_borrows_name_len = 0;
                         }
+                        if (!latch_holds && c->live_scoped_threads == 0)
+                            esc_latch_release_all(c);   /* BUG-1648 */
                         result = ty_void;
                         typemap_set(c, field_node, result);
                         break;
@@ -25446,6 +25622,10 @@ typedef struct {
     SyncBind *bind; int nbind, cbind;
     int frame;                /* first binding of the function being walked */
     Node *fnode;              /* the function being walked (indirect callees) */
+    /* BUG-1649: a Handle auto-deref in a body the checker finished AFTER the
+     * spawn site was scanned (`late_seq` >= 0 arms the check). */
+    int late_seq;
+    Symbol *late_alloc;
 } SyncWalk;
 typedef struct { Symbol **v; int n, cap; bool direct; } SyncGl;
 static void sync_gl_add(SyncGl *l, Symbol *g) {
@@ -25572,11 +25752,28 @@ static void sync_record_bound(SyncWalk *w, Node *place, bool write, SyncCtx ctx)
     }
 }
 /* An lvalue: its ROOT is named, not read; its index expressions are read. */
+/* BUG-1649: `h.v` is a call into its Pool / Slab (BUG-1625), named only by the
+ * checker's annotation on the node. The spawn-site scan reads that annotation, so
+ * a target (or a callee of it) whose body was checked AFTER the spawn site showed
+ * it nothing. Seen here, once every body is checked — a read AND an assignment
+ * target (the two walks below). `late_seq` > 0 arms it (thread walks only). */
+static void sync_late_alloc(SyncWalk *w, Node *n) {
+    if (w->late_seq <= 0 || w->phase != SW_THREAD || w->late_alloc) return;
+    if (!n || n->kind != NODE_FIELD || !n->field.handle_alloc) return;
+    if (!w->fnode || w->fnode->kind != NODE_FUNC_DECL) return;
+    int seq = w->fnode->func_decl.body_checked_seq;
+    if (seq != 0 && seq <= w->late_seq - 1) return;   /* the scan saw this body checked */
+    Symbol *as = n->field.handle_alloc;
+    if (as->type && !as->is_function && spawn_global_needs_sync(w->c, as))
+        w->late_alloc = as;
+}
 static void sync_lvalue(SyncWalk *w, Node *t, SyncCtx ctx, int depth) {
     if (!t || depth > ZER_EXPR_WALK_MAX) return;
     switch (t->kind) {
     case NODE_IDENT: return;
-    case NODE_FIELD: sync_lvalue(w, t->field.object, ctx, depth + 1); return;
+    case NODE_FIELD:
+        sync_late_alloc(w, t);   /* BUG-1649 */
+        sync_lvalue(w, t->field.object, ctx, depth + 1); return;
     case NODE_INDEX:
         sync_lvalue(w, t->index_expr.object, ctx, depth + 1);
         sync_walk(w, t->index_expr.index, ctx, depth + 1);
@@ -25837,7 +26034,9 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_ONCE:      return;
     case NODE_AWAIT:     SW(n->await_stmt.cond); return;
     case NODE_BINARY:    SW(n->binary.left); SW(n->binary.right); return;
-    case NODE_FIELD:     sync_record_bound(w, n, false, ctx); SW(n->field.object); return;
+    case NODE_FIELD:
+        sync_late_alloc(w, n);   /* BUG-1649 */
+        sync_record_bound(w, n, false, ctx); SW(n->field.object); return;
     case NODE_INDEX:
         sync_record_bound(w, n, false, ctx);
         SW(n->index_expr.object); SW(n->index_expr.index);
@@ -26035,6 +26234,7 @@ static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line,
     s->downgraded = downgraded;
     s->binds = NULL; s->nbind = 0;
     s->file = c->file_name; s->source = c->source; s->line = line;
+    s->seq = c->body_check_seq;   /* BUG-1649 */
     /* BUG-1565 (C2): what each argument points at, resolved now — the
      * argument's own scope is live here and gone by the post pass. */
     if (!spawn || !target || !target->func_node || target->func_node->kind != NODE_FUNC_DECL)
@@ -26194,6 +26394,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             SyncWalk tw;
             memset(&tw, 0, sizeof(tw));
             tw.c = c; tw.out = &thr[i]; tw.phase = SW_THREAD; tw.fnode = t->func_node;
+            tw.late_seq = s->seq + 1;   /* BUG-1649 (0 = unarmed) */
             /* the target's params, bound to what the spawn handed them */
             Node *fd = t->func_node;
             for (int p = 0; p < fd->func_decl.param_count; p++) {
@@ -26211,6 +26412,16 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             DeclModuleSave dm = decl_module_enter(c, t);
             sync_walk(&tw, t->func_node->func_decl.body, none, 0);
             decl_module_leave(c, dm);
+            if (tw.late_alloc) {   /* BUG-1649 */
+                c->file_name = s->file; c->source = s->source;
+                checker_error(c, s->line,
+                    "spawn target '%.*s' accesses non-shared global '%.*s' through a "
+                    "Handle auto-deref (`h.field` is a call into that Pool / Slab) — "
+                    "data race. Wrap the access in a shared struct, or give each "
+                    "thread its own allocator",
+                    (int)t->name_len, t->name,
+                    (int)tw.late_alloc->name_len, tw.late_alloc->name);
+            }
             sync_walk_free(&tw);
         }
         Symbol *e = s->encl;
@@ -28857,7 +29068,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
             (subtree_can_detach(c, node->for_stmt.body) ||
              subtree_can_detach(c, node->for_stmt.cond) ||
              subtree_can_detach(c, node->for_stmt.step))) {
-            c->after_spawn_in_func = true;
+            c->after_spawn_in_func = true; esc_note_spawn(c);
             c->unbounded_spawn_in_func = true;
         }
         /* BUG-854: the lowerer runs a for-loop's INIT before installing that loop's
@@ -29219,7 +29430,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
         if (!c->after_spawn_in_func &&
             (subtree_can_detach(c, node->while_stmt.body) ||
              subtree_can_detach(c, node->while_stmt.cond))) {
-            c->after_spawn_in_func = true;
+            c->after_spawn_in_func = true; esc_note_spawn(c);
             c->unbounded_spawn_in_func = true;
         }
         /* BUG-1015 (2026-09-13): the condition is checked AFTER the body's writes
@@ -30770,7 +30981,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
         if (!c->after_spawn_in_func && c->current_func_node &&
             c->current_func_node->kind == NODE_FUNC_DECL &&
             subtree_can_detach(c, c->current_func_node->func_decl.body)) {
-            c->after_spawn_in_func = true;
+            c->after_spawn_in_func = true; esc_note_spawn(c);
             c->unbounded_spawn_in_func = true;
         }
         /* BUG-1012 (from qo0mm9 d0e6b116): a label inside a defer body. `goto` is
@@ -30926,7 +31137,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
             if (!c->after_spawn_in_func && c->current_func_node &&
                 c->current_func_node->kind == NODE_FUNC_DECL &&
                 subtree_can_detach(c, c->current_func_node->func_decl.body)) {
-                c->after_spawn_in_func = true;
+                c->after_spawn_in_func = true; esc_note_spawn(c);
                 c->unbounded_spawn_in_func = true;
             }
             check_stmt(c, node->defer.body);
@@ -32180,7 +32391,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
          * So a scoped spawn opens the window too, and the join CLOSES it — but only
          * the last one, and never if a fire-and-forget spawn also ran. */
         if (node->spawn_stmt.handle_name == NULL) {
-            c->after_spawn_in_func = true;
+            c->after_spawn_in_func = true; esc_note_spawn(c);
             c->unbounded_spawn_in_func = true;
         }
         Symbol *func_sym = global_decl_lookup(c,
@@ -32218,7 +32429,9 @@ static void check_stmt_impl(Checker *c, Node *node) {
         bool is_scoped = (node->spawn_stmt.handle_name != NULL);
         /* Check each argument — type-check + pointer safety */
         for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
+            esc_latch_suspend(c, false);   /* BUG-1648 */
             Type *arg_type = check_expr(c, node->spawn_stmt.args[i]);
+            esc_latch_suspend(c, true);
             if (!arg_type) continue;
             /* BUG-1160: a struct LITERAL has no type of its own (check_expr
              * returns void; the context supplies it). Type it against the
@@ -32614,6 +32827,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
                 sym->th_spawn_branch_depth = c->branch_depth;
                 c->live_scoped_threads++;
                 c->after_spawn_in_func = true;
+                if (!node->spawn_stmt.window_closed) esc_note_spawn(c);   /* BUG-1648 */
                 typemap_set(c, node, ty_u64);
                 /* Scoped-borrow exclusivity: a non-shared stack local lent via
                  * `&x` to a scoped spawn is exclusively borrowed by the thread
@@ -32820,7 +33034,8 @@ static void check_stmt_impl(Checker *c, Node *node) {
                      * parent-write check cannot see. Reject an already-borrowed
                      * local; join() clears the flag, so sequential borrow (spawn,
                      * join, spawn again) still compiles. */
-                    if (vs->is_borrowed_by_thread) {
+                    if (vs->is_borrowed_by_thread &&
+                        !(vs->borrow_latched && !vs->lend_live)) {   /* BUG-1648: the latch is not a lend */
                         checker_error(c, node->loc.line,
                             "'%.*s' is already borrowed by a live scoped spawn — "
                             "lending it to a second thread is a data race. join() "
@@ -32829,10 +33044,20 @@ static void check_stmt_impl(Checker *c, Node *node) {
                         continue;
                     }
                     vs->is_borrowed_by_thread = true;
+                    vs->lend_live = true;
                     {   /* BUG-1303: a PARAM lent (or a local holding one) */
                         int lp = param_pos_named(c, vn, vl);
                         if (lp < 0 && vs->param_alias_pos1 > 0) lp = vs->param_alias_pos1 - 1;
                         if (lp >= 0 && lp < 64) c->lent_param_live_mask |= (1ULL << lp);
+                        /* BUG-1648: under a goto two spawn sites cannot be ordered */
+                        if (!esc_note_lent(c, vs, lp, vglobal, node,
+                                           node->spawn_stmt.window_closed))
+                            checker_error(c, node->loc.line,
+                                "'%.*s' is lent to a scoped spawn at two places in a "
+                                "function with a goto / label — a jump can run both "
+                                "threads at once (data race). Lend it from one spawn, "
+                                "or move each spawn..join into its own function",
+                                (int)vl, vn);
                     }
                     if (vglobal) {   /* BUG-1125: the parent's CALLEES are checked too */
                         if (c->lent_global_count >= c->lent_global_cap) {
@@ -34682,13 +34907,15 @@ static bool all_paths_return(Node *node) {
  * The final walk does not repeat a diagnostic the first one already printed.
  * A function in which no such taint appears — nearly all of them — is walked once.
  * ================================================================ */
-enum { ESC_LOCAL = 1, ESC_ARENA = 2, ESC_FROM_ARENA = 4, ESC_NONKEEP = 8, ESC_KEEPD = 16 };
+enum { ESC_LOCAL = 1, ESC_ARENA = 2, ESC_FROM_ARENA = 4, ESC_NONKEEP = 8, ESC_KEEPD = 16,
+       ESC_LENT = 32 /* BUG-1648: lent to a scoped spawn somewhere in the function */ };
 typedef struct EscFact {
     const void *loop;        /* the loop node, or NULL = "ever, anywhere in the function" */
     const char *key;         /* the declaration's name pointer: one per declaration */
     uint32_t bits;
     uint64_t nk_mask;
     int nk_root;
+    const void *lend_site;   /* BUG-1648: the one spawn that lends this declaration */
 } EscFact;
 struct EscState {
     EscFact *facts; int n, cap;
@@ -34699,6 +34926,16 @@ struct EscState {
     int dedupe_from, dedupe_to;   /* the final walk does not repeat these diagnostics */
     uint64_t growth;    /* monotone count of fact bits, to detect the fixpoint */
     bool saturate;      /* BUG-1489: no convergence within the cap — apply the union */
+    /* BUG-1648: the scoped-spawn window in a function with a label / goto. */
+    bool has_spawn;     /* the function spawns (any kind) */
+    bool latch;         /* this walk holds the window open from the function's entry */
+    int last_jump_line; /* line of the textually last goto / label */
+    uint64_t lent_params;            /* params lent to a scoped spawn, by position */
+    Symbol **lent_glob; int lent_glob_n, lent_glob_cap;   /* globals lent */
+    /* BUG-1650: the value-taint (BUG-1010) an outer local holds at the END of a
+     * loop body reaches the top on the back edge — `g = x + 1; x = g;`. */
+    struct EscRmw { const void *loop; const char *name; uint32_t len; Symbol *g; } *rmw;
+    int rmw_n, rmw_cap;
 };
 
 static bool esc_fn_is_sticky(Checker *c) {
@@ -34753,6 +34990,7 @@ static bool esc_fact_or(struct EscState *e, const void *loop, const char *key,
         }
         f = &e->facts[e->n++];
         f->loop = loop; f->key = key; f->bits = 0; f->nk_mask = 0; f->nk_root = root;
+        f->lend_site = NULL;
     }
     uint32_t nb = f->bits | bits;
     uint64_t nm = f->nk_mask | mask;
@@ -34795,21 +35033,171 @@ static void esc_apply_fact(Checker *c, const void *loop, Symbol *s) {
         } \
 } while (0)
 
+/* ---- BUG-1648: the scoped-spawn window in a function with a label / goto ----
+ * The borrow of a variable lent to a scoped spawn, and the function's concurrent
+ * window (`after_spawn_in_func`, the lent-param mask, the lent globals), are
+ * facts set at the spawn and cleared at the join IN TEXT ORDER. A goto runs code
+ * written BEFORE the spawn inside the window, and code written after the join
+ * before it:
+ *     goto S;  W: x = 3; goto J;  S: th = spawn w(&x); goto W;  J: th.join();
+ * wrote `x` while the thread held it (TSan). In a function with a jump the window
+ * is therefore LATCHED: every declaration some spawn lends is borrowed from its
+ * declaration on (a param / global from the function's entry), the window flags
+ * are on from the entry, and a join releases nothing — except a join written
+ * after the LAST jump and outside any conditional body, from which control can
+ * only run forward (every thread still running there is one zercheck_ir's CFG
+ * requires a later join for). One declaration may be lent by ONE spawn site
+ * only: the textual double-lend check cannot order two sites under a goto.
+ * Facts ride the escape fixpoint: the first walk records them and raises an
+ * event, the re-walks apply them. */
+static bool esc_lent_fact(Checker *c, const Symbol *s) {
+    EscFact *f = esc_fact_find(c->esc, NULL, s->name);
+    return f && (f->bits & ESC_LENT);
+}
+static void lent_global_push(Checker *c, Symbol *vs) {
+    for (int i = 0; i < c->lent_global_count; i++)
+        if (c->lent_globals[i] == vs) return;
+    if (c->lent_global_count >= c->lent_global_cap) {
+        int nc = c->lent_global_cap ? c->lent_global_cap * 2 : 8;
+        Symbol **nl = (Symbol **)arena_alloc(c->arena, (size_t)nc * sizeof(Symbol *));
+        if (!nl) return;
+        if (c->lent_global_count)
+            memcpy(nl, c->lent_globals, (size_t)c->lent_global_count * sizeof(Symbol *));
+        c->lent_globals = nl;
+        c->lent_global_cap = nc;
+    }
+    c->lent_globals[c->lent_global_count++] = vs;
+}
+static void esc_note_spawn(Checker *c) {
+    if (!esc_on(c) || !c->esc->sticky || c->esc->has_spawn) return;
+    c->esc->has_spawn = true;
+    c->esc->growth++;
+    c->esc->event = true;
+}
+/* Record that `site` lends `vs`. False when ANOTHER spawn site already lends it. */
+static bool esc_note_lent(Checker *c, Symbol *vs, int param_pos, bool is_global,
+                          const void *site, bool closed) {
+    if (!esc_on(c) || !c->esc->sticky) return true;
+    struct EscState *e = c->esc;
+    if (closed) {   /* records nothing; must not meet an OPEN window's lend */
+        EscFact *cf = esc_fact_find(e, NULL, vs->name);
+        return !(cf && (cf->bits & ESC_LENT) && cf->lend_site != site);
+    }
+    if (esc_fact_or(e, NULL, vs->name, ESC_LENT, 0, 0)) e->event = true;
+    EscFact *f = esc_fact_find(e, NULL, vs->name);
+    bool one_site = true;
+    if (f) {
+        if (!f->lend_site) f->lend_site = site;
+        else if (f->lend_site != site) one_site = false;
+    }
+    if (param_pos >= 0 && param_pos < 64 && !(e->lent_params & (1ULL << param_pos))) {
+        e->lent_params |= (1ULL << param_pos);
+        e->growth++; e->event = true;
+    }
+    if (is_global) {
+        bool have = false;
+        for (int i = 0; i < e->lent_glob_n; i++) if (e->lent_glob[i] == vs) have = true;
+        if (!have) {
+            if (e->lent_glob_n >= e->lent_glob_cap) {
+                int nc = e->lent_glob_cap ? e->lent_glob_cap * 2 : 8;
+                Symbol **nl = (Symbol **)realloc(e->lent_glob, (size_t)nc * sizeof(Symbol *));
+                if (!nl) return one_site;
+                e->lent_glob = nl; e->lent_glob_cap = nc;
+            }
+            e->lent_glob[e->lent_glob_n++] = vs;
+            e->growth++; e->event = true;
+        }
+    }
+    return one_site;
+}
+/* Function entry (params are in scope): open the latched window. */
+static void esc_latch_enter(Checker *c) {
+    if (!esc_on(c)) return;
+    struct EscState *e = c->esc;
+    e->latch = e->sticky && e->has_spawn;
+    if (!e->latch) return;
+    c->after_spawn_in_func = true;
+    c->lent_param_live_mask |= e->lent_params;
+    ESC_FOR_LOCAL_SYMS(c, s, {
+        if (esc_lent_fact(c, s)) { s->is_borrowed_by_thread = true; s->borrow_latched = true; }
+    });
+    for (int i = 0; i < e->lent_glob_n; i++) {
+        e->lent_glob[i]->is_borrowed_by_thread = true;
+        e->lent_glob[i]->borrow_latched = true;
+        lent_global_push(c, e->lent_glob[i]);
+    }
+}
+/* Function exit: a global's flags outlive the walk — put them back. */
+static void esc_latch_leave(Checker *c) {
+    if (!esc_on(c) || !c->esc->sticky) return;
+    struct EscState *e = c->esc;
+    for (int i = 0; i < e->lent_glob_n; i++) {
+        e->lent_glob[i]->is_borrowed_by_thread = false;
+        e->lent_glob[i]->borrow_latched = false;
+        e->lent_glob[i]->lend_live = false;
+    }
+    e->latch = false;
+}
+/* A local declaration some spawn lends: borrowed from here on. */
+static void esc_latch_decl(Checker *c, Symbol *s) {
+    if (!esc_on(c) || !c->esc->latch || !s) return;
+    if (esc_lent_fact(c, s)) { s->is_borrowed_by_thread = true; s->borrow_latched = true; }
+}
+/* Does the latch keep the window open across a join written at `line`? */
+static bool esc_latch_holds(Checker *c, int line) {
+    return esc_on(c) && c->esc->latch &&
+           !(line > c->esc->last_jump_line && c->branch_depth == 0);
+}
+/* The join after the last jump, with no thread left running: the latch ends. */
+static void esc_latch_release_all(Checker *c) {
+    if (!esc_on(c) || !c->esc->latch) return;
+    struct EscState *e = c->esc;
+    ESC_FOR_LOCAL_SYMS(c, s, {
+        if (s->borrow_latched) {
+            s->borrow_latched = false;
+            if (!s->lend_live) s->is_borrowed_by_thread = false;
+        }
+    });
+    for (int i = 0; i < e->lent_glob_n; i++) {
+        Symbol *g = e->lent_glob[i];
+        g->borrow_latched = false;
+        if (!g->lend_live) g->is_borrowed_by_thread = false;
+    }
+    e->latch = false;
+}
+/* A spawn's ARGUMENTS are evaluated before its thread exists, and name the very
+ * variables it lends: the latch (not a live textual lend) is lifted around them. */
+static void esc_latch_suspend(Checker *c, bool resume) {
+    if (!esc_on(c) || !c->esc->latch) return;
+    struct EscState *e = c->esc;
+    ESC_FOR_LOCAL_SYMS(c, s, {
+        if (s->borrow_latched && !s->lend_live) s->is_borrowed_by_thread = resume;
+    });
+    for (int i = 0; i < e->lent_glob_n; i++)
+        if (e->lent_glob[i]->borrow_latched && !e->lent_glob[i]->lend_live)
+            e->lent_glob[i]->is_borrowed_by_thread = resume;
+}
+
 /* Does this function body contain a label or a goto — in a statement, or in an
  * orelse block reached through an expression? Exhaustive; the conservative
  * direction (sticky) is "yes". */
+static int _esc_jump_last_line;   /* BUG-1648: max line of a goto / label seen by the walk */
 static bool esc_has_jump(Checker *c, Node *n, int depth);
 static bool esc_has_jump_ob(Checker *c, Node *blk, void *ud) {
     return esc_has_jump(c, blk, *(int *)ud + 1);
 }
 static bool esc_has_jump(Checker *c, Node *n, int depth) {
     if (!n) return false;
-    if (depth > ZER_EXPR_WALK_MAX) return true;
+    if (depth > ZER_EXPR_WALK_MAX) { _esc_jump_last_line = 0x7fffffff; return true; }
     int d = depth;
     if (for_each_orelse_block(c, n, esc_has_jump_ob, &d, 0)) return true;
     #define EHJ(x) do { if (esc_has_jump(c, (x), depth + 1)) return true; } while (0)
     switch (n->kind) {
-    case NODE_GOTO: case NODE_LABEL: return true;
+    /* BUG-1648: the walk no longer stops at the first jump — it records the LAST
+     * one's line (the caller reads `_esc_jump_last_line > 0` as "has a jump"). */
+    case NODE_GOTO: case NODE_LABEL:
+        if ((int)n->loc.line > _esc_jump_last_line) _esc_jump_last_line = (int)n->loc.line;
+        return false;
     case NODE_BLOCK: for (int i = 0; i < n->block.stmt_count; i++) EHJ(n->block.stmts[i]); return false;
     case NODE_IF: EHJ(n->if_stmt.then_body); EHJ(n->if_stmt.else_body); return false;
     case NODE_FOR: EHJ(n->for_stmt.init); EHJ(n->for_stmt.body); return false;
@@ -34890,7 +35278,36 @@ static void esc_check_loop(Checker *c, Node *node) {
         ent[cnt].m = s->is_nonkeep_derived ? s->nonkeep_root_mask : 0;
         cnt++;
     });
+    for (int i = 0; i < e->rmw_n; i++)   /* BUG-1650: the back edge's value taints */
+        if (e->rmw[i].loop == node)
+            rmw_tab_add(&c->rmw_taints, &c->rmw_taint_count, &c->rmw_taint_capacity,
+                        e->rmw[i].name, e->rmw[i].len, e->rmw[i].g);
     check_stmt_impl(c, node);
+    for (int i = 0; i < cnt; i++) {   /* BUG-1650: record what the body left */
+        Symbol *s = ent[i].s;
+        for (int r = 0; r < c->rmw_taint_count; r++) {
+            RmwTaintEnt *t = &c->rmw_taints[r];
+            if (!t->global || t->name_len != s->name_len ||
+                memcmp(t->name, s->name, s->name_len) != 0) continue;
+            bool have = false;
+            for (int k = 0; k < e->rmw_n; k++)
+                if (e->rmw[k].loop == node && e->rmw[k].g == t->global &&
+                    e->rmw[k].len == s->name_len &&
+                    memcmp(e->rmw[k].name, s->name, s->name_len) == 0) { have = true; break; }
+            if (have) continue;
+            if (e->rmw_n >= e->rmw_cap) {
+                int nc = e->rmw_cap ? e->rmw_cap * 2 : 8;
+                struct EscRmw *nb = (struct EscRmw *)realloc(e->rmw, (size_t)nc * sizeof(*nb));
+                if (!nb) break;
+                e->rmw = nb; e->rmw_cap = nc;
+            }
+            e->rmw[e->rmw_n].loop = node; e->rmw[e->rmw_n].name = s->name;
+            e->rmw[e->rmw_n].len = s->name_len; e->rmw[e->rmw_n].g = t->global;
+            e->rmw_n++;
+            e->growth++;
+            e->event = true;
+        }
+    }
     for (int i = 0; i < cnt; i++) {
         Symbol *s = ent[i].s;
         uint32_t gain = esc_bits(s) & ~ent[i].b;
@@ -34903,8 +35320,50 @@ static void esc_check_loop(Checker *c, Node *node) {
     if (ent != stk) free(ent);
 }
 
+/* BUG-1648: a CLOSED window — `ThreadHandle th = spawn f(..); ...; th.join();`
+ * in one statement list with no goto / label between the two. No jump can enter
+ * the region (it holds no label) or leave it (no goto; a break / continue /
+ * return out of it leaves the thread unjoined, which zercheck_ir's CFG refuses),
+ * so the code outside it never runs beside that thread and the plain textual
+ * rule is exact for it. Only an OPEN window needs the latch. */
+static bool esc_stmt_has_jump(Checker *c, Node *n) {
+    int sv = _esc_jump_last_line;
+    _esc_jump_last_line = 0;
+    bool r = esc_has_jump(c, n, 0) || _esc_jump_last_line > 0;
+    _esc_jump_last_line = sv;
+    return r;
+}
+static bool esc_is_join_of(Node *st, const char *h, size_t hl) {
+    if (!st || st->kind != NODE_EXPR_STMT) return false;
+    Node *e = st->expr_stmt.expr;
+    if (!e || e->kind != NODE_CALL || !e->call.callee ||
+        e->call.callee->kind != NODE_FIELD) return false;
+    Node *f = e->call.callee;
+    if (f->field.field_name_len != 4 || memcmp(f->field.field_name, "join", 4) != 0)
+        return false;
+    Node *o = f->field.object;
+    return o && o->kind == NODE_IDENT && (size_t)o->ident.name_len == hl &&
+           memcmp(o->ident.name, h, hl) == 0;
+}
+static void esc_mark_closed_spawns(Checker *c, Node *blk) {
+    for (int i = 0; i < blk->block.stmt_count; i++) {
+        Node *st = blk->block.stmts[i];
+        if (!st || st->kind != NODE_SPAWN || !st->spawn_stmt.handle_name) continue;
+        st->spawn_stmt.window_closed = false;
+        for (int j = i + 1; j < blk->block.stmt_count; j++) {
+            Node *nx = blk->block.stmts[j];
+            if (esc_is_join_of(nx, st->spawn_stmt.handle_name, st->spawn_stmt.handle_name_len)) {
+                st->spawn_stmt.window_closed = true;
+                break;
+            }
+            if (esc_stmt_has_jump(c, nx)) break;
+        }
+    }
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node || !esc_on(c)) { check_stmt_impl(c, node); return; }
+    if (node->kind == NODE_BLOCK && c->esc->sticky) esc_mark_closed_spawns(c, node);   /* BUG-1648 */
     switch (node->kind) {
     case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
         esc_check_loop(c, node);
@@ -34916,6 +35375,7 @@ static void check_stmt(Checker *c, Node *node) {
         if (s) {
             esc_note_ever(c, s);
             if (c->esc->sticky) esc_apply_fact(c, NULL, s);
+            esc_latch_decl(c, s);   /* BUG-1648 */
         }
         return;
     }
@@ -35040,7 +35500,11 @@ static void check_func_body(Checker *c, Node *node) {
     struct EscState *e = c->esc;
     e->n = 0; e->growth = 0; e->event = false; e->defers_seen = 0; e->saturate = false;
     e->dedupe_from = e->dedupe_to = 0;
-    e->sticky = esc_has_jump(c, body, 0);
+    _esc_jump_last_line = 0;
+    e->sticky = esc_has_jump(c, body, 0) || _esc_jump_last_line > 0;
+    e->last_jump_line = _esc_jump_last_line;
+    e->has_spawn = false; e->latch = false; e->lent_params = 0; e->lent_glob_n = 0;
+    e->rmw_n = 0;
     Checker *snap = (Checker *)malloc(sizeof(Checker));
     if (!snap) { check_func_body_once(c, node); return; }
     *snap = *c;
@@ -35075,6 +35539,8 @@ static void check_func_body(Checker *c, Node *node) {
     e->active = false;
     e->saturate = false;
     free(snap);
+    if (node->kind == NODE_FUNC_DECL)   /* BUG-1649 */
+        node->func_decl.body_checked_seq = ++c->body_check_seq;
 }
 
 static void check_func_body_once(Checker *c, Node *node) {
@@ -35323,7 +35789,9 @@ static void check_func_body_once(Checker *c, Node *node) {
         c->var_range_count = 0;
         c->rmw_taint_count = 0;   /* BUG-1010: per-function, same lifetime as VarRange */
         c->rmw_ptr_carrier_count = 0;   /* BUG-1046 */
+        esc_latch_enter(c);   /* BUG-1648 */
         check_stmt(c, node->func_decl.body);
+        esc_latch_leave(c);
         /* NOT DONE — the mirror of ISR-TRANS (a transitive global-access walk over
          * every REGULAR function body, so an RMW reached from main through a
          * helper is attributed to main) was implemented and REVERTED: with the
@@ -42811,6 +43279,7 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
 
     /* Interrupt safety — validate shared globals (global state, collected while
      * every body was checked) */
+    check_mem_split_rmw(c);   /* BUG-1650: before the rule reads the RMW flags */
     if (c->isr_global_count > 0 || c->mmio_access_count > 0) {   /* BUG-1480 */
         check_interrupt_safety(c);
     }

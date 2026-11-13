@@ -1,0 +1,32 @@
+// BUG-1619: a literal TREE (`~0xFFF`) meeting a wider integer operand is
+// computed at that operand's width, exactly as it is when it flows into a
+// declaration, a compound assignment or an argument. Pre-fix the tree stayed
+// u32 in a binary-operand position and was zero-extended: the page-align idiom
+// `addr & ~0xFFF` on a u64 cleared the upper 32 bits.
+u64 hide(u64 x) {
+    u64 r = 0;
+    for (u32 i = 0; i < 64; i += 1) { r = r | (x & ((u64)1 << i)); }
+    return r;
+}
+u64 page_a(u64 x) { return x & ~0xFFF; }
+u64 page_b(u64 x) { x &= ~0xFFF; return x; }
+u64 page_c(u64 x) { u64 m = ~0xFFF; return x & m; }
+
+u32 main() {
+    u64 addr = hide(0x123456789ABC);
+    if (page_a(addr) != 0x123456789000) { return 1; }
+    if (page_a(addr) != page_b(addr)) { return 2; }
+    if (page_a(addr) != page_c(addr)) { return 3; }
+    if ((~0xFFF & addr) != 0x123456789000) { return 4; }      // literal on the left
+    u64 ones = hide(0xFFFFFFFFFFFFFFFF);
+    if (!(ones == ~0)) { return 5; }                          // all-ones at u64
+    if ((addr | ~0xFF) != 0xFFFFFFFFFFFFFFBC) { return 6; }
+    i64 s = (i64)hide(0x123456789ABC);
+    if ((s & ~0xFFF) != 0x123456789000) { return 7; }
+    // an explicit 32-bit mask is still a 32-bit mask
+    if ((addr & 0xFFFFF000) != 0x56789000) { return 8; }
+    // a u32 operand is unaffected
+    u32 w = (u32)hide(0xDEADBEEF);
+    if ((w & ~0xFF) != 0xDEADBE00) { return 9; }
+    return 0;
+}

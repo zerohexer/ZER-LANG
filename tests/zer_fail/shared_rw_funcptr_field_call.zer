@@ -1,5 +1,8 @@
 // EXPECTED: compile error
-// expect-error: calls through a function pointer
+// expect-error: lock is not re-entrant
+// (BUG-1609: `g.cb = f` is a write of part of `g`, so the call now resolves to
+// every function of the field's signature and the diagnostic names the real
+// defect — the callee takes S again — rather than "the target is not known".)
 // BUG-980b (from claude/loving-davinci-vgonmt, body verbatim): the funcptr is a FIELD of the shared(rw) struct itself —
 // `g.cb()` reads the field under g's write lock and calls through it while the
 // lock is held (the BUG-795 callee-position form). A callback that touches g

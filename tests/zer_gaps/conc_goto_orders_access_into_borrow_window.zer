@@ -1,0 +1,16 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a goto runs a write of a lent local inside the spawn..join window (the borrow rule is textual; TSan)
+void w(*u32 p) { *p = 5; }
+u32 main() {
+    u32 x = 0;
+    u32 n = 0;
+    goto S;
+W:
+    x = 3;
+    goto J;
+S:
+    ThreadHandle th = spawn w(&x);
+    goto W;
+J:
+    th.join();
+    return x;
+}

@@ -729,10 +729,27 @@ void check_keep_inference(Checker *c);
 bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len);
 /* BUG-1184: is `&name` formed anywhere in `n` (a reassignment does not count)? */
 bool ast_name_addr_taken(Node *n, const char *name, uint32_t len);
+/* BUG-1609: as ast_name_mutated_or_addrd, plus writes of / addresses into PART
+ * of the object (field / element / bit-slice / view / pointer capture). For a
+ * name that is not itself a pointer, slice or Handle. */
+bool ast_name_part_mutated_or_addrd(Node *n, const char *name, uint32_t len, bool scalar);
+/* BUG-1610: an address / view of the object or of part of it (no assignment). */
+/* `scalar`: the name holds an integer, so `name[hi..lo]` read is a bit extract. */
+bool ast_name_part_addr_taken(Node *n, const char *name, uint32_t len, bool scalar);
 /* BUG-1124: the visitor form — fn(value-or-NULL, ud) per write; true stops. */
 /* `kind`: ANW_ASSIGN (`value` is the assigned value for `=`, NULL for a compound
  * operator), ANW_ADDR (`&name`), ANW_OPAQUE (a node the walk cannot see into). */
-enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2 };
+enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2,
+       /* BUG-1609, reported by the PARTS walk only: a write of part of the
+        * object (`name.f = v`), an address / view into part of it (`&name.f`,
+        * `name.arr[a..b]`, a `|*v|` capture of `name.opt`). */
+       ANW_PART_ASSIGN = 3, ANW_PART_ADDR = 4,
+       /* BUG-1609: `if (name) |*v|` / `switch (name) { .a => |*v| ... }` — the
+        * capture is a pointer INTO the object, so the object can be written
+        * through it with no assignment or `&` naming it. Reported by every
+        * walk; it is not an `&name` (ast_name_addr_taken: the capture cannot
+        * leave its arm), but it is a possible mutation. */
+       ANW_CAPTURE = 5 };
 typedef bool (*AstNameWriteFn)(Node *value, int kind, void *ud);
 bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud);
 int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */

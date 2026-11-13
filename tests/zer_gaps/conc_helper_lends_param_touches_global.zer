@@ -1,0 +1,12 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a helper lends its pointer param to a scoped spawn and writes, by name, the global the caller passed (TSan)
+u32 g;
+void w(*u32 p) { for (u32 i = 0; i < 100000; i += 1) { *p += 1; } }
+void sp(*u32 p) {
+    ThreadHandle th = spawn w(p);
+    g += 1;
+    th.join();
+}
+u32 main() {
+    sp(&g);
+    return 0;
+}

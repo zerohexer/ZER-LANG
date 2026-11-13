@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: cannot spawn inside @critical block
+// BUG-1609: a global funcptr table filled by element assignment has no
+// initializer to trust and is not "never mutated" — the call reaches every
+// function of the element signature.
+void w() { }
+void nop() { }
+void sp() { spawn w(); }
+*() [2] tbl;
+u32 main() {
+    tbl[0] = nop;
+    tbl[1] = sp;
+    @critical { tbl[1](); }
+    return 0;
+}

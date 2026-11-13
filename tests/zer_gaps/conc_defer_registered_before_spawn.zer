@@ -1,0 +1,8 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a defer registered BEFORE a fire-and-forget spawn runs a plain access after it (atomic-cell rule is textual; TSan)
+u32 g;
+void w() { for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&g, 1); } }
+u32 main() {
+    defer { for (u32 j = 0; j < 100000; j += 1) { g += 1; } }
+    spawn w();
+    return 0;
+}

@@ -245,6 +245,34 @@ digit after '0x'": the prefix must be followed by a digit). There is **no octal*
 seventeen, not fifteen as in C). A bare integer literal is `u32`; a literal too
 big for 32 bits (`0x1_0000_0000`) initialises a `u64` fine.
 
+**A literal expression takes the width of what it meets.** An expression made
+only of literals (`~0xFFF`, `1 << 40`, `0 - 1`) is computed at the width of the
+variable it initialises or is assigned to, the parameter it is passed to, the
+value it is returned as — and of the wider integer it is combined or compared
+with. So the page-align idiom works on a `u64` exactly as written, and the
+three spellings below agree:
+
+```zer
+u64 page_a(u64 x) { return x & ~0xFFF; }            // ~0xFFF is computed as a u64
+u64 page_b(u64 x) { x &= ~0xFFF; return x; }
+u64 page_c(u64 x) { u64 m = ~0xFFF; return x & m; }
+
+u32 main() {
+    u64 addr = 0x1234_5678_9ABC;
+    if (page_a(addr) != 0x1234_5678_9000) { return 1; }
+    if (page_a(addr) != page_b(addr)) { return 2; }
+    if (page_a(addr) != page_c(addr)) { return 3; }
+    u64 ones = 0xFFFF_FFFF_FFFF_FFFF;
+    if (!(ones == ~0)) { return 4; }                // ~0 is all ones at u64 here
+    if ((addr & 0xFFFF_F000) != 0x5678_9000) { return 5; }   // an explicit 32-bit mask stays one
+    return 0;
+}
+```
+
+Only when nothing wider is involved does the expression stay `u32` (`u32 w = ~0xFF;`
+is `0xFFFF_FF00`). A shift is typed by its LEFT operand alone, so a literal count
+never widens anything.
+
 A **character literal** `'A'` is a `u8`. It widens to `u32` / `u64`
 implicitly; it does not convert to a signed type (`i8 c = 'A';` is an error).
 Escapes, shared with string literals: `\n \t \r \\ \0 \xHH`, plus `\'` in a
@@ -4743,7 +4771,8 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   a function bound to a local function pointer (`*() fp = bump; fp();`).
 - A read-modify-write (`reg |= 1`, `g = g + 1`) of a volatile global shared with an
   interrupt handler is a compile error OUTSIDE `@critical` (non-atomic RMW) — see
-  `interrupt` for the full set of ISR rules.
+  `interrupt` for the full set of ISR rules, and for the one exception (a single
+  handler updating a counter that the rest of the program only reads).
 - INDEXING a volatile `*T` (`reg[i]`) is bounds-checked against the `mmio`
   declaration, but only when the compiler can DERIVE the bound — which it can do
   only for a pointer obtained directly from `@inttoptr(*T, <const addr>)` inside
@@ -4886,6 +4915,18 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
   `@critical` (or use `@atomic_*`) on EVERY side that does one — an interrupt can
   land between the read and the write. A plain single-word read or store needs
   neither.
+- **The tick-counter exception.** ONE handler may read-modify-write a volatile
+  single-word global with no `@critical` when the rest of the program only READS
+  it: the handler is then the cell's single writer, nothing can run between its
+  load and its store that writes the cell, and a reader sees the old or the new
+  word. The compiler accepts this only when it can see all of it: exactly one
+  handler reaches the global (helpers that only that handler calls count as the
+  handler), no other code assigns it — whole, compound, or a bit-slice
+  (`g[3..0] = 1`) — and its address (`&g`) is taken nowhere in the program.
+  Reading it, including a bit extract `g[3..0]`, is free. Anything else is the
+  rule above. (Like `@critical`, this assumes a handler never runs concurrently
+  with itself; a per-CPU instance of one handler on an SMP system is two writers
+  and needs `@atomic_*`.)
 - TWO interrupt handlers sharing a global are treated exactly like an ISR and
   main: with nested priorities one handler preempts the other mid-update.
 - The same rule covers a peripheral REGISTER reached through a pointer bound to a
@@ -4921,6 +4962,31 @@ u32 main() {
     @critical { ticks += 4; }     // ...on BOTH sides
     u32 now = ticks;              // a plain single-word read needs no @critical
     return now - now;
+}
+```
+
+<!-- audit: compile-only: an interrupt handler only builds for a bare-metal target -->
+```zer
+volatile u32 ticks;               // the tick counter: ONE handler writes it...
+
+interrupt TIM2 { ticks += 1; }    // ...so its read-modify-write needs no @critical
+
+u32 elapsed(u32 since) { return ticks - since; }   // everyone else only reads
+
+u32 main() {
+    u32 start = ticks;
+    while (elapsed(start) < 10) { }
+    return 0;
+}
+```
+
+<!-- audit: expect-error: is read-modify-written and is shared between interrupt and main code -->
+```zer
+volatile u32 ticks;
+interrupt TIM2 { ticks += 1; }    // ERROR — main writes it too (see below)
+u32 main() {
+    ticks = 0;                    // a second writer: put BOTH updates in @critical
+    return 0;
 }
 ```
 
@@ -6069,7 +6135,9 @@ binary operators, comparisons, call arguments, struct-literal fields and array i
 intrinsic arguments (`@saturate(u8, x + bump(&x))`), slice bounds (`a[0 .. x + bump(&x)]`),
 bit-slice positions and the value of a Ring `push`, whether an operand is a local, a
 global or a field. An assignment evaluates its TARGET
-(including every index in it) before its value, and yields the stored value.
+(including every index in it, and the bit positions of a bit-slice target such as
+`a[i][hi..lo] = v`) before its value — also when the value is an `orelse`
+expression and when the assignment is a `for` step — and yields the stored value.
 A PLACE is evaluated from its root outward: in `m[f()][g()]`, `pick().a[k].b` or
 `mk().v[k]`, the object (`m`, `pick()`, `mk()`) comes first, then each index in the
 order written — for a read and for a write alike. The object a `shared struct` access
@@ -6758,6 +6826,12 @@ u32 main() {
 - Handle to spawn → compile error (pool.get not thread-safe). This covers a
   Handle at **any nesting** — bare, inside a struct, inside a nested struct,
   behind `?`, in an array — not just a bare `Handle(T)` argument
+- A Handle a thread obtains some other way (read out of a `shared struct`, say)
+  cannot be dereferenced there either: `h.field` is `pool.get(h).field`, a use of
+  the Pool / Slab, so a spawn target that does it is refused with "accesses
+  non-shared global '<the pool>'" — the same error as naming the pool. The same
+  holds in an `interrupt` handler ("used from both interrupt and main code").
+  Hand the thread the DATA (copy the fields into a `shared struct`), not the handle
 - Scoped spawn: freeing a payload the child still holds **before** `.join()` →
   compile error, including when the payload is carried inside a by-value struct
 - A callback the spawn target invokes is scanned too — if it touches a

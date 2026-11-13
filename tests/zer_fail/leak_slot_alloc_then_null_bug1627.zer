@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: overwritten while alive
+// BUG-1627: resetting a slot that is the last holder of a live allocation leaks it.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H h;
+    h.p = alloc(T);
+    h.p = null;
+    return 0;
+}

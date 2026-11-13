@@ -1,0 +1,25 @@
+// BUG-1609 boundary: a funcptr-carrying global that is `const`, or that no
+// body writes (whole or in part), still resolves to its initializer, so a
+// call through it inside a locked statement / @critical is accepted.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+u32 zero() { return 0; }
+u32 seven() { return 7; }
+u32 rb() { return b.y; }
+struct Ops { *() -> u32 f; u32 tag; }
+const Ops cops = { .f = seven, .tag = 1 };
+Ops ops = { .f = seven, .tag = 2 };
+u32 main() {
+    b.y = 3;
+    a.x = cops.f();
+    u32 r = a.x;
+    a.x = ops.f();
+    u32 t = ops.tag;          // a READ of a field is not a mutation
+    r += a.x;
+    @critical { r += ops.f(); }
+    if (r != 21) { return 1; }
+    if (t != 2) { return 2; }
+    if (rb() != 3) { return 3; }
+    return 0;
+}

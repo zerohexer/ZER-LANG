@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot assign to const variable
+// BUG-1614: a bit-slice store writes bits of the integer it names; the const
+// walk stopped at the slice node and never reached the root.
+u32 main() { const u32 x = 5; x[3..0] = 1; return x; }

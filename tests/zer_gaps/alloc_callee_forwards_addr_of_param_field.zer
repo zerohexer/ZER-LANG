@@ -1,0 +1,23 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a callee forwards &param.field to a freeing helper: two hops lose the frees_param_field summary (exit 99)
+struct T { u32 v; }
+struct H { *T p; }
+struct Ctx { H h; }
+?*T gk;
+void drop2(*H h) { free(h.p); }
+void drop(*Ctx c) { drop2(&c.h); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    Ctx c;
+    c.h.p = a;
+    drop(&c);
+    u32 r = 0;
+    ?*T mb = alloc(T);
+    if (mb) |b| {
+        b.v = 5;
+        a.v = 99;
+        r = b.v;
+        free(b);
+    }
+    gk = a;
+    return r;
+}

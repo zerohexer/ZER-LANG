@@ -1,0 +1,18 @@
+// GAP (2026-11-13 audit, docs/limitations.md): inside a function, a pointer param's field freed by a callee stays ALIVE (exit 99)
+struct T { u32 v; }
+struct H { *T p; }
+void drop(*H h) { free(h.p); }
+u32 reuse(*H h) {
+    drop(h);
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    h.p.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H h = { .p = a };
+    return reuse(&h);
+}

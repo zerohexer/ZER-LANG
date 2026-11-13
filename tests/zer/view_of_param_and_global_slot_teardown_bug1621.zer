@@ -1,0 +1,41 @@
+// BUG-1621..1624: teardown / link / peek helpers written through a VIEW of a
+// parameter's or a global's slot (`*H h = &c.h;`, `&gc.h`, `&tbl[i]`) are the same
+// operations as their direct spellings. Pre-fix this valid program was refused
+// (false leaks, and a false "global left dangling" for the reset through the view).
+struct T { u32 v; }
+struct H { ?*T p; }
+struct Ctx { H h; H[2] hs; }
+H[2] tbl;
+Ctx gc;
+void drop_tbl() { for (u32 i = 0; i < 2; i += 1) { *H h = &tbl[i]; if (h.p) |q| { free(q); } h.p = null; } }
+void drop_ctx(*Ctx c) {
+    *H h = &c.h;
+    if (h.p) |q| { free(q); }
+    h.p = null;
+    for (u32 i = 0; i < 2; i += 1) { *H e = &c.hs[i]; if (e.p) |q| { free(q); } e.p = null; }
+}
+void set_ctx(*Ctx c, *T a) { *H h = &c.h; h.p = a; }
+u32 peek(*Ctx c) { *H h = &c.h; if (h.p) |q| { return q.v; } return 0; }
+void drop_g() { *H h = &gc.h; if (h.p) |q| { free(q); } h.p = null; }
+u32 main() {
+    tbl[0].p = alloc(T);
+    tbl[1].p = alloc(T);
+    drop_tbl();
+    Ctx c;
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    set_ctx(&c, a);
+    c.hs[1].p = alloc(T);
+    u32 r = peek(&c);
+    drop_ctx(&c);
+    gc.h.p = alloc(T);
+    drop_g();
+    // same-function view of a param-like local pointer
+    Ctx d;
+    *Ctx dp = &d;
+    *H dh = &dp.h;
+    dh.p = alloc(T);
+    if (dh.p) |q| { q.v = 3; r += q.v; free(q); }
+    dh.p = null;
+    return r - 10;
+}

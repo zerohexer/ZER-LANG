@@ -1,0 +1,18 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a getter returning a field through a local view is not a view of its argument (exit 99)
+struct T { u32 v; }
+struct H { *T p; }
+struct Ctx { H h; }
+*T get(*Ctx c) { *H h = &c.h; return h.p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    Ctx w;
+    w.h.p = a;
+    *T q = get(&w);
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    q.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

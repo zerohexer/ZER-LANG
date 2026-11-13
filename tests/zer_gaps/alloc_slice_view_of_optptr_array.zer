@@ -1,0 +1,20 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a ?*T read out of a slice view of a local array is not an alias of the slot (exit 99)
+struct T { u32 v; }
+?*T gk;
+u32 main() {
+    *T a = alloc(T) orelse return;
+    ?*T[2] arr;
+    arr[0] = a;
+    [*]?*T s = arr[0..];
+    if (s[0]) |q| { free(q); }
+    u32 r = 0;
+    ?*T mb = alloc(T);
+    if (mb) |b| {
+        b.v = 5;
+        a.v = 99;
+        r = b.v;
+        free(b);
+    }
+    gk = a;
+    return r;
+}

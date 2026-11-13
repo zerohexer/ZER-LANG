@@ -1,0 +1,21 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a callee frees elements of a slice param through a view with a VARIABLE index; the caller's alias stays ALIVE (accept-unsafe, exit 99)
+struct T { u32 v; }
+struct H { ?*T p; }
+?*T gk;
+void drop([*]H s) { for (u32 i = 0; i < 2; i += 1) { *H h = &s[i]; if (h.p) |q| { free(q); } h.p = null; } }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    hs[0].p = a;
+    drop(hs);
+    u32 r = 0;
+    ?*T mb = alloc(T);
+    if (mb) |b| {
+        b.v = 5;
+        a.v = 99;
+        r = b.v;
+        free(b);
+    }
+    gk = a;
+    return r;
+}

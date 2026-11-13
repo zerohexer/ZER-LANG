@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: deadlock: single statement accesses both
+// BUG-1609: `ops.f = rb;` writes PART of the global, so its declaration
+// initializer (`zero`) no longer says what `ops.f()` calls. The statement
+// holds A's lock and the callee takes B's.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+u32 zero() { return 0; }
+u32 rb() { return b.y; }
+struct Ops { *() -> u32 f; }
+Ops ops = { .f = zero };
+u32 main() {
+    ops.f = rb;
+    a.x = ops.f();
+    return 0;
+}

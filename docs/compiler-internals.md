@@ -162,6 +162,112 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
+## The 2026-11-13 audit (BUG-1609..1627) — what took a loop to find
+
+Read with BUGS-FIXED.md "Session 2026-11-13". Only what is not obvious from the diff.
+
+**1. "Is this name ever written?" has TWO answers, chosen by the name's TYPE (BUG-1609).**
+`ast_name_writes_r` (zercheck_ir.c) is the one exhaustive walk behind
+`ast_name_mutated_or_addrd`, `ast_name_addr_taken`, the aim visitors and
+`global_name_never_mutated`. It reported a bare `name = v` and `&name` only — correct for a
+POINTER name (`r[i] = x` and `p.f = x` write the pointee; the MMIO-bound and stable-aim rules
+need exactly that) and wrong for everything else, where the same spellings write the object.
+The walk now takes a mode:
+
+| mode | reports in addition | used by |
+|---|---|---|
+| `ANW_PARTS_NONE` | nothing — the historical walk | every visitor that existed (`ast_name_writes`) |
+| `ANW_PARTS_AGGREGATE` | `name.f = v`, `name[i] = v`, `&name.f`, a view `name.arr[a..b]`, a `\|*v\|` capture of `name.opt` | `ast_name_part_mutated_or_addrd(…, false)` |
+| `ANW_PARTS_SCALAR` | the same, except a `name[hi..lo]` READ is a bit extract, not a view | `…(…, true)` — an integer name |
+
+`ANW_CAPTURE` (`if (name) |*v|`, a `|*v|` switch arm on `name`) is reported in EVERY mode: it
+is a pointer into the object, so the object can change with no assignment or `&` naming it.
+It is deliberately not an `&name` for `ast_name_addr_taken` — the capture cannot leave its
+arm, and the async "task-private union" test (BUG-1234) asks precisely whether anything ELSE
+can reach the union (`tests/zer/async_switch_capture_yield` fails if you count it).
+`global_name_never_mutated` picks the mode from `Symbol.type` and additionally answers "may be
+mutated" for a non-const global holding an ARRAY by value: an array becomes a slice, or is
+handed to an array parameter (which ALIASES its argument), with no `&` and no slice
+expression in the source, and a body that has not been checked yet has not had its implicit
+view made explicit (BUG-1516), so no walk over names can prove such a global untouched.
+**A new visitor must decide what the PART and CAPTURE kinds mean for it** — the three existing
+aim / handle-source visitors treat anything that is not `ANW_ASSIGN` as "cannot follow".
+
+**2. A relaxation's conjuncts each need a cell (BUG-1610, the tick counter).** The licence is
+"one writer", proved by four whole-program facts. The first draft used the AGGREGATE mode on
+the integer and refused `u32 b = flags[1..1];` in main — a bit EXTRACT read as a view. The
+SCALAR mode exists for that. The single-writer grid in `tests/test_hw_matrix.c` has one
+negative cell per conjunct (main plain store, main helper store, main bit-slice store, `&t`
+to a callee, a global pointer `&t`, the handler publishing `&t`, a second handler reading, a
+second handler writing); deleting any conjunct turns one of them into a false negative.
+Changing the rule also changed what the RMW FORM grid's ISR cells MEAN: with a reader-only
+main their programs became correct, so the ISR site's partner now also stores.
+
+**3. Escape taint: three ways a "kill" was not one (BUG-1611..1613).** The assignment sink
+clears the target's flags when the assignment REPLACES the value on every path
+(`bk_replaces`). It does not when (a) the value mentions the target — the flags were being
+cleared before the value that reads them was examined; (b) the function has a label (the
+fixpoint's `sticky` mode is flow-insensitive, and a kill is the one flow-SENSITIVE act);
+(c) the statement may not run: `Checker.branch_depth` is the test, and an orelse BLOCK
+fallback and a `for` STEP were walked at the enclosing depth. **When you add a construct whose
+body runs conditionally, walk it with `check_stmt_cond_body` (or bump `branch_depth`).**
+
+**4. `value_escaping_call` is the one "which call is this value a view of?" peel
+(BUG-1615).** Five sinks each peeled `.f` / `[i]` by hand; one also knew a slice, two an
+orelse subject, none a launder or `&place`. Do not write a sixth walk. The helper returns the
+call node (the keep-call sink names its callee) and reports a depth give-up, which callers
+read as an escape. `arg_is_local_derived` has the same peel for a NESTED call
+(`id(&view(a)[1])`), and `propagate_escape_from_value` asks it for a field store into a
+local carrier (`h.p = &view(a)[1]; return h;` — the walk there ended at the call node and
+found no symbol to copy flags from).
+
+**5. An assignment has THREE lowering sites, and the target hoists must be at each
+(BUG-1618).** `lower_expr`'s NODE_ASSIGN arm (the hoists were here), the statement-level
+"Case A" for `target = X orelse Y` with a non-local target, and the `for` STEP (a
+passthrough). "The target is evaluated before the value" is `hoist_place_effects` (when a
+part may write or reads volatile) plus `hoist_target_indices` (when the value may write).
+A bit-slice TARGET (`NODE_SLICE`) was a leaf to both — its object's indices and its two bit
+positions are parts like any other. The symptom is an unchecked out-of-bounds store, because
+the checker proves the index at the statement's START.
+
+**6. Allocation views: which roots resolve, and the over-rejection that bounds them
+(BUG-1620..1626).** A view is a pointer formed by `&place`; `ir_extract_compound_key`
+re-roots projections through it. Roots that resolve now: a local aggregate (BUG-984/1396), a
+pointer that holds one value — a parameter never reassigned, a local bound once
+(`ir_is_stable_aggregate_ptr_local`) — a whole global (BUG-1462), a nested global slot, and
+a stable global pointer's aim (`ir_global_projection_key`). Three things cost loops:
+- **A view keyed on a VARIABLE index re-breaks the teardown loop.** `*H h = &tbl[i]; if
+  (h.p) |q| { free(q); } h.p = null;` — with the view keyed "tbl[i]" the next iteration's read
+  met the previous iteration's freed entry ("use of an unnamed temporary, which may be a view
+  of 'q'"). The per-iteration slot facts (BUG-1130/1302) live on the DIRECT spelling. New view
+  roots are therefore restricted to places fixed below the root (`ir_place_fixed_below_root`:
+  fields and literal elements); the variable-index callee forms stay open (limitations.md).
+- **Making a view resolve exposes every sink that asked a syntactic question about its
+  target.** Once `&gc.h` was a view, `h.p = null;` no longer reset the slot (G5 asked "is the
+  target SPELLED from a global?", BUG-1622) and a callee's free through it recorded no freed
+  global (the trace was syntactic, BUG-1623) — the first surfaced as a FALSE "global left
+  dangling", which had been MASKING the second. Fixing only the first turned a wrong-worded
+  rejection into an accepted use-after-free. **After teaching a key query a new root, re-run
+  the valid idioms AND the hazard through every sink: store, reset, read, free, summary.**
+- **A PARAMETER has zero bindings in the body.** `ast_name_bind_count(body, param) == 0`; a
+  "bound once" test written for locals (`== 1`) silently refuses every parameter root
+  (`ir_local_view_place` — the flow-insensitive twin of the view fact, for summaries that
+  read the AST rather than a path state).
+
+**7. A literal TREE has a width only where it flows (BUG-1619).** Every value-flow sink
+retypes a pure literal tree to its destination (BUG-939). A binary OPERAND retyped it only
+when its exact value fit the other side, so `~0xFFF` against a `u64` stayed u32 and was
+zero-extended. `widen_literal_tree_operand` applies the var-decl sink's own licence
+(`value_flows_to_ex`), so the operand position and `u64 m = <tree>;` cannot disagree; shifts
+are excluded (a shift's type is its LEFT operand's). Measured consequence: `x > 0 - 1` on a
+u64 now compares against all-ones (as `u64 k = 0 - 1;` always produced), not 0xFFFFFFFF.
+
+**8. Running `make check` while editing: use a snapshot.** `make check` takes 15-30 minutes
+here and reads `./zerc`, so the tree cannot be rebuilt under it. Copy the working tree
+(`git ls-files -co --exclude-standard | tar …`) into a scratch directory and run it there;
+keep a second scratch build of the pre-change compiler for A/B. A probe subagent given a
+prebuilt compiler path and a read-only repo cannot disturb either.
+
 ## Reachability for the interrupt-sharing rules (BUG-1608, 2026-10-15)
 
 **"Which context runs this body?" is a reachability question, and both ISR sharing sinks asked

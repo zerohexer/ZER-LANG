@@ -1369,8 +1369,6 @@ ir_lower.c:hoist_target_indices:NODE_ORELSE:orelse.expr
 ir_lower.c:hoist_target_indices:NODE_ORELSE:orelse.fallback
 ir_lower.c:hoist_target_indices:NODE_RETURN:ret.expr
 ir_lower.c:hoist_target_indices:NODE_SLICE:slice.end
-ir_lower.c:hoist_target_indices:NODE_SLICE:slice.object
-ir_lower.c:hoist_target_indices:NODE_SLICE:slice.start
 ir_lower.c:hoist_target_indices:NODE_SPAWN:spawn_stmt.args
 ir_lower.c:hoist_target_indices:NODE_STATIC_ASSERT:static_assert_stmt.cond
 ir_lower.c:hoist_target_indices:NODE_STRUCT_INIT:struct_init.fields
@@ -2036,9 +2034,6 @@ ir_lower.c:hoist_place_effects:NODE_ONCE:once.body
 ir_lower.c:hoist_place_effects:NODE_ORELSE:orelse.expr
 ir_lower.c:hoist_place_effects:NODE_ORELSE:orelse.fallback
 ir_lower.c:hoist_place_effects:NODE_RETURN:ret.expr
-ir_lower.c:hoist_place_effects:NODE_SLICE:slice.end
-ir_lower.c:hoist_place_effects:NODE_SLICE:slice.object
-ir_lower.c:hoist_place_effects:NODE_SLICE:slice.start
 ir_lower.c:hoist_place_effects:NODE_SPAWN:spawn_stmt.args
 ir_lower.c:hoist_place_effects:NODE_STATIC_ASSERT:static_assert_stmt.cond
 ir_lower.c:hoist_place_effects:NODE_STRUCT_INIT:struct_init.fields

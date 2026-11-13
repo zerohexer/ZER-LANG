@@ -1,0 +1,11 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a move struct consumed twice through a forwarding helper taking a pointer param (use-after-move, no memory fault)
+move struct Tok { u32 k; }
+struct W { Tok t; }
+void consume(Tok t) { }
+void eat(*W w) { consume(w.t); }
+void twice(*W w) { eat(w); eat(w); }
+u32 main() {
+    W w;
+    twice(&w);
+    return 0;
+}

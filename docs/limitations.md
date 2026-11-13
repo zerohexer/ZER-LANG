@@ -30,6 +30,114 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1627; measured, reproducers in `tests/zer_gaps/`)
+
+Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
+executed reproducer in `tests/zer_gaps/` (compile-clean = the gap still holds; the runner
+fails loudly when one closes). "exit 99" = a stale pointer wrote a recycled slot and the
+program returned the corrupted value.
+
+**A. Allocation tracker — a free / store / move the caller cannot see (MEDIUM, accept-unsafe).**
+The view work of BUG-1620..1626 resolves a view whose root is a local aggregate, a pointer
+that holds one value (a parameter, a local bound once), a whole or nested global slot, and a
+stable global pointer — in the function AND in the summaries built from it. What is left is
+each a missing SUMMARY fact, not a missing key:
+1. **A variable-index view in a callee** — `void drop([*]H s) { for (i..) { *H h = &s[i]; if
+   (h.p) |q| { free(q); } h.p = null; } }`: the view is refused for a non-literal index (a view
+   keyed on it re-broke the valid teardown loop, see BUG-1621), so `frees_param_elems` is not
+   set. `alloc_callee_teardown_loop_slice_view`, `alloc_callee_store_slice_elem_view`.
+2. **Two hops** — a callee forwarding `&param.field` (or `&global.field`) to a freeing helper:
+   the inner summary's `frees_param_field` is applied to a path the outer function does not
+   record against ITS parameter. `alloc_callee_forwards_addr_of_param_field`,
+   `alloc_callee_forwards_addr_global_field`, and the in-function form
+   `alloc_param_field_freed_by_callee_then_used` (a pointer param's field freed by a callee
+   stays ALIVE in the caller of that callee).
+3. **A getter of an ADDRESS** — `*H geth() { return &g_h; }`: `ret_global_key` (BUG-1311) is
+   for a getter returning the global's VALUE. `alloc_getter_returns_addr_of_global`,
+   `alloc_getter_through_local_view` (a getter reading a field through a local view is not a
+   view of its argument — the return-view summary reads the AST root, not the view place;
+   `ir_local_view_place` is the query to give it).
+4. **A global reached through a COPY or a capture** — `H c = g_h; g_h.p = null; free(c.p)`,
+   `if (g_opt) |c| { free(c.p); }`, a slice view of a global array: nothing is minted for the
+   global's slot at the copy, so the state-based note (BUG-1623) has no entry to find.
+   `alloc_callee_frees_global_{struct_copy,optional_capture,slice_view}`.
+5. **A carrier forwarded to a funcptr PARAMETER** — `apply(fre, h)` with `h` a struct holding
+   the pointer: the bare-pointer argument is widened (BUG-740), the carrier's fields are not.
+   `alloc_funcptr_param_frees_carrier_field`.
+6. **A `?*T` read out of a slice view of a local array** — `[*]?*T s = arr[0..]; if (s[0])
+   |q| { free(q); }`. `alloc_slice_view_of_optptr_array`.
+7. **An async task holding a pointer the FUNCTION was given** — `_init(&task, a)` with `a` a
+   parameter (the same body with a local allocation is refused), and a global task started in
+   a helper. `alloc_async_task_holds_param_ptr`, `alloc_async_global_task_started_in_helper`.
+8. **`move struct` across a pointer / slice parameter** — `void eat(*W w) { consume(w.t); }`
+   called twice, through a pointer local, or on a slice element: no memory fault, the
+   use-after-move guarantee only. `move_{double_via_param_forward,via_ptr_local_then_use,from_slice_param}`.
+9. **Silent leaks** — `use(alloc(T) orelse return)` (an allocation consumed as a call
+   argument — BUG-1597 covered the other inline positions; `leak_inline_alloc_call_arg`), a
+   `goto` that jumps over a `defer free(a)`, and a GLOBAL slot overwritten with null
+   (`g.p = alloc(T); g.p = null;` — global entries are escaped, so the overwrite query stays
+   silent; the LOCAL-slot form is reported since BUG-1627).
+10. **Over-rejections seen (loud):** a field freed through a getter-returned pointer marks the
+   POINTER freed (`*H h = geth(); if (h.p) |q| { free(q); } h.p = null;`); a callee that frees
+   and RESETS a global's field through its pointer param is "left dangling" at the caller
+   (`drop(&g_h)`); the destructor `if (t.l) |q| { free(q); } ... free(t);` is "returning while
+   't.l' holds a freed pointer" (the non-optional spelling compiles); the grow idiom
+   `nd.v = old.v; free(old); v.data = nd;` infers `keep` on the vector parameter; `*H h =
+   &c.h; free(h.p);` on a HEAP `c` reports "wrong pool"; `return get2(&c.h)` with `c` a pointer
+   parameter is "local-derived"; a range-for teardown over an array of structs is a false
+   use-after-free; `defer th.join();` in a function with a label is "not joined".
+
+**B. Concurrency (MEDIUM, accept-unsafe — each TSan- or ASan-confirmed).**
+1. **A re-entrant `_poll` of the same task** — a call in an async body that reaches
+   `_poll(&task)` re-runs the current segment on the same frame (the state advances at the
+   next `yield`): a double free. VRP already widens for it (BUG-1503); the handle states do
+   not, and `_poll` has no "running" flag. `conc_reentrant_poll_double_free`.
+2. **Funcptr reach through a POINTER / SLICE spawn argument** — `void w(*O p) { *() f = p.f;
+   f(); }`, `if (p.f) |c| { c(); }`, `run(p.f)`, `tbl[0]()` on a slice of funcptrs, a funcptr
+   field of a shared struct loaded into a local. The by-value struct argument and the direct
+   `p.f()` are refused. The BUG-1290 signature fallback is keyed on the ARGUMENT carrying a
+   funcptr by value. `conc_funcptr_field_copy_via_ptr_arg`.
+3. **The window rules are textual** — a `goto` runs an access inside a spawn..join window it
+   is written before (`conc_goto_orders_access_into_borrow_window`; the downgrade check
+   likewise), and a `defer` registered BEFORE a fire-and-forget spawn runs a plain access
+   after it (`conc_defer_registered_before_spawn`). `Symbol.is_borrowed_by_thread` and
+   `Checker.after_spawn_in_func` are linear in the text; the escape fixpoint's answer (a
+   labelled function is flow-insensitive, a defer body sees "ever") is the model to copy.
+4. **A helper lends its pointer param and touches the same global by NAME** — `void sp(*u32
+   p) { th = spawn w(p); g += 1; th.join(); } ... sp(&g);`. BUG-1303's pairs are
+   param-versus-param. `conc_helper_lends_param_touches_global`; and "same object" by name
+   misses a plain local alias (`sp(&t.x, &tp.x)`, `conc_alias_pair_local_alias`).
+5. **A lent global reached by the parent's callee through a pointer FIELD of a global
+   struct** (`gh.p = &g; spawn w(&g); poke();` with `poke` writing `*gh.p`).
+   `conc_lent_global_via_global_struct_ptr_field`.
+6. **The spin-lock recogniser accepts a loop that does not lock** — a `break` in the CAS spin
+   loop, or a wrong expected value. `conc_spinlock_with_break`.
+7. **ISR split read-modify-write through MEMORY** (checker only; an `interrupt` block does not
+   build hosted, so no gap file): `mem = g; g = mem + 1;` through a global, through two
+   functions, through `*p`, and across a loop back edge (`g = x + 1; x = g;`). The local-copy
+   spellings are refused.
+8. **BUG-1625 sees a CHECKED body only** — the Handle auto-deref's allocator is recorded by
+   the checker on the node, so a spawn target declared AFTER its spawn site (body not yet
+   checked when the scan runs) is still unseen. A post-pass over `Checker.sync_spawns` would
+   close it.
+
+**C. Values / bare metal (LOW, loud).**
+- A shift COUNT literal is typed against the LEFT operand: `u3 y = x << 8;` is "cannot
+  initialize 'u3' with 'u32'" while `x << 7` compiles (the documented result is 0).
+- A comptime shift by exactly 63 (`v >> 63`, `v << 63`) is "could not be evaluated".
+- `if (i < 8) { return reg[i]; }` on an MMIO pointer with max index 7 still gets the
+  auto-guard (precision).
+- `@cpu_save_context` / `@cpu_restore_context` emit `sd` / `ld` for riscv32 (RV64-only
+  instructions): the build fails on a 32-bit RISC-V target.
+- `**u32 hold = &(&X);` (address of an rvalue) is accepted by the checker and refused by GCC.
+
+**D. Recorded design decisions (not defects).**
+- A local array passed to a funcptr PARAMETER of type `[*]T` is not `keep` (a retaining
+  callback then holds a dangling slice): the deliberate, measured exemption in
+  `keep_edge_callee_keeps` — an unknown callback that takes a buffer is the read/fill idiom.
+- `@container` on a pointer PARAMETER has unknown provenance and is allowed (CLAUDE.md
+  "Provenance Tracking"); a caller passing `&whole_object` is the caller's bug to see.
+
 ## OPEN — residuals of the 2026-10-12 audit (BUG-1566..1596; measured)
 
 1. **The `*opaque` C bridge (BUG-1594).** A C extern with an `*opaque` / `?*opaque` in its
@@ -149,8 +257,8 @@ repeated.
 
 1. ~~A callee that `@cond_wait`s is not refused when reached from inside `@critical` or an
    interrupt handler~~ — CLOSED 2026-10-10 (BUG-1512, with every blocking wait in an ISR).
-2. A lock root whose place is a SLICE is not hoisted by `hoist_place_effects` (non-packed
-   bit-slice writes are evaluated once through the emitter's pointer hoist).
+2. ~~A lock root whose place is a SLICE is not hoisted by `hoist_place_effects`~~ — CLOSED
+   2026-11-13 (BUG-1618): a bit-slice place hoists its object's parts and both bit positions.
 3. The moved volatile predicates resolve a root name in the checker's CURRENT module; the
    emitter calls them after checking, so a module global shadowed by a same-named main
    global could be judged by the wrong declaration's qualifier (unprobed).
@@ -760,7 +868,16 @@ it. The literals keep their old spelling so a grep for a grid's file still finds
 second `make check` running in another worktree at the same time, and no directory left behind.
 A NEW grid must include `zer_tmp.h` and wrap its paths — a fixed path is the defect back.
 
-## OPEN — an interrupt handler's own read-modify-write is refused even when only main READS (2026-09-23, LOW/MEDIUM — over-rejection of the tick-counter idiom)
+## CLOSED 2026-11-13 (BUG-1610) — an interrupt handler's own read-modify-write was refused even when only main READS (the tick-counter idiom)
+
+**Closed** by `isr_rmw_regular_code_only_reads`: accepted when one handler reaches the cell,
+no regular-code body assigns it (whole / compound / bit-slice) and its address is taken
+nowhere. The reason given below for not shipping it ("unsound on a multi-core part") does not
+apply to a reader: with ONE writer there is no update to lose on any number of cores, and the
+`@critical` exemptions already assume a handler does not run concurrently with itself. A main
+that WRITES the cell (even a plain `ticks = 0;`) is still refused — put both updates in
+`@critical`. Original text:
+
 
 `volatile u32 ticks; interrupt TIM2 { ticks += 1; } u32 main() { u32 t = ticks; ... }` is
 refused ("read-modify-written and is shared"). On a single core the ISR's RMW cannot be split

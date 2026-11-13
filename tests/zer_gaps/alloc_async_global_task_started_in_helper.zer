@@ -1,0 +1,19 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a global task started in a helper holds the caller's pointer across its free (exit 99)
+struct T { u32 v; }
+async void co(*T p) {
+    yield;
+    p.v = 99;
+}
+_zer_async_co gtask;
+void start(*T a) { _zer_async_co_init(&gtask, a); _zer_async_co_poll(&gtask); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    start(a);
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    _zer_async_co_poll(&gtask);
+    u32 r = b.v;
+    free(b);
+    return r;
+}

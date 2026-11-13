@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// expect-error: spawn target 'w' accesses non-shared global 'sl'
+// BUG-1625: the thread reads the Slab's page table through `h.v` while main
+// grows the slab (ASan: heap-use-after-free in _zer_slab_get pre-fix).
+struct T { u32 v; }
+Slab(T) sl;
+shared struct Reg { Handle(T) h; u32 stop; }
+Reg reg;
+Handle(T)[20000] kp;
+void w() {
+    Handle(T) h = reg.h;
+    u32 s = 0;
+    while (s == 0) { h.v += 1; s = reg.stop; }
+}
+u32 main() {
+    Handle(T) h = sl.alloc() orelse return;
+    reg.h = h;
+    ThreadHandle th = spawn w();
+    for (u32 i = 0; i < 20000; i += 1) {
+        ?Handle(T) m = sl.alloc(); if (m) |x| { kp[i] = x; }
+    }
+    reg.stop = 1;
+    th.join();
+    return 0;
+}

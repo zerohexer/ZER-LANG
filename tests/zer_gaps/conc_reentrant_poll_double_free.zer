@@ -1,0 +1,19 @@
+// GAP (2026-11-13 audit, docs/limitations.md): a call in an async body re-polls the same global task: the segment re-runs on one frame (ASan double free)
+async void t();
+_zer_async_t ga;
+u32 depth;
+void again() { depth += 1; if (depth == 1) { _zer_async_t_poll(&ga); } }
+async void t() {
+    ?[*]u32 m = alloc(u32, 4);
+    [*]u32 s = m orelse return;
+    yield;
+    free(s);
+    again();
+    yield;
+}
+u32 main() {
+    _zer_async_t_init(&ga);
+    _zer_async_t_poll(&ga);
+    _zer_async_t_poll(&ga);
+    return 0;
+}

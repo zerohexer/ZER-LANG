@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: spawn target 'w' accesses non-shared global 'pl'
+// BUG-1625: a Handle auto-deref (`h.v`) is a call into its Pool — the same
+// access the explicit `pl.get(h).v` spelling is refused for.
+struct T { u32 v; }
+Pool(T, 4) pl;
+shared struct Reg { Handle(T) h; }
+Reg reg;
+void w() { for (u32 i = 0; i < 100000; i += 1) { Handle(T) h = reg.h; h.v += 1; } }
+u32 main() {
+    Handle(T) h = pl.alloc() orelse return;
+    reg.h = h;
+    ThreadHandle th = spawn w();
+    for (u32 i = 0; i < 100000; i += 1) { h.v += 1; }
+    th.join();
+    return 0;
+}

@@ -227,7 +227,9 @@ static void gen(HWScenario s, char *buf, size_t n) {
             snprintf(buf, n,
                 "volatile u32 g_cnt;\n"
                 "interrupt UART { g_cnt += 1; }\n"
-                "u32 main() { u32 x = g_cnt; return x; }\n");
+                /* BUG-1610: regular code WRITES it too (a reader-only main is
+                 * the accepted tick-counter idiom — the SINGLE-WRITER grid). */
+                "u32 main() { g_cnt = 0; u32 x = g_cnt; return x; }\n");
             break;
         case HW_MMIO_OK:
             snprintf(buf, n,
@@ -616,8 +618,13 @@ static void gen_rmw(RSite site, RForm f, char *out, size_t n) {
                          "u32 main(){ spawn w(); u32 x = g; return x & 1; }\n", helper, body);
         break;
     case RSITE_ISR:
+        /* BUG-1610: main STORES g as well. With a main that only reads, the
+         * handler is the cell's single writer and its RMW cannot lose an
+         * update (the SINGLE-WRITER grid below pins that boundary); this grid
+         * asks whether each SPELLING is recognised as an RMW at the ISR sink,
+         * so the partner must be one the rule still refuses. */
         snprintf(out, n, "volatile u32 g;\n%s\ninterrupt TIMER { %s }\n"
-                         "u32 main(){ u32 x = g; return x & 1; }\n", helper, body);
+                         "u32 main(){ g = 0; u32 x = g; return x & 1; }\n", helper, body);
         break;
     /* BUG-1043: the RMW is in MAIN-line code (a helper main calls) and the ISR
      * does a plain write — the BUG-801 shape, answered by the per-function
@@ -955,6 +962,69 @@ int main(void) {
             int ok = run_vol(rnm, rbuf, "", neg);
             fprintf(stderr, "  [%-5s][%-24s][%s] %s\n",
                     rsite_name(vs), rform_name(rf), neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
+    /* SINGLE-WRITER grid (BUG-1610) — the tick-counter idiom and its boundary.
+     * One interrupt handler read-modify-writes a volatile single-word global.
+     * POSITIVE: regular code only READS it (any spelling of the handler's RMW
+     * that takes no address, a helper only the handler calls, a bit EXTRACT in
+     * main). NEGATIVE: each way regular code — or a second handler — can be a
+     * second WRITER, or a way the "only reads" walk could be fooled (an address
+     * of the cell anywhere in the program). The relaxation is licensed by the
+     * conjunction; a cell here per conjunct keeps each one load-bearing. */
+    fprintf(stderr, "\n--- ISR single-writer grid (tick counter; who else writes?) ---\n");
+    {
+        static const struct { const char *name; int neg; const char *code; } sw[] = {
+          { "reader-only main", 0,
+            "volatile u32 t;\ninterrupt TIMER { t += 1; }\n"
+            "u32 main(){ u32 a = t; while (t == a) { } return t & 1; }\n" },
+          { "written-out t=t+1", 0,
+            "volatile u32 t;\ninterrupt TIMER { t = t + 1; }\n"
+            "u32 main(){ return t & 1; }\n" },
+          { "split read/write", 0,
+            "volatile u32 t;\ninterrupt TIMER { u32 v = t; t = v + 1; }\n"
+            "u32 main(){ return t & 1; }\n" },
+          { "isr-only helper", 0,
+            "volatile u32 t;\nvoid tick(){ t += 1; }\ninterrupt TIMER { tick(); }\n"
+            "u32 now(){ return t; }\nu32 main(){ return now() & 1; }\n" },
+          { "main bit extract", 0,
+            "volatile u32 t;\ninterrupt TIMER { t |= 2; }\n"
+            "u32 main(){ u32 b = t[1..1]; return b; }\n" },
+          { "main plain store", 1,
+            "volatile u32 t;\ninterrupt TIMER { t += 1; }\n"
+            "u32 main(){ t = 0; return 0; }\n" },
+          { "main helper store", 1,
+            "volatile u32 t;\ninterrupt TIMER { t += 1; }\nvoid reset(){ t = 0; }\n"
+            "u32 main(){ reset(); return 0; }\n" },
+          { "main bit-slice store", 1,
+            "volatile u32 t;\ninterrupt TIMER { t += 1; }\n"
+            "u32 main(){ t[3..0] = 1; return 0; }\n" },
+          { "main &t to callee", 1,
+            "volatile u32 t;\ninterrupt TIMER { t += 1; }\n"
+            "void wr(volatile *u32 p){ *p = 0; }\nu32 main(){ wr(&t); return 0; }\n" },
+          { "global pointer &t", 1,
+            "volatile u32 t;\nvolatile *u32 gp = &t;\ninterrupt TIMER { t += 1; }\n"
+            "u32 main(){ *gp = 0; return 0; }\n" },
+          { "handler publishes &t", 1,
+            "volatile u32 t;\n?volatile *u32 gp = null;\n"
+            "interrupt TIMER { t += 1; gp = &t; }\n"
+            "u32 main(){ u32 a = t; return a & 1; }\n" },
+          { "second handler reads", 1,
+            "volatile u32 t;\ninterrupt TIMER { t += 1; }\n"
+            "interrupt UART { u32 a = t; }\nu32 main(){ return 0; }\n" },
+          { "second handler writes", 1,
+            "volatile u32 t;\nvoid tick(){ t += 1; }\ninterrupt TIMER { tick(); }\n"
+            "interrupt UART { tick(); }\nu32 main(){ return t & 1; }\n" },
+        };
+        for (size_t i = 0; i < sizeof(sw) / sizeof(sw[0]); i++) {
+            valid_cells++;
+            char nm[128];
+            snprintf(nm, sizeof(nm), "single-writer/%s", sw[i].name);
+            int ok = run_vol(nm, sw[i].code, "", sw[i].neg);
+            fprintf(stderr, "  [%-24s][%s] %s\n", sw[i].name, sw[i].neg ? "neg" : "pos",
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }

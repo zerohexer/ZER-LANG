@@ -5,6 +5,135 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-11-13 — BUG-1609..1627: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
+
+**Branch.** The one branch ahead of main, `zerohexer-automated/serene-shannon-0xnbk1`
+(BUG-1566..1608, 3 commits), forked AT main's head, so it was a fast-forward; `make check`
+on it was green before anything else was touched. Every other branch is in main already.
+
+**Method.** Four read-only probe runs (allocation tracker, escape / type doors, bounds /
+arithmetic / emitter, concurrency / ISR / bare metal) against a build of the adopted tree,
+plus own probes. Every fix below was A/B-measured against that build; every new negative /
+matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
+`docs/limitations.md` "residuals of the 2026-11-13 audit" with 26 executed reproducers in
+`tests/zer_gaps/`.
+
+**Globals that carry a function pointer**
+- **BUG-1609 — a write of PART of a global left it "never mutated".**
+  `global_name_never_mutated` (the query behind every rule that trusts a global's
+  declaration initializer) asked the name-write walk, which sees a bare `g = v` / `&g` only.
+  `Ops ops = { .f = nop }; ... ops.f = sp;` therefore still resolved `ops.f()` to `nop`: a
+  statement holding shared `A` calling into shared `B` compiled (the deadlock rule), and so
+  did a `spawn` inside `@critical`; a table filled by element assignment (`tbl[1] = sp;`, no
+  initializer) resolved to NOTHING. The walk (`ast_name_writes_r`) now has a PARTS mode
+  reporting `g.f = v`, `g[i] = v`, a bit-slice store, `&g.f`, a view `g.arr[a..b]` and a
+  `|*v|` capture (`ANW_PART_ASSIGN` / `ANW_PART_ADDR` / `ANW_CAPTURE`); the query uses it for
+  every global that is not itself a pointer / slice / Handle (through those a projection
+  writes the POINTEE — the MMIO-bound and stable-aim callers depend on that), and a non-const
+  global holding an ARRAY by value is never "unmutated" (an array reaches a slice or an
+  array parameter with no `&` in the source). Tests: `funcptr_global_{field_reassigned_deadlock,
+  array_elem_assigned_critical,field_addr_critical}_bug1609` (all compiled pre-fix), positive
+  `funcptr_global_unmutated_binding_bug1609`. `shared_rw_funcptr_field_call` now reports the
+  real defect ("lock is not re-entrant") instead of "target is not known".
+
+**Interrupt sharing — a relaxation**
+- **BUG-1610 — the tick-counter idiom.** `volatile u32 ticks; interrupt TIM2 { ticks += 1; }`
+  with regular code that only reads `ticks` was refused as a splittable read-modify-write.
+  What splits a handler's RMW is another WRITER between its load and its store; with one
+  handler reaching the cell and no other code writing it there is none. Accepted when ALL
+  hold, each asked of the whole program (`isr_rmw_regular_code_only_reads`): one handler
+  (`!multi_isr`), no regular-code RMW and no opaque hand-off, no regular-code body assigns it
+  (whole, compound, bit-slice — the PARTS walk in its integer mode, where a bit EXTRACT is a
+  read), and its address is taken nowhere (any body, any global initializer). Functions only a
+  handler reaches count as the handler (BUG-1608). Assumes, like the `@critical` exemptions
+  (BUG-1059c / 1403), that a handler never runs concurrently with itself. Gate: the new ISR
+  SINGLE-WRITER grid in `tests/test_hw_matrix.c` (5 positive, 8 negative cells — one per
+  conjunct; the positives are over-rejections on the old build), and the RMW FORM grid's ISR
+  site now pairs each spelling with a main that also STORES. reference.md documents the rule
+  with a compile-only example and its negative.
+
+**Escape analysis** (gate: SHAPES p72..p76 in `tools/sink_matrix.sh`, 39 holes pre-fix)
+- **BUG-1612 — `t = t;` erased the escape taint.** The assignment handler cleared the target's
+  flags and then re-derived them from a value that reads the just-cleared symbol, so `t = t`,
+  `t = t[1..]`, `t = id(t)`, `t = (*u32)t`, `t = m orelse t`, `h = { .p = h.p }` each laundered
+  a stack pointer through every sink (return, global store, keep call, keep inference), and
+  `p = p;` erased the `@container` whole-object fact (ASan stack-buffer-underflow). A value
+  that mentions its own target (`expr_mentions_name`) replaces nothing.
+- **BUG-1611 / BUG-1613 — a reassignment that may not run still cleared the taint:** skipped
+  by a `goto` (a labelled function is flow-insensitive, so no kill clears in the fixpoint's
+  `sticky` mode), inside an orelse BLOCK fallback (now checked as a conditional body), in a
+  `for` STEP that runs zero times.
+- **BUG-1615 — the call-result sinks found their call by peeling `.f` / `[i]` only.**
+  `g = oid(&x) orelse &G`, `return @ptrcast(*u32, id(&x))`, `return view(a)[1..3]`,
+  `keep(&view(a)[1])`, `return &idb(&b).b`, `[*]u32 u = view(a)[1..]; return u;`,
+  `h.p = &view(a)[1]; return h;`, `@ptrtoint(id(&x))` — all ASan stack-use-after-return. One
+  peel, `value_escaping_call` (launders, field / element / sub-slice, `&` of a place, both
+  orelse arms), at the assignment, var-decl, return and keep-call sinks, in
+  `propagate_escape_from_value` (field stores into a local carrier) and in
+  `arg_is_local_derived` (a nested call).
+- **BUG-1616 — a var-decl from `f(&local)` of UNION or OPTIONAL-AGGREGATE type was never
+  tainted** (the gate listed pointer / slice / optional-of-those / struct).
+- **BUG-1617 — the return summary kept ONE param per local.** `*u32 t = a; if (c) { t = b; }
+  return t;` recorded whichever was assigned last in the text, so `g = f(&x, &G, false)` put a
+  stack address in a global. `classify_return_root` now ORs the local's `nonkeep_root_mask`.
+- **BUG-1614 — a bit-slice store was not const-checked.** `const u32 x = 5; x[3..0] = 1;`,
+  a store through a `const [*]u32` parameter, and `"hello"[0][3..0] = 1` (.rodata) all
+  compiled; so did a field write through a distinct typedef of a const pointer. The const
+  walk peels a NODE_SLICE target, unwraps distinct in its field arm, and treats a string
+  literal root as read-only. Tests: `const_bitslice_*_bug1614`, `const_distinct_ptr_field_write_bug1614`.
+
+**Bounds / values**
+- **BUG-1618 — `a[i] = mb(&i) orelse 0;` evaluated the value BEFORE the target's index.** The
+  statement-level orelse path stored through the untouched target, skipping both target
+  hoists of the ordinary assignment arm (BUG-1184 / 1372); a bit-slice store's target
+  (`a[i][3..0] = v`, its bit positions too) was a leaf to both hoists; a `for` step made
+  neither. The checker proves the index at the statement's start, so its check was elided and
+  the store landed at `a[4000]` (UBSan; a neighbouring field overwritten at -O2). Test:
+  `tests/zer/assign_target_before_value_bug1618` (exit 1 pre-fix).
+- **BUG-1619 — `x & ~0xFFF` on a `u64` cleared the upper 32 bits.** A literal TREE in a
+  binary-operand position was retyped only when its exact value fit the other side, so a `~`
+  tree stayed u32 and was zero-extended, while `x &= ~0xFFF` and `u64 m = ~0xFFF; x & m` kept
+  the bits (and `x == ~0` was false for an all-ones u64). It is now computed at the wider
+  operand's width under the var-decl sink's own licence (`widen_literal_tree_operand`). Test:
+  `literal_tree_widens_with_operand_bug1619`.
+
+**Allocation tracker — views** (gate: SHAPE p77; valid idioms `view_of_param_and_global_slot_teardown_bug1621`)
+- **BUG-1620 — `free(*pp)` with `**T pp = &a` freed an entry nobody names.** The key of a
+  deref still rooted at the pointer; `ir_extract_compound_key` now asks `ir_ptr_stable_aim`
+  like the store and the read already did.
+- **BUG-1621 — a view rooted at a pointer PARAMETER or a NESTED global aggregate was not a
+  view.** `*H h = &c.h;` (c a `*Ctx` param) and `&gc.h` keyed `h.p` under `h`, a stranger to
+  `c.h.p` / "gc.h.p": freed through one, read through the other (exit 99), in one function and
+  in every callee summary built from such a body. `ir_view_set_of_value` accepts a root that
+  is a pointer holding one value (`ir_is_stable_aggregate_ptr_local`) when the place is fixed
+  below it; the ADDR-OF transfer records a nested global slot's key; a field read through
+  such a view mints the parameter's slot as the direct spelling does (BUG-985).
+- **BUG-1622 — a store through a local view of a global slot did not reach the slot**, so the
+  taught reset `h.p = null;` cleared nothing and a correct teardown was "global left dangling".
+- **BUG-1623 — the freed-global summary was a syntactic trace.** A free that reached the global
+  through a view recorded nothing; the free site now also notes every global slot the STATE
+  says holds the allocation.
+- **BUG-1624 — the store summary did not see through a view local.** `void link(*Ctx c, *T p)
+  { *H h = &c.h; h.p = p; }` recorded nothing (`ir_local_view_place`, the flow-insensitive twin
+  of the view fact, in `ir_ps_target_rec`).
+- **BUG-1626 — a projection through a stable GLOBAL POINTER** (`*H gp = &g_h;`) keyed under
+  the pointer's name; `ir_global_projection_key` substitutes its aim. Tests:
+  `free_through_global_pointer_view_bug1626`, positive `global_pointer_view_slot_ok_bug1626`.
+- **BUG-1627 — a slot reset that drops the last reference was a silent leak.** `h.p =
+  alloc(T); h.p = null;` compiled while `o = alloc(T); o = null;` is "overwritten while
+  alive". The local-slot reset arm now asks the one overwrite query (`ir_report_overwrite`,
+  BUG-1072), which stays silent while another name holds the allocation. Corpus cost: zero.
+  Test: `leak_slot_alloc_then_null_bug1627`.
+
+**Concurrency**
+- **BUG-1625 — a Handle auto-deref (`h.v`) was invisible to the spawn race scan and the ISR
+  rule,** which find a Pool / Slab by its NAME; the explicit `pl.get(h).v` was refused. A
+  thread read a Slab's page table while main grew it (ASan heap-use-after-free in
+  `_zer_slab_get`). Both scans read `field.handle_alloc`, and the checker records the use for
+  the ISR rule where it resolves the auto-deref. Tests: `{spawn,isr}_handle_autoderef_*_bug1625`.
+
+---
+
 ## Session 2026-10-12 — BUG-1566..1596: five-area audit (escape, allocation tracker, values, concurrency, language surface), the library made to build, `*opaque` at the C boundary
 
 No unconsumed audit branch remained: `loving-bohr-u1sijc`, `zerohexer/review/28092026`,

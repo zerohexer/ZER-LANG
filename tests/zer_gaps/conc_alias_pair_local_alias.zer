@@ -1,0 +1,14 @@
+// GAP (2026-11-13 audit, docs/limitations.md): one object passed twice (directly and through a local pointer alias) to a helper that lends one and writes the other (TSan)
+void w(*u32 p) { for (u32 i = 0; i < 100000; i += 1) { *p += 1; } }
+void sp(*u32 a, *u32 b) {
+    ThreadHandle th = spawn w(a);
+    *b += 1;
+    th.join();
+}
+struct Two { u32 x; u32 y; }
+u32 main() {
+    Two t;
+    *Two tp = &t;
+    sp(&t.x, &tp.x);
+    return 0;
+}

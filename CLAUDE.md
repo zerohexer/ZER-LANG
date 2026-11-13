@@ -9,7 +9,9 @@
 > | Process lessons with their evidence (tests, audits, harvesting, debugging, proofs) | `docs/session-playbook.md` |
 > | Architecture, emission patterns, IR invariants | `docs/compiler-internals.md` (1 MB: `grep -n '^## ' docs/compiler-internals.md` is its table of contents — read the section, never the whole file) |
 > | Coq / Iris / VST | `docs/proof-internals.md` |
-> | What is open / deferred / over-rejected | `docs/limitations.md` |
+> | What is open NOW (meant to be read whole; gated) | `docs/limitations.md` |
+> | A closed entry's discussion — grep by BUG number, never read whole | `docs/limitations-closed.md` |
+> | Old entries nobody re-measured — hypotheses, a triage queue | `docs/limitations-legacy.md` |
 > | Past bugs and root causes | `BUGS-FIXED.md` |
 > | The language as users see it | `docs/reference.md`, `ZER-LANG-LLM.md` (compact) |
 >
@@ -276,6 +278,7 @@ SHAPE in `tools/sink_matrix.sh`; "conc" / "hw" = `tests/test_conc_matrix.c` /
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
 | `audit_esc_restore.sh` | `OK — every realloc'd Checker buffer is kept by esc_restore` |
+| `audit_limitations.sh` | `OK — limitations.md holds open entries only` |
 | `emit_audit.sh` | `OK — no dead-stub markers in emitted C` |
 | `sink_matrix.sh` | `SINK MATRIX CLEAN` |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
@@ -1011,9 +1014,13 @@ below). New safety rule → which of the 4 models, its gate cell, a negative wit
 
 **Docs go in the SAME commit, after `make check` is green.**
 - a fix → `BUGS-FIXED.md` (symptom, root cause, fix, test);
-- an open gap, deferred fix, over-rejection or residual → a `## OPEN` entry in
-  `docs/limitations.md` (updated / removed when fixed) — a gap recorded only in a commit
-  message or a code comment is lost;
+- an open gap, deferred fix, over-rejection or residual → an entry in `docs/limitations.md`
+  — a gap recorded only in a commit message or a code comment is lost. That file holds OPEN
+  entries only (`audit_limitations.sh` fails the build otherwise): when a fix closes one,
+  MOVE its text to the end of `docs/limitations-closed.md`, and write whatever the fix left
+  open as its own entry tagged `[residual of: … — closed by BUG-n]`. Never strike an entry
+  through and leave it. An entry in `docs/limitations-legacy.md` is a hypothesis: measure
+  it, then promote it or archive it — that file only shrinks;
 - durable architecture → `docs/compiler-internals.md`; a language change → `docs/reference.md`;
 - a class or gate → its row in `docs/multi-site-classes.md` + ONE index line here;
 - a process lesson → `docs/session-playbook.md` + at most two lines here.

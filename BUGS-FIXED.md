@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-11-13 — BUG-1609..1634: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
+## Session 2026-11-13 — BUG-1609..1635: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
 
 **Branch.** The one branch ahead of main, `zerohexer-automated/serene-shannon-0xnbk1`
 (BUG-1566..1608, 3 commits), forked AT main's head, so it was a fast-forward; `make check`
@@ -195,6 +195,23 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   this place"), which is transitive like every freed-global key. Tests:
   `field_free_{two_hops_param_place,two_hops_global_place,three_hops_global}_bug1634`,
   positive `field_free_two_hops_teardown_ok_bug1634`; p77 hop cells.
+
+- **BUG-1635 — an element read out of a SLICE VIEW of a local array aliased no slot.**
+  `[*]?*T s = arr[0..]; if (s[0]) |q| { free(q); }` (and the coercion `[*]?*T s = arr;`):
+  the key query already rebased `s[0]` onto `arr[0]` (BUG-1383/1463) — so `s[0] orelse
+  return` and `s[0].p` were right — but the slot SPLIT behind if-captures and element reads
+  (`ir_slot_decompose`) keyed the bare slice local. The free reached nothing: `a` stayed ALIVE
+  (exit 99), a second `free(a)` was accepted, and a consume loop over the view was refused as
+  a LEAK. The split now rebases first and resolves a stable slice local to its array; a
+  VARIABLE index through a view that starts at element 0 names the array's element at that
+  index (`s[i]` is `arr[i]`, in `ir_rebase_slice_index`), and through a shifted view it is
+  "some element". The same rebase closed a callee freeing through a slice view of a GLOBAL
+  array (`[*]H s = tbl[0..]; free(s[i].p)` — the summary now names `tbl[i]`). Tests:
+  `slice_view_optptr_{capture_free,double_free,var_index_free}_bug1635`,
+  `callee_frees_through_global_slice_view_bug1635`, positives
+  `slice_view_optptr_consume_ok_bug1635`, `global_slice_view_teardown_ok_bug1635`; p45
+  local-view cells. Also: `ir_path_is_under` passed a NULL base to `memcmp` for an empty
+  base (UBSan; undefined even at length 0) — guarded.
 
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**

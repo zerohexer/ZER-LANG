@@ -3272,6 +3272,33 @@ static Node *ir_rebase_slice_index(ZerCheck *zc, IRFunc *func, Node *e, int dept
         Node *sd = ir_stable_slice_local_def(zc, func, o);   /* BUG-1463 */
         if (sd) o = sd;
     }
+    /* BUG-1635: a VARIABLE index through a view that starts at element 0
+     * (`[*]T s = arr;`, `arr[0..n]`) names the array's element at that same
+     * index — `s[i]` is `arr[i]`. Only the literal index was rebased, so a
+     * loop over the view read, stored and reset slots of a stranger. A view
+     * with a non-zero start shifts the index and is left alone here (the
+     * slot split treats it as "some element of the array"). */
+    if (o && ix && ix->kind != NODE_INT_LIT) {
+        Node *sd = o->kind == NODE_IDENT ? ir_stable_slice_local_def(zc, func, o) : NULL;
+        Node *v = sd ? sd : (o->kind == NODE_SLICE ? o : NULL);
+        Node *arr = NULL;
+        if (v && v->kind == NODE_SLICE) {
+            Node *lo = v->slice.start;
+            Type *vt = v->slice.object ? checker_get_type(zc->checker, v->slice.object) : NULL;
+            if ((!lo || (lo->kind == NODE_INT_LIT && lo->int_lit.value == 0)) &&
+                vt && type_dispatch_kind(vt) == TYPE_ARRAY)
+                arr = v->slice.object;
+        } else if (v) {
+            arr = v;                       /* the coercion `[*]T s = arr;` */
+        }
+        if (arr) {
+            Node *n = (Node *)arena_alloc(zc->arena, sizeof(Node));
+            if (!n) return e;
+            *n = *e;
+            n->index_expr.object = arr;
+            return ir_rebase_slice_index(zc, func, n, depth + 1);
+        }
+    }
     if (o && o->kind == NODE_SLICE && ix && ix->kind == NODE_INT_LIT) {
         Node *st = o->slice.start;
         uint64_t base = 0;
@@ -3488,7 +3515,9 @@ static int ir_rel_key_path(IRFunc *func, Node *expr, Node *base, char *buf) {
 static bool ir_path_is_under(const char *p, uint32_t pl, const char *base, uint32_t bl,
                              bool global) {
     (void)global;
-    if (!p || pl < bl || memcmp(p, base, bl) != 0) return false;
+    /* an empty base may be NULL — memcmp with a NULL argument is undefined even
+     * for length 0 (UBSan, async_frees_param_field_ok) */
+    if (!p || pl < bl || (bl > 0 && (!base || memcmp(p, base, bl) != 0))) return false;
     if (pl == bl) return true;
     return p[bl] == '.' || p[bl] == '[';
 }
@@ -4969,6 +4998,14 @@ static bool ir_slot_decompose(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                               Node *e, IRSlotRef *r) {
     memset(r, 0, sizeof(*r));
     e = ir_peel_launder(e);
+    /* BUG-1635: an element of a SLICE VIEW of an array is the array's element —
+     * `[*]?*T s = arr[0..]; if (s[0]) |q| { free(q); }`. The key extraction
+     * rebases `s[0]` onto `arr[0]` (BUG-1383/1463), but this split keyed the
+     * OBJECT alone — the bare slice local, a stranger to `arr` — so the read
+     * aliased no slot and the free through it left `arr[0]`'s owner ALIVE.
+     * A literal index is rebased exactly; below, a variable one keeps its
+     * symbol when the view starts at element 0 and is any-slot otherwise. */
+    e = ir_rebase_slice_index(zc, func, e, 0);
     Node *cur = e;
     uint32_t restlen = 0;
     while (cur && cur->kind == NODE_FIELD) {
@@ -4978,9 +5015,20 @@ static bool ir_slot_decompose(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!cur || cur->kind != NODE_INDEX || !cur->index_expr.index)
         return ir_slot_decompose_key(zc, func, ps, e, r);   /* BUG-1410 */
     Node *ix = cur->index_expr.index;
+    Node *aobj = cur->index_expr.object;
+    bool view_shifted = false;
+    if (aobj && aobj->kind == NODE_IDENT) {
+        Node *sd = ir_stable_slice_local_def(zc, func, aobj);
+        if (sd && sd->kind == NODE_SLICE) {
+            Node *lo = sd->slice.start;
+            view_shifted = lo && !(lo->kind == NODE_INT_LIT && lo->int_lit.value == 0);
+            aobj = sd->slice.object;
+        } else if (sd) {
+            aobj = sd;
+        }
+    }
     int root; const char *ap; uint32_t apl;
-    if (ir_extract_compound_key(zc, func, ps, cur->index_expr.object,
-                                &root, &ap, &apl) != 0)
+    if (ir_extract_compound_key(zc, func, ps, aobj, &root, &ap, &apl) != 0)
         return false;
     char *rest = (char *)arena_alloc(zc->arena, restlen + 1);
     if (!rest) return false;
@@ -4999,6 +5047,11 @@ static bool ir_slot_decompose(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     r->rest = rest;
     r->restlen = restlen;
     int cl = -1;
+    if (view_shifted) {
+        /* the view's index is offset from the array's: some slot of it */
+        r->kind = IR_SLOT_UNKEYED;
+        return true;
+    }
     if (ix->kind == NODE_INT_LIT) {
         r->kind = IR_SLOT_LIT;
         cl = snprintf(NULL, 0, "[%llu]", (unsigned long long)ix->int_lit.value);

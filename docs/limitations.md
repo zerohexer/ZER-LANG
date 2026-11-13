@@ -30,7 +30,7 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1634; measured, reproducers in `tests/zer_gaps/`)
+## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1635; measured, reproducers in `tests/zer_gaps/`)
 
 Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
 executed reproducer in `tests/zer_gaps/` (compile-clean = the gap still holds; the runner
@@ -63,14 +63,18 @@ each a missing SUMMARY fact, not a missing key:
    view of its argument — the return-view summary reads the AST root, not the view place;
    `ir_local_view_place` is the query to give it).
 4. **A global reached through a COPY or a capture** — `H c = g_h; g_h.p = null; free(c.p)`,
-   `if (g_opt) |c| { free(c.p); }`, a slice view of a global array: nothing is minted for the
-   global's slot at the copy, so the state-based note (BUG-1623) has no entry to find.
-   `alloc_callee_frees_global_{struct_copy,optional_capture,slice_view}`.
+   `if (g_opt) |c| { free(c.p); }`: nothing is minted for the global's slot at the copy, so
+   the state-based note (BUG-1623) has no entry to find.
+   `alloc_callee_frees_global_{struct_copy,optional_capture}`. (A slice VIEW of a global
+   array is CLOSED, BUG-1635.)
 5. **A carrier forwarded to a funcptr PARAMETER** — `apply(fre, h)` with `h` a struct holding
    the pointer: the bare-pointer argument is widened (BUG-740), the carrier's fields are not.
    `alloc_funcptr_param_frees_carrier_field`.
-6. **A `?*T` read out of a slice view of a local array** — `[*]?*T s = arr[0..]; if (s[0])
-   |q| { free(q); }`. `alloc_slice_view_of_optptr_array`.
+6. ~~A `?*T` read out of a slice view of a local array~~ — CLOSED (BUG-1635).
+   Residual precision (loud): a VARIABLE index through a view that does not start at 0
+   (`[*]?*T u = arr[1..3]; for (i..) { free(u[i]); u[i] = null; }`) is "some element", so
+   the reset reaches no specific slot and the loop is refused — the same answer as the
+   direct `arr[i + 1]` spelling. Iterate the array, or a view starting at 0.
 7. **An async task holding a pointer the FUNCTION was given** — `_init(&task, a)` with `a` a
    parameter (the same body with a local allocation is refused), and a global task started in
    a helper. `alloc_async_task_holds_param_ptr`, `alloc_async_global_task_started_in_helper`.

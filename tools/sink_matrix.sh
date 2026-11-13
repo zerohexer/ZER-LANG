@@ -972,6 +972,16 @@ cell p45_view_drain_one     reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orel
 cell p45_view_drain_dblfree reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; vdrain45(hs); free(a); return 0; }'
 cell p45_slice_local_drain  reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; [*]H45 sl = hs; vdrain45(sl); return a.v; }'
 cell p45_slice_local_dblfree reject "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; [*]H45 sl = hs[0..1]; sdrain45(sl); free(a); return 0; }'
+# BUG-1635: the element is read out of a SLICE VIEW of a local array in the SAME
+# function — the slot split keyed the bare slice local, a stranger to the array.
+P45L='struct T45 { u32 v; }
+'
+cell p45_lview_capture_free reject "$P45L"' u32 main(){ *T45 a = alloc(T45) orelse return; ?*T45[2] arr; arr[0] = a; [*]?*T45 s = arr[0..]; if (s[0]) |q| { free(q); } return a.v; }'
+cell p45_lview_coerce_dbl   reject "$P45L"' u32 main(){ *T45 a = alloc(T45) orelse return; ?*T45[2] arr; arr[0] = a; [*]?*T45 s = arr; if (s[0]) |q| { free(q); } free(a); return 0; }'
+cell p45_lview_var_index    reject "$P45L"' u32 pk(u32 k){ *T45 a = alloc(T45) orelse return; ?*T45[2] arr; arr[k % 2] = a; [*]?*T45 s = arr[0..]; if (s[k % 2]) |q| { free(q); } return a.v; } u32 main(){ return pk(1); }'
+cell p45_lview_shifted_lit  reject "$P45L"' u32 main(){ *T45 a = alloc(T45) orelse return; ?*T45[4] arr; arr[2] = a; [*]?*T45 s = arr[1..3]; if (s[1]) |q| { free(q); } return a.v; }'
+cell p45_safe_lview_consume compile "$P45L"' u32 main(){ ?*T45[4] arr; for (u32 i = 0; i < 4; i += 1) { arr[i] = alloc(T45); } [*]?*T45 s = arr[0..]; u32 n = 0; for (u32 i = 0; i < s.len; i += 1) { if (s[i]) |q| { n += q.v; free(q); } } return n; }'
+cell p45_safe_lview_reset   compile "$P45L"' u32 main(){ ?*T45[4] arr; for (u32 i = 0; i < 4; i += 1) { arr[i] = alloc(T45); } [*]?*T45 s = arr; for (u32 i = 0; i < s.len; i += 1) { if (s[i]) |q| { free(q); } s[i] = null; } u32 n = 0; for (u32 j = 0; j < 4; j += 1) { if (arr[j]) |r| { n += r.v; } } return n; }'
 cell p45_safe_view_readonly compile "$P45V"' u32 main(){ *T45 a = alloc(T45) orelse return; H45[2] hs; hs[0].p = a; hs[0].n = 3; a.v = vsum45(hs); u32 r = a.v - 3; vdrain45(hs); return r; }'
 cell p45_safe_view_refill   compile "$P45V"' u32 main(){ H45[2] hs; hs[0].p = alloc(T45); hs[1].p = alloc(T45); vdrain45(hs); hs[0].p = alloc(T45); u32 r = 0; if (hs[0].p) |z| { z.v = 7; r = z.v - 7; } sdrain45(hs); return r; }'
 

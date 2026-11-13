@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is freed
+// BUG-1635: the same read through the array -> slice COERCION; the caller then
+// frees its own alias a second time. Accepted with no diagnostic before.
+struct T { u32 v; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    ?*T[2] arr;
+    arr[0] = a;
+    [*]?*T s = arr;
+    if (s[0]) |q| { free(q); }
+    free(a);
+    return 0;
+}

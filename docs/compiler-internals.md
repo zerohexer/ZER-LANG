@@ -162,7 +162,7 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
-## The 2026-11-13 audit (BUG-1609..1634) — what took a loop to find
+## The 2026-11-13 audit (BUG-1609..1635) — what took a loop to find
 
 Read with BUGS-FIXED.md "Session 2026-11-13". Only what is not obvious from the diff.
 
@@ -313,6 +313,15 @@ When adding a summary fact, write the applier's argument resolution FIRST and te
 the array itself, `&agg`, `&agg.field`, a sub-slice, a slice local, a forwarded parameter,
 and a global place. A fact that is right in the callee and applied to nothing looks exactly
 like "the callee does nothing".
+
+**11b. The key query and the slot SPLIT must rebase the same way (BUG-1635).**
+`ir_extract_compound_key` rebases `s[0]` through a slice view onto `arr[0]`;
+`ir_slot_decompose` (if-captures, element reads, the overwrite / reset sinks) split `A[i].f`
+by keying `A` ALONE — so a view local was a stranger there while the same expression keyed
+correctly everywhere else. Any new consumer that takes an element access apart instead of
+keying it whole must call `ir_rebase_slice_index` first; that is the one place a view's
+index is translated (a zero-start view keeps a variable index, a shifted one becomes
+"some element").
 
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key

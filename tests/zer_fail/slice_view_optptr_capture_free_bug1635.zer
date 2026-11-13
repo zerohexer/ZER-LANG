@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is freed
+// BUG-1635: `s[0]` read out of a SLICE VIEW of a local array is the array's
+// slot. The slot split keyed the bare slice local — a stranger to `arr` — so
+// the if-capture aliased nothing and the free through it left `a` ALIVE: the
+// write below landed in the recycled slot of `b` (the program returned 99).
+// (`s[0] orelse return` and `s[0].p` were already rebased by the key query.)
+struct T { u32 v; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    ?*T[2] arr;
+    arr[0] = a;
+    [*]?*T s = arr[0..];
+    if (s[0]) |q| { free(q); }
+    *T b = alloc(T) orelse return;
+    b.v = 5;
+    a.v = 99;
+    u32 r = b.v;
+    free(b);
+    return r;
+}

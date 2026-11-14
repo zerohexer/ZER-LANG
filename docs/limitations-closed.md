@@ -8303,3 +8303,19 @@ the pointee type", and records are compared by may-alias. Built as designed belo
    refusing them), and a thread's own never-published heap object. Until it is built:
    reach shared data by name or by index, not through a pointer fetched at run time, or
    keep it in a `shared struct`.
+
+## CLOSED 2026-11-14 by BUG-1670 — a `static` local Pool or Ring emitted C that GCC refused
+
+Fixed in the emitter: `emit_container_storage_type` spells the storage struct once for the
+global and the static-local declaration (`tests/zer/static_local_pool_ring_bug1670.zer`).
+The entry as it stood:
+
+### (was) OPEN — a `static` LOCAL Pool or Ring emits C that GCC refuses (2026-11-14, LOW — loud, valid program refused)
+
+`u32 f() { static Pool(N, 4) sp; … }` passes the checker ("Pool / Ring / Slab / Arena must
+be global or static") and GCC then reports `variable 'sp' has initializer but incomplete
+type`: the struct for a Pool / Ring stamp is emitted from the GLOBAL declarations, and a
+static local's stamp has no definition before the function. A static-local Slab or Arena
+builds. Measured while writing the BUG-1668 grid (whose static-Pool cells are therefore
+checker-only). Fix sketch: collect the stamps of static locals in the same pre-pass that
+collects the globals'. Until then declare the Pool / Ring at file scope.

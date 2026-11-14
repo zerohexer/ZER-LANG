@@ -1,0 +1,18 @@
+// expect-error: both access non-shared global 'task'
+// BUG-1673: an async function's locals and its resume point live IN its task; every poll rewrites them.
+// Two threads polling ONE task met nowhere — the call's argument is `&task`, an address, not an access.
+// TSan: data race (on the task's state) on the pre-fix compiler.
+u32 flagx;
+async void job() {
+    u32 n = 0;
+    for (u32 i = 0; i < 100000; i += 1) { n += 1; yield; }
+}
+_zer_async_job task;
+void poller() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { _zer_async_job_poll(&task); } }
+i32 main() {
+    _zer_async_job_init(&task);
+    ThreadHandle a = spawn poller();
+    ThreadHandle b = spawn poller();
+    a.join(); b.join();
+    return 0;
+}

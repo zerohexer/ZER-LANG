@@ -1,0 +1,15 @@
+// expect-error: both access non-shared global 'gs'
+// BUG-1675: a struct with an atomic FIELD. One thread does @atomic_add(&gs.count, 1); the other assigns
+// the WHOLE struct plainly — a write of every field, the atomic one included. The atomic access had no
+// record for the plain one to meet. TSan: data race on the pre-fix compiler.
+u32 flagx;
+struct S { u32 count; u32 other; }
+S gs;
+void wa() { for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&gs.count, 1); } }
+void wp() { @atomic_store(&flagx, 1); S z; z.count = 0; z.other = 0; for (u32 i = 0; i < 100000; i += 1) { gs = z; } }
+i32 main() {
+    ThreadHandle a = spawn wa();
+    ThreadHandle b = spawn wp();
+    a.join(); b.join();
+    return 0;
+}

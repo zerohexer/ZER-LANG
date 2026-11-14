@@ -1,0 +1,78 @@
+// BUG-1671 / 1672 / 1673, the precision half — what must still be accepted, with exact results:
+//   - a detached grandchild and the code after the join of its starter, both under ONE lock
+//   - one @once block reached by two workers (it cannot meet itself), read after the joins
+//   - an async task per thread on the thread's own stack, and one shared task polled under a lock
+u32 flagx;
+u32 lk;
+u32 done;
+u32 total;
+u32 table;
+u32 polls;
+
+void grandchild() {
+    @atomic_store(&flagx, 1);
+    for (u32 i = 0; i < 1000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        total += 1;
+        @atomic_store(&lk, 0);
+    }
+    @atomic_store(&done, 1);
+}
+void child() { spawn grandchild(); }
+
+void init_worker() {
+    @atomic_store(&flagx, 1);
+    @once { table = 42; }
+}
+
+async void job() {
+    u32 n = 0;
+    for (u32 i = 0; i < 50; i += 1) { n += 1; yield; }
+}
+_zer_async_job shared_task;
+
+void own_poller() {
+    @atomic_store(&flagx, 1);
+    _zer_async_job mine;
+    _zer_async_job_init(&mine);
+    u32 k = 0;
+    while (_zer_async_job_poll(&mine) == 0) { k += 1; }
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    polls += k;
+    @atomic_store(&lk, 0);
+}
+void shared_poller() {
+    @atomic_store(&flagx, 1);
+    for (u32 i = 0; i < 30; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        _zer_async_job_poll(&shared_task);
+        @atomic_store(&lk, 0);
+    }
+}
+
+i32 main() {
+    _zer_async_job_init(&shared_task);
+    ThreadHandle t = spawn child();
+    t.join();
+    for (u32 i = 0; i < 1000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        total += 1;
+        @atomic_store(&lk, 0);
+    }
+    while (@atomic_load(&done) == 0) { }
+    ThreadHandle a = spawn init_worker();
+    ThreadHandle b = spawn init_worker();
+    ThreadHandle c = spawn own_poller();
+    ThreadHandle d = spawn own_poller();
+    ThreadHandle e = spawn shared_poller();
+    ThreadHandle f = spawn shared_poller();
+    a.join(); b.join(); c.join(); d.join(); e.join(); f.join();
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    u32 tot = total;
+    u32 pl = polls;
+    @atomic_store(&lk, 0);
+    if (tot != 2000) { return 1; }
+    if (table != 42) { return 2; }
+    if (pl != 100) { return 3; }
+    return 0;
+}

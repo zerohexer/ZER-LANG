@@ -270,6 +270,21 @@ is the first of them that is not a trace model of ONE protocol: it certifies the
 COMPARISON of two records, and says nothing about whether an access got a record at all —
 BUG-1667 and BUG-1668 were accesses with none, and no theorem there could have failed.
 
+**The composition (`race_free.v`, 2026-11-14).** The four above are each sound over their
+own states; `race_free.v` is the one machine in which all the mechanisms live together —
+threads as control-flow graphs, an interleaving step relation, a definition of a data race
+— and the theorem that an ANNOTATION satisfying local flow constraints plus the pairwise
+rule excludes every reachable race. Shape to copy for any "accepted → safe" theorem over a
+flow analysis: (1) the analysis result is a parameter (predicates over program points),
+not a function — the theorem quantifies over every solution; (2) each constraint is LOCAL
+to one control-flow edge, so it is checkable and the invariant is one `Record` proved by
+one case split on the step; (3) the hypotheses are bundled as `acc k` ("all but number
+k"), so necessity is a theorem per hypothesis — `acc k` holds and the bad state is
+reachable — over small enumerated programs closed by one exhaustion tactic. Its header
+lists what `checker.c` must establish; reading that list against the walk found five
+accepted races in an hour (BUG-1671..1674). The first draft of its own accepted example
+was refused by the theorem, correctly.
+
 **File structure per function verified:**
 ```
 proofs/vst/

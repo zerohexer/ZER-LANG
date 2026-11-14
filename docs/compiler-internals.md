@@ -8833,6 +8833,13 @@ checker has REWRITTEN the tree by the time the walk runs: `alloc(T)` is `T.alloc
 `free(p)` is `T.free_ptr(p)`, `x orelse return` has no fallback node, only a flag — a
 recogniser written against the source spelling matches nothing (measured: the own-heap
 rule recognised no allocation at all until it read the flags).
+The SETS the records go into (BUG-1671): `thr[i]` (a thread), `win[i]` (its spawner's
+code in the window) and, built on demand, `winx[j]` (site j's window with no join closing
+it). Pairs judged: a thread with itself when started twice, with its own window, with
+every ANCESTOR's window (`sync_ancestor_conflict`), with every other thread. A set has one
+logical thread (`lt`) and the hand-off verdict counts owners by it — add a pair, never
+pour one thread's records into another's set. The final verdict on a pair is
+`zer_pair_ordered` (`race_free.v`); `sync_sets_conflict` is its only caller.
 
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key

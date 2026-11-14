@@ -539,7 +539,8 @@ check-vst:
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety -Q ../operational/lambda_zer_concurrency zer_conc verif_window_rules.v && \
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety -Q ../operational/lambda_zer_concurrency zer_conc verif_lock_rules.v && \
 	        coqc -Q . zer_vst -Q ../../src/safety zer_safety -Q ../operational/lambda_zer_concurrency zer_conc verif_handoff_rules.v && \
-	        coqc -Q . zer_vst -Q ../../src/safety zer_safety -Q ../operational/lambda_zer_concurrency zer_conc verif_alias_rules.v'
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety -Q ../operational/lambda_zer_concurrency zer_conc verif_alias_rules.v && \
+	        coqc -Q . zer_vst -Q ../../src/safety zer_safety -Q ../operational/lambda_zer_concurrency zer_conc verif_race_rules.v'
 	@echo "=== VST proofs compile green ==="
 	@if grep -l 'Admitted\|admit\.' proofs/vst/verif_*.v 2>/dev/null | grep -q .; then \
 	    echo "FAIL: admits found in VST proofs"; exit 1; \

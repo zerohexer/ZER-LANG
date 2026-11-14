@@ -26402,6 +26402,7 @@ static Symbol *sync_stmt_handoff_store(Checker *c, Node *s, Node *fn, Node **nod
 typedef struct {
     Symbol *g; bool write; Symbol *lock, *own_f; uint64_t own_v; Symbol *pub;
     Type *ty; bool atomic;
+    Symbol *once;   /* BUG-1672: made inside this @once block (NULL: outside any) */
 } SyncAcc;
 /* BUG-1664: one store of a flag as an instance's walk met it, and the value its
  * thread held there — `from` is zer_flag_store_from's answer (1 an observed
@@ -26458,7 +26459,7 @@ static bool sync_acc_has(SyncAccSet *s, SyncAcc a) {
     for (int i = 0; i < s->n; i++)
         if (s->v[i].g == a.g && s->v[i].write == a.write && s->v[i].lock == a.lock &&
             s->v[i].own_f == a.own_f && (!a.own_f || s->v[i].own_v == a.own_v) &&
-            s->v[i].pub == a.pub && s->v[i].atomic == a.atomic &&
+            s->v[i].pub == a.pub && s->v[i].atomic == a.atomic && s->v[i].once == a.once &&
             (a.g || type_equals(s->v[i].ty, a.ty))) return true;
     return false;
 }
@@ -26473,7 +26474,9 @@ static void sync_acc_add(SyncAccSet *s, SyncAcc a) {
     s->v[s->n++] = a;
 }
 
-typedef struct { Symbol *lock, *own_f; uint64_t own_v; Symbol *pub; } SyncCtx;
+/* BUG-1672: `once` — the @once block this code is inside; its body has ONE
+ * executor program-wide, so two accesses made inside one block never meet. */
+typedef struct { Symbol *lock, *own_f; uint64_t own_v; Symbol *pub; Symbol *once; } SyncCtx;
 /* THREAD: the walk is a thread's body — every access counts. WINDOW: the walk
  * is the function that SPAWNED it, and only the accesses between the spawn and
  * its join count (BEFORE -> IN at the spawn, IN -> AFTER at `handle.join()`). */
@@ -26519,6 +26522,7 @@ typedef struct {
     bool jump_fn;
     bool entry_once;          /* the instance's entry function runs at most once */
     Node *impl_store;
+    bool detached;            /* BUG-1671: the window is judged for a detached descendant — no join closes it */
 } SyncWalk;
 typedef struct { Symbol **v; int n, cap; bool direct; } SyncGl;
 static void sync_gl_add(SyncGl *l, Symbol *g) {
@@ -26658,8 +26662,14 @@ static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
     if (w->rmw_mode && write && g && g->is_volatile && !g->is_function && g->type &&
         volatile_global_exempt_from_race_check(w->c, g))
         vol_store_note(g, ctx.lock, w->rmw_mode == 1);
-    if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
-    SyncAcc a = { g, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, NULL, false };
+    /* BUG-1675: an atomic cell used to be skipped here ("the atomic-cell rule's").
+     * That rule polices the SPAWNER's plain accesses; a plain access made by a
+     * thread that uses an @atomic of its own had no judge at all — `bump(&g)`,
+     * `*gp += 1`, `gs = z` over a struct with an atomic field were accepted
+     * (TSan: each races the other thread's @atomic_add). The cell's atomic
+     * accesses are recorded as ATOMIC (sync_record_atomic); a plain one meets them. */
+    if (!g || !spawn_global_needs_sync(w->c, g)) return;
+    SyncAcc a = { g, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, NULL, false, ctx.once };
     sync_acc_add(w->out, a);
 }
 /* BUG-1666: an access to "some object of type `ty`". A type that locks itself
@@ -26672,24 +26682,28 @@ static void sync_record_typed(SyncWalk *w, Type *ty, bool write, bool atomic, Sy
     TypeKind k = type_dispatch_kind(t);
     if (k == TYPE_STRUCT && (t->struct_type.is_shared || t->struct_type.is_shared_rw)) return;
     if (k == TYPE_BARRIER || k == TYPE_SEMAPHORE) return;
-    SyncAcc a = { NULL, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, t, atomic };
+    SyncAcc a = { NULL, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, t, atomic, ctx.once };
     sync_acc_add(w->out, a);
 }
-/* BUG-1668: an ATOMIC access of a named object that has no atomic-cell rule of
- * its own (a static local). Atomic against atomic is no race; against a plain
- * access of the same object it is. */
+/* BUG-1668 / BUG-1675: an ATOMIC access of a named object — a global cell, a
+ * field or element of a global, a static local. Atomic against atomic is no
+ * race; against a plain access of the same object it is (race_free.v:
+ * `conflict` excuses a pair only when BOTH are atomic). */
 static void sync_record_atomic(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
     if (w->phase != SW_THREAD && w->phase != SW_IN) return;
     if (!g || !spawn_global_needs_sync(w->c, g)) return;
-    SyncAcc a = { g, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, NULL, true };
+    SyncAcc a = { g, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, NULL, true, ctx.once };
     sync_acc_add(w->out, a);
 }
 /* A thread read-modify-writes volatile `g`: refused outright, as the spawn scan
  * always did — unless a lock is held, in which case every OTHER store must hold
- * it too (check_volatile_locked_rmw). An @once body is never walked. */
+ * it too (check_volatile_locked_rmw). */
 static void sync_vol_rmw_thread_hit(SyncWalk *w, Symbol *g, SyncCtx ctx) {
     if (!g || g->is_function || !g->is_volatile || g->is_const || global_is_threadlocal(g))
         return;
+    /* inside a @once body the single-owner rule of the spawn scan decides
+     * (once_single_owner) — as it did when this walk never entered one */
+    if (ctx.once) return;
     if (!ctx.lock) { if (!w->vol_rmw) w->vol_rmw = g; }
     else vol_locked_note(g, ctx.lock, w->site);
 }
@@ -27561,6 +27575,69 @@ static bool sync_indirect_visit(Checker *c, Symbol *fn, void *ud) {
     sync_descend(u->w, fn, u->args, u->nargs, u->ctx, u->depth);
     return false;
 }
+/* A WRITE of the place `t` — an assignment's target, an asm output: the global
+ * (or static local) it is in, the object behind every reference on the way, and
+ * the reads its index expressions make. */
+static void sync_write_target(SyncWalk *w, Node *t, SyncCtx ctx, int depth) {
+    Checker *c = w->c;
+    if (!t) return;
+    Node *troot = sync_place_root(t);
+    Symbol *tself = troot ? sync_name_self(w, troot->ident.name,
+                                           (uint32_t)troot->ident.name_len) : NULL;
+    /* BUG-1668: a static local is written by its own name; the global
+     * resolver knows only the program's scope */
+    if (tself) sync_record(w, tself, true, ctx);
+    /* BUG-1675: a name this function binds is its LOCAL — what it reaches is in
+     * the walk's own bindings (sync_record_bound, below). The global resolver
+     * answers such a name from the spawn scan's alias table, which is that
+     * scan's state: `b = @atomic_load(&gb);` came back as a write of `gb`
+     * (hidden for as long as an atomic cell was never recorded). */
+    else if (troot && w->fnode &&
+             fn_binds_name(w->fnode, troot->ident.name, (uint32_t)troot->ident.name_len)) { }
+    else sync_record(w, resolve_write_target_global(c, t, 0), true, ctx);
+    sync_record_bound(w, t, true, ctx);
+    sync_lvalue(w, t, ctx, depth + 1);
+}
+/* BUG-1672: the tag of one @once block (NULL if it cannot be made: its body is
+ * then judged like any other code). */
+static Symbol *sync_once_site(Checker *c, Node *once) {
+    if (!once->once.site_sym) {
+        Symbol *s = (Symbol *)arena_alloc(c->arena, sizeof(Symbol));
+        if (!s) return NULL;
+        memset(s, 0, sizeof(*s));
+        s->name = "@once"; s->name_len = 5;
+        once->once.site_sym = s;
+    }
+    return once->once.site_sym;
+}
+/* BUG-1673: `_zer_async_NAME_init / _poll / _result(&task, …)`. An async
+ * function's locals and its resume point live IN the task; every poll rewrites
+ * them. Two threads polling one task met nowhere: the call's argument is `&task`
+ * — an address, not an access. Returns 1 for a call that rewrites the task, 2 for
+ * one that reads it (`_result`), 0 otherwise. */
+static int sync_async_task_call(Checker *c, Node *call) {
+    Node *cal = call->call.callee;
+    if (!cal || cal->kind != NODE_IDENT || call->call.arg_count < 1) return 0;
+    const char *nm = cal->ident.name; size_t nl = cal->ident.name_len;
+    if (nl <= 16 || memcmp(nm, "_zer_async_", 11) != 0) return 0;
+    int kind = 0;
+    if (memcmp(nm + nl - 5, "_init", 5) == 0 || memcmp(nm + nl - 5, "_poll", 5) == 0) kind = 1;
+    else if (nl > 18 && memcmp(nm + nl - 7, "_result", 7) == 0) kind = 2;
+    if (!kind) return 0;
+    Symbol *fs = global_decl_lookup(c, nm, (uint32_t)nl);
+    return (fs && fs->is_function) ? kind : 0;
+}
+/* an access to the object the reference VALUE `ref` points at */
+static void sync_record_through(SyncWalk *w, Node *ref, bool write, SyncCtx ctx) {
+    if (sync_ref_unknown(w, ref, 0)) {
+        sync_record_typed(w, sync_pointee(w->c, ref), write, false, ctx);
+        return;
+    }
+    SyncGl gl; memset(&gl, 0, sizeof(gl));
+    sync_value_globals(w, ref, &gl, 0);
+    for (int i = 0; i < gl.n; i++) sync_record(w, gl.v[i], write, ctx);
+    free(gl.v);
+}
 static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     if (!n) return;
     /* BUG-1665: past the cap the walk records nothing more. It used to return in
@@ -27581,15 +27658,7 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     }
     case NODE_ASSIGN: {
         sync_vol_rmw_facts(w, n, ctx);   /* BUG-1652 */
-        Node *troot = sync_place_root(n->assign.target);
-        Symbol *tself = troot ? sync_name_self(w, troot->ident.name,
-                                               (uint32_t)troot->ident.name_len) : NULL;
-        /* BUG-1668: a static local is written by its own name; the global
-         * resolver knows only the program's scope */
-        if (tself) sync_record(w, tself, true, ctx);
-        else sync_record(w, resolve_write_target_global(c, n->assign.target, 0), true, ctx);
-        sync_record_bound(w, n->assign.target, true, ctx);
-        sync_lvalue(w, n->assign.target, ctx, depth + 1);
+        sync_write_target(w, n->assign.target, ctx, depth);
         SW(n->assign.value);
         /* a bound name re-aimed: it may now hold this value's targets too */
         Node *t = n->assign.target;
@@ -27618,6 +27687,10 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         sync_vol_rmw_facts(w, n, ctx);   /* BUG-1652 */
         SW(n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++) SW(n->call.args[i]);
+        {   /* BUG-1673: a poll rewrites the task it is handed */
+            int ak = sync_async_task_call(c, n);
+            if (ak) sync_record_through(w, n->call.args[0], ak == 1, ctx);
+        }
         {   /* BUG-1667: a builtin method rewrites the container it is called on */
             bool mut = false; Symbol *slab = NULL;
             Node *recv = sync_method_receiver(c, w->fnode, n, &mut, &slab);
@@ -27656,8 +27729,10 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         for (int i = 0; i < n->spawn_stmt.arg_count; i++) SW(n->spawn_stmt.args[i]);
         if (n == w->spawn && w->phase == SW_BEFORE) {
             w->phase = SW_IN;
-            w->handle = n->spawn_stmt.handle_name;
-            w->handle_len = (uint32_t)n->spawn_stmt.handle_name_len;
+            /* BUG-1671: the window is judged for a thread BELOW the spawned one
+             * that was detached — joining the spawned one does not close it */
+            w->handle = w->detached ? NULL : n->spawn_stmt.handle_name;
+            w->handle_len = w->detached ? 0 : (uint32_t)n->spawn_stmt.handle_name_len;
         } else if (w->phase == SW_AFTER) {
             if (w->nseq >= w->cseq) {
                 int nc = w->cseq ? w->cseq * 2 : 8;
@@ -27840,8 +27915,17 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_RETURN:    SW(n->ret.expr);        return;
     case NODE_CRITICAL:  SW(n->critical.body);   return;
     case NODE_DEFER:     SW(n->defer.body);      return;
-    /* A @once body runs once program-wide (BUG-1276's single-owner rule). */
-    case NODE_ONCE:      return;
+    /* BUG-1672: a @once body runs ONCE program-wide — so it cannot meet ITSELF
+     * (the same block in another thread instance). It can meet everything else:
+     * the arm used to return, and a thread reading what another thread's @once
+     * body writes was accepted (TSan: data race). Its accesses carry the block
+     * as a tag; two records with one tag are the only pairs it excuses. */
+    case NODE_ONCE: {
+        SyncCtx oc = ctx;
+        if (!oc.once) oc.once = sync_once_site(c, n);
+        sync_walk(w, n->once.body, oc, depth + 1);
+        return;
+    }
     case NODE_AWAIT:     SW(n->await_stmt.cond); return;
     case NODE_BINARY:    SW(n->binary.left); SW(n->binary.right); return;
     case NODE_FIELD:
@@ -27885,14 +27969,14 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
                          memcmp(n->intrinsic.name, "atomic_load", 11) == 0);
             if (ref && sync_expr_is_ref(c, ref) && sync_ref_unknown(w, ref, 0))
                 sync_record_typed(w, sync_pointee(c, ref), awr, true, ctx);
-            /* BUG-1668: a static-local cell has no atomic-cell rule of its own
-             * (that rule is keyed by global) — the atomic access is recorded, and
-             * meets every plain access of the same static */
-            Node *croot = (!ref && cell && cell->kind == NODE_UNARY && cell->unary.op == TOK_AMP)
-                              ? sync_place_root(cell->unary.operand) : NULL;
-            Symbol *cself = croot ? sync_name_self(w, croot->ident.name,
-                                                   (uint32_t)croot->ident.name_len) : NULL;
-            if (cself) sync_record_atomic(w, cself, awr, ctx);
+            else if (cell && !sync_ref_unknown(w, cell, 0)) {
+                /* BUG-1675: a NAMED cell — `&g`, `&gs.count`, `&ga[i]`, a
+                 * parameter bound to one, a static local (BUG-1668) */
+                SyncGl gl; memset(&gl, 0, sizeof(gl));
+                sync_value_globals(w, cell, &gl, 0);
+                for (int gi = 0; gi < gl.n; gi++) sync_record_atomic(w, gl.v[gi], awr, ctx);
+                free(gl.v);
+            }
         }
         /* BUG-1664: every store of a flag this instance makes, and the value
          * its thread holds there (H_sto). The census lists the store SITES; a
@@ -27915,8 +27999,16 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    /* BUG-1674: an asm block READS its inputs and WRITES its outputs — an
+     * output is an assignment target with no `=` in it. The arm used to be a
+     * leaf, in this walk and in both scans. */
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++) SW(n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++)
+            sync_write_target(w, n->asm_stmt.outputs[i].expr, ctx, depth);
+        return;
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_CAST: case NODE_SIZEOF:
@@ -27939,6 +28031,29 @@ typedef struct {
     Symbol *lock_ok, *in_region;
     Node *fn;                            /* the function / handler being walked */
 } SyncCensus;
+/* BUG-1675: globals whose ADDRESS is formed anywhere but as the cell operand of
+ * an @atomic_* (the census sees every body and every global initializer). A
+ * scalar that is not here can be reached by NAME only — no pointer the walk
+ * cannot follow points at it. A failed append answers "exposed". */
+static Symbol **_addr_exposed = NULL;
+static int _addr_exposed_n = 0, _addr_exposed_cap = 0;
+static bool _addr_exposed_lost = false;
+static void addr_exposed_add(Symbol *g) {
+    if (!g || g->is_function) return;
+    for (int i = 0; i < _addr_exposed_n; i++) if (_addr_exposed[i] == g) return;
+    if (_addr_exposed_n >= _addr_exposed_cap) {
+        int nc = _addr_exposed_cap ? _addr_exposed_cap * 2 : 16;
+        Symbol **nb = (Symbol **)realloc(_addr_exposed, (size_t)nc * sizeof(Symbol *));
+        if (!nb) { _addr_exposed_lost = true; return; }
+        _addr_exposed = nb; _addr_exposed_cap = nc;
+    }
+    _addr_exposed[_addr_exposed_n++] = g;
+}
+static bool addr_exposed(Symbol *g) {
+    if (_addr_exposed_lost || _lock_broken_lost) return true;   /* an incomplete census */
+    for (int i = 0; i < _addr_exposed_n; i++) if (_addr_exposed[i] == g) return true;
+    return false;
+}
 static void census_add(SyncCensus *k, Symbol *caller, Symbol *callee, bool in_loop,
                        Node *call) {
     if (k->n >= k->cap) {
@@ -28100,6 +28215,7 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
                 fn_binds_name(k->fn, r->ident.name, (uint32_t)r->ident.name_len);
             if (!local) {
                 Symbol *ag = resolve_write_target_global(c, n->unary.operand, 0);
+                addr_exposed_add(ag);   /* BUG-1675 */
                 lock_word_break(ag, n,
                                 "its address is taken, so it can be written through a pointer");
                 flag_break(ag, n, "its address is taken, so it can be written through a pointer");
@@ -28155,8 +28271,13 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_CONTAINER_DECL:
+    /* BUG-1675: an operand expression can take an address (`"rdi" = &g`) */
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++) CW(n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++) CW(n->asm_stmt.outputs[i].expr);
+        return;
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_CAST: case NODE_SIZEOF:
@@ -28472,9 +28593,13 @@ static bool sync_flag_orders(Checker *c, Symbol *f, SyncAcc *a, SyncAccSet *as, 
     if (!flag_claim_granted(f, vb, bs, all, nall)) { flag_note_ungranted(c, f, vb, all, nall); return false; }
     return zer_flag_orders(handoff_flag_ok(c, f, all, nall) ? 1 : 0, va != vb ? 1 : 0) != 0;
 }
-static bool sync_ordered(Checker *c, SyncAcc *a, SyncAccSet *as, SyncAcc *b, SyncAccSet *bs,
-                         SyncAccSet **all, int nall) {
-    if (a->lock && a->lock == b->lock) return true;
+/* one lock held at both — a spin lock, or being the one executor of a @once block */
+static bool sync_common_lock(SyncAcc *a, SyncAcc *b) {
+    return (a->lock && a->lock == b->lock) || (a->once && a->once == b->once);
+}
+/* two different held values of one hand-off flag */
+static bool sync_tok_differ(Checker *c, SyncAcc *a, SyncAccSet *as, SyncAcc *b, SyncAccSet *bs,
+                            SyncAccSet **all, int nall) {
     if (sync_flag_orders(c, a->own_f, a, as, b, bs, all, nall)) return true;
     if (a->pub != a->own_f && sync_flag_orders(c, a->pub, a, as, b, bs, all, nall)) return true;
     /* not ordered: if a flag either side relies on is broken, say why (once) */
@@ -28525,13 +28650,29 @@ static bool sync_type_is_byte(Type *t) {
  * model's types are trees; an Arena breaks that — it carves objects of any type
  * out of a byte buffer — so in a program that has one, a typed BYTE access is
  * taken to overlap a typed access of any type (the model's limit 3, by fiat). */
+/* BUG-1675: can a reference the walk could NOT follow point at global `g`? Not
+ * at a SCALAR whose address the program never forms: `&g` is the only way to
+ * get a reference to one (an aggregate also yields views and coerced slices),
+ * and the census has seen every body and every global initializer — a `&g`
+ * that is the cell operand of an @atomic_* is consumed there and leaves no
+ * pointer behind. So a spin-lock word, a hand-off flag or an atomic counter
+ * does not meet every `*u32` in the program. (A static local is not asked: the
+ * census skips names a function binds.) */
+static bool sync_global_unreachable(Symbol *g) {
+    if (!g->type || !g->func_node || g->func_node->kind != NODE_GLOBAL_VAR) return false;
+    if (g->arena_backing_of) return false;
+    TypeKind k = type_dispatch_kind(g->type);
+    bool scalar = type_is_integer(g->type) || k == TYPE_BOOL || k == TYPE_ENUM ||
+                  k == TYPE_F32 || k == TYPE_F64;
+    return scalar && !addr_exposed(g);
+}
 static bool sync_acc_may_alias(Checker *c, SyncAcc *x, SyncAcc *y) {
     int both_named = (x->g && y->g) ? 1 : 0;
     int same = (both_named && x->g == y->g) ? 1 : 0;
     int ab = 0, ba = 0;
     if (!both_named) {
-        if (x->g) ab = sync_global_holds(x->g, y->ty) ? 1 : 0;
-        else if (y->g) ab = sync_global_holds(y->g, x->ty) ? 1 : 0;
+        if (x->g) ab = (!sync_global_unreachable(x->g) && sync_global_holds(x->g, y->ty)) ? 1 : 0;
+        else if (y->g) ab = (!sync_global_unreachable(y->g) && sync_global_holds(y->g, x->ty)) ? 1 : 0;
         else {
             ab = type_may_hold(x->ty, y->ty) ? 1 : 0;
             ba = type_may_hold(y->ty, x->ty) ? 1 : 0;
@@ -28548,11 +28689,20 @@ static SyncAcc *sync_sets_conflict(Checker *c, SyncAccSet *a, SyncAccSet *b,
     for (int i = 0; i < a->n; i++)
         for (int j = 0; j < b->n; j++) {
             SyncAcc *x = &a->v[i], *y = &b->v[j];
-            if (!x->write && !y->write) continue;
-            if (x->atomic && y->atomic) continue;
+            /* THE PAIRWISE VERDICT (race_free.v: `conflict -> ordered`;
+             * zer_pair_ordered is proved equal to its meaning lemma). `apart` is
+             * 0 here: that one thread is not running at the other's access is
+             * decided by WHICH sets are compared — a window set holds only what
+             * runs beside its thread, and two spawns of which one is joined
+             * before the other starts are never paired (sync_seq_has). */
+            int xw = x->write ? 1 : 0, yw = y->write ? 1 : 0;
+            int ba = (x->atomic && y->atomic) ? 1 : 0;
+            if (zer_pair_ordered(1, xw, yw, ba, 0, 0, 0)) continue;       /* no conflict whatever they touch */
             if (!sync_acc_may_alias(c, x, y)) continue;
+            int cl = sync_common_lock(x, y) ? 1 : 0;
+            int td = (!cl && sync_tok_differ(c, x, a, y, b, all, nall)) ? 1 : 0;
             /* report the NAMED side when there is one */
-            if (!sync_ordered(c, x, a, y, b, all, nall)) return (!x->g && y->g) ? y : x;
+            if (!zer_pair_ordered(1, xw, yw, ba, cl, td, 0)) return (!x->g && y->g) ? y : x;
         }
     return NULL;
 }
@@ -28571,7 +28721,7 @@ static void sync_window_callers(Checker *c, SyncCensus *k, Symbol *encl, SyncAcc
     if (!q) return;
     int qn = 0;
     q[qn++] = encl;
-    SyncCtx none = { NULL, NULL, 0, NULL };
+    SyncCtx none = { NULL, NULL, 0, NULL, NULL };
     for (int qi = 0; qi < qn; qi++) {
         Symbol *f = q[qi];
         for (int i = 0; i < k->n; i++) {
@@ -28605,6 +28755,103 @@ static bool sync_seq_has(SyncWalk *w, Node *n) {
     return false;
 }
 
+/* BUG-1665: an incomplete walk orders nothing */
+static void sync_report_lost(Checker *c, struct SyncSpawnSite *s) {
+    c->file_name = s->file; c->source = s->source;
+    checker_error(c, s->line,
+        "spawn target '%.*s' touches non-shared globals, and the code it (or a "
+        "thread beside it) runs could not be followed to the end — a call chain "
+        "deeper than the analysis walks. What lies beyond cannot be shown ordered "
+        "against the other thread, and an @atomic_* / @barrier elsewhere does not "
+        "order it. Shorten the chain, or keep the data in a shared struct",
+        (int)s->target->name_len, s->target->name);
+}
+/* ---- BUG-1671: A THREAD RUNS INSIDE ITS ANCESTORS' WINDOWS ----
+ * race_free.v orders a pair by `after t n u` only when u has FINISHED, and a
+ * join of u says nothing of a thread u STARTED. The walk judged a thread
+ * against the window of its own spawn site alone:
+ *     void child() { ThreadHandle m = spawn gc(); m.join(); }
+ *     ThreadHandle t = spawn child();  g += 1;  t.join();      // gc writes g
+ * `g += 1` is in child's window, not in gc's — never compared; and with
+ * `spawn gc();` detached, the write AFTER `t.join()` was not either (TSan: both
+ * race). Thread i lives inside every thread that can run the function that
+ * spawns it, so it is judged against that thread's window too — up the whole
+ * chain. `det`: some spawn on the chain below the ancestor is detached, so i may
+ * outlive the ancestor's join: the window then never closes (`winx`). */
+/* does `f` reach `target` through CALLS (f runs target's body in its own thread)? */
+static bool sync_calls_reach(SyncCensus *k, Symbol *f, Symbol *target, Symbol **q) {
+    int qn = 0;
+    q[qn++] = target;
+    for (int qi = 0; qi < qn; qi++) {
+        if (q[qi] == f) return true;
+        for (int i = 0; i < k->n; i++) {
+            SyncCallSite *cs = &k->v[i];
+            if (cs->callee != q[qi] || !cs->call || !cs->caller) continue;
+            bool seen = false;
+            for (int j = 0; j < qn; j++) if (q[j] == cs->caller) { seen = true; break; }
+            if (!seen && qn < k->n + 2) q[qn++] = cs->caller;
+        }
+    }
+    return false;
+}
+typedef struct {
+    Checker *c; SyncCensus *k; int n;
+    SyncAccSet *thr, *win, *winx; bool *winx_done;
+    SyncAccSet **all; int nall;
+    Symbol **q;          /* scratch for sync_calls_reach, k->n + 2 slots */
+    bool *seen;          /* 2 * n: (site, det) pairs visited */
+    int hit;             /* the ancestor site whose window met the thread */
+} SyncAnc;
+/* the never-closing window of site j: its function from the spawn to the end,
+ * and every caller after that function returns. Tokens are dropped — the
+ * hand-off verdict is taken over the sets the flag census knows, and this one
+ * is extra: only a common lock orders against it. */
+static SyncAccSet *sync_winx(SyncAnc *a, int j) {
+    Checker *c = a->c;
+    if (a->winx_done[j]) return &a->winx[j];
+    a->winx_done[j] = true;
+    struct SyncSpawnSite *s = &c->sync_spawns[j];
+    Symbol *e = s->encl;
+    if (!e || !e->func_node || e->func_node->kind != NODE_FUNC_DECL) { a->winx[j].lost = true; return &a->winx[j]; }
+    SyncCtx none = { NULL, NULL, 0, NULL, NULL };
+    SyncWalk w;
+    memset(&w, 0, sizeof(w));
+    w.c = c; w.out = &a->winx[j]; w.phase = SW_BEFORE; w.spawn = s->spawn;
+    w.detached = true; w.rmw_mode = 0; w.fnode = e->func_node; w.fn_depth = 1;
+    w.jump_fn = esc_stmt_has_jump(c, e->func_node->func_decl.body);
+    if (s->spawn && s->spawn->kind == NODE_SPAWN && s->spawn->spawn_stmt.in_jump_fn) w.phase = SW_IN;
+    DeclModuleSave dm = decl_module_enter(c, e);
+    sync_walk(&w, e->func_node->func_decl.body, none, 0);
+    decl_module_leave(c, dm);
+    sync_walk_free(&w);
+    sync_window_callers(c, a->k, e, &a->winx[j]);
+    for (int x = 0; x < a->winx[j].n; x++) {
+        a->winx[j].v[x].own_f = NULL; a->winx[j].v[x].own_v = 0; a->winx[j].v[x].pub = NULL;
+    }
+    a->winx[j].repeated = true; a->winx[j].lt = SLT_AMBIG;
+    return &a->winx[j];
+}
+static SyncAcc *sync_ancestor_conflict(SyncAnc *a, int i, int x, bool det) {
+    Checker *c = a->c;
+    if (a->seen[2 * x + (det ? 1 : 0)]) return NULL;
+    a->seen[2 * x + (det ? 1 : 0)] = true;
+    Symbol *encl = c->sync_spawns[x].encl;
+    if (!encl) return NULL;
+    for (int j = 0; j < a->n; j++) {
+        Symbol *tj = c->sync_spawns[j].target;
+        if (!tj || !sync_calls_reach(a->k, tj, encl, a->q)) continue;
+        SyncAccSet *ws = det ? sync_winx(a, j) : &a->win[j];
+        /* an ancestor window that could not be followed orders nothing */
+        if (ws->lost) { a->hit = j; a->thr[i].lost = true; return NULL; }
+        SyncAcc *g = sync_sets_conflict(c, &a->thr[i], ws, a->all, a->nall);
+        if (g) { a->hit = j; return g; }
+        bool jdet = c->sync_spawns[j].spawn && !c->sync_spawns[j].spawn->spawn_stmt.handle_name;
+        g = sync_ancestor_conflict(a, i, j, det || jdet);
+        if (g) return g;
+    }
+    return NULL;
+}
+
 /* BUG-1562/1563: the race finding of a spawn target with an @atomic_* /
  * @barrier is only a warning, because a hand-built protocol can order plain
  * accesses. Refuse what no protocol the analysis can see orders: two thread
@@ -28619,6 +28866,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     SyncCensus k;
     memset(&k, 0, sizeof(k));
     _lock_broken_n = 0; _lock_acq_n = 0; _lock_broken_lost = false;   /* BUG-1663: one program per run */
+    _addr_exposed_n = 0; _addr_exposed_lost = false;                  /* BUG-1675 */
     _flag_store_n = 0; _flag_plain_n = 0; _flag_bad_n = 0; _flag_lost = false;   /* BUG-1664 */
     _flag_verdict_n = 0; _flag_fn_memo_n = 0;
     for (int fi = 0; fi < count; fi++) {
@@ -28667,7 +28915,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     SyncAccSet *win = (SyncAccSet *)calloc((size_t)n, sizeof(SyncAccSet));
     SyncWalk *ww = (SyncWalk *)calloc((size_t)n, sizeof(SyncWalk));
     if (!thr || !win || !ww) { free(thr); free(win); free(ww); free(k.v); free(k.taken); return; }
-    SyncCtx none = { NULL, NULL, 0, NULL };
+    SyncCtx none = { NULL, NULL, 0, NULL, NULL };
     Symbol **stack = (Symbol **)calloc((size_t)k.n + 1, sizeof(Symbol *));
     for (int i = 0; i < n; i++) {
         struct SyncSpawnSite *s = &c->sync_spawns[i];
@@ -28788,6 +29036,15 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     for (int i = 0; i < n && all; i++) { all[nall++] = &thr[i]; all[nall++] = &win[i]; }
     for (int i = 0; i < ni && all; i++) all[nall++] = &isr[i];
     bool *done = (bool *)calloc((size_t)n, sizeof(bool));
+    /* BUG-1671: the ancestor windows */
+    SyncAnc anc;
+    memset(&anc, 0, sizeof(anc));
+    anc.c = c; anc.k = &k; anc.n = n; anc.thr = thr; anc.win = win; anc.all = all; anc.nall = nall;
+    anc.winx = (SyncAccSet *)calloc((size_t)n, sizeof(SyncAccSet));
+    anc.winx_done = (bool *)calloc((size_t)n, sizeof(bool));
+    anc.q = (Symbol **)calloc((size_t)k.n + 2, sizeof(Symbol *));
+    anc.seen = (bool *)calloc((size_t)(2 * n), sizeof(bool));
+    bool anc_ok = anc.winx && anc.winx_done && anc.q && anc.seen;
     _flag_census = &k; _flag_stack = stack;   /* BUG-1664: for handoff_flag_ok */
     for (int i = 0; i < n && done && all; i++) {
         struct SyncSpawnSite *s = &c->sync_spawns[i];
@@ -28806,14 +29063,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
                    !sync_seq_has(&ww[j], s->spawn);
         if (lost && !done[i]) {
             done[i] = true;
-            c->file_name = s->file; c->source = s->source;
-            checker_error(c, s->line,
-                "spawn target '%.*s' touches non-shared globals, and the code it (or a "
-                "thread beside it) runs could not be followed to the end — a call chain "
-                "deeper than the analysis walks. What lies beyond cannot be shown ordered "
-                "against the other thread, and an @atomic_* / @barrier elsewhere does not "
-                "order it. Shorten the chain, or keep the data in a shared struct",
-                (int)s->target->name_len, s->target->name);
+            sync_report_lost(c, s);
             continue;
         }
         if (s->downgraded && s->repeated &&
@@ -28823,6 +29073,15 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             why = ffg ? "and the code that runs after it was started (in the function that "
                         "spawned it, or in any caller after that function returns)"
                       : "and the code that spawned it (between the spawn and the join)";
+        } else if (s->downgraded && !anc_ok) {
+            /* the ancestor windows could not be built: nothing can be shown ordered */
+            thr[i].lost = true;
+        } else if (s->downgraded && (memset(anc.seen, 0, (size_t)(2 * n)), anc.hit = -1,
+                                     (g = sync_ancestor_conflict(&anc, i, i, ffg)))) {
+            why = "and the code running beside the thread that started it (a thread runs "
+                  "inside the thread that spawned it: what is beside that one — from its "
+                  "spawn to its join, or to the end when a thread below it is detached — "
+                  "is beside this one)";
         } else {
             for (int j = i + 1; j < n; j++) {
                 if (!s->downgraded && !c->sync_spawns[j].downgraded) continue;
@@ -28834,6 +29093,12 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
                     break;
                 }
             }
+        }
+        /* an ancestor window that could not be built or followed (BUG-1665's rule) */
+        if (!g && !done[i] && s->downgraded && thr[i].lost) {
+            done[i] = true;
+            sync_report_lost(c, s);
+            continue;
         }
         if (!g || done[i]) continue;
         done[i] = true;
@@ -28900,6 +29165,10 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
         sync_walk_free(&ww[i]);
     }
     for (int i = 0; i < ni; i++) { free(isr[i].v); free(isr[i].fs); free(isr[i].want); }
+    for (int i = 0; i < n && anc.winx; i++) {
+        free(anc.winx[i].v); free(anc.winx[i].fs); free(anc.winx[i].want);
+    }
+    free(anc.winx); free(anc.winx_done); free(anc.q); free(anc.seen);
     free(thr); free(win); free(ww); free(done); free(k.v); free(k.taken); free(stack);
     free(all); free(isr);
 }
@@ -29280,7 +29549,16 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         _scan_once_node = sv_once;
         return r;
     }
-    case NODE_LABEL: case NODE_ASM:
+    /* BUG-1674: an asm block reads its inputs and WRITES its outputs */
+    case NODE_ASM:
+        for (int k = 0; k < node->asm_stmt.input_count; k++)
+            if (scan_unsafe_global_access(c, node->asm_stmt.inputs[k].expr, out_name, out_len))
+                return true;
+        for (int k = 0; k < node->asm_stmt.output_count; k++)
+            if (scan_unsafe_global_access(c, node->asm_stmt.outputs[k].expr, out_name, out_len))
+                return true;
+        return false;
+    case NODE_LABEL:
     case NODE_YIELD:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
@@ -40381,7 +40659,14 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     case NODE_AWAIT:
         record_isr_globals(c, node->await_stmt.cond, depth);
         break;
-    case NODE_LABEL: case NODE_ASM: case NODE_YIELD:
+    /* BUG-1674 (the mirrored sink): asm operands are accesses */
+    case NODE_ASM:
+        for (int k = 0; k < node->asm_stmt.input_count; k++)
+            record_isr_globals(c, node->asm_stmt.inputs[k].expr, depth);
+        for (int k = 0; k < node->asm_stmt.output_count; k++)
+            record_isr_globals(c, node->asm_stmt.outputs[k].expr, depth);
+        break;
+    case NODE_LABEL: case NODE_YIELD:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:

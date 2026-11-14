@@ -2198,6 +2198,159 @@ int main(void) {
                 if (!ok) grid_ok = 0;
             }
         }
+
+        /* ---- BUG-1671..1674: found by reading race_free.v's hypotheses against the
+         * walk. `after t n u` says u has FINISHED — not that what u started has; a
+         * @once body is code like any other except against itself; a poll rewrites
+         * its task; an asm output is a write. CONSTRUCT x LOCK. ---- */
+        fprintf(stderr, "\n  -- threads that outlive a join, @once bodies, async tasks, asm operands --\n");
+        static const struct { const char *name; int neg; const char *code; } hx[] = {
+            /* a detached thread below a joined one */
+            { "detached grandchild / unlocked", 1,
+              "u32 flagx;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { g += 1; } }\n"
+              "void child() { spawn gc(); }\n"
+              "u32 main() { ThreadHandle t = spawn child(); t.join(); g += 1; return 0; }\n" },
+            { "detached grandchild / locked", 0,
+              "u32 flagx;\nu32 lk;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { " PR_L "g += 1;" PR_U " } }\n"
+              "void child() { spawn gc(); }\n"
+              "u32 main() { ThreadHandle t = spawn child(); t.join(); " PR_L "g += 1;" PR_U " return 0; }\n" },
+            { "detached through a helper / unlocked", 1,
+              "u32 flagx;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { g += 1; } }\n"
+              "void start() { spawn gc(); }\nvoid child() { start(); }\n"
+              "u32 main() { ThreadHandle t = spawn child(); t.join(); g += 1; return 0; }\n" },
+            { "detached two levels down / unlocked", 1,
+              "u32 flagx;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { g += 1; } }\n"
+              "void mid() { spawn gc(); }\nvoid child() { ThreadHandle m = spawn mid(); m.join(); }\n"
+              "u32 main() { ThreadHandle t = spawn child(); t.join(); g += 1; return 0; }\n" },
+            { "scoped grandchild (joined below) / unlocked", 0,
+              "u32 flagx;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { g += 1; } }\n"
+              "void child() { ThreadHandle m = spawn gc(); m.join(); }\n"
+              "u32 main() { ThreadHandle t = spawn child(); t.join(); g += 1; return 0; }\n" },
+            { "scoped grandchild / write in the grandparent's window", 1,
+              "u32 flagx;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { g += 1; } }\n"
+              "void child() { ThreadHandle m = spawn gc(); m.join(); }\n"
+              "u32 main() { ThreadHandle t = spawn child(); g += 1; t.join(); return 0; }\n" },
+            { "scoped grandchild behind a helper / write in the window", 1,
+              "u32 flagx;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { g += 1; } }\n"
+              "void run() { ThreadHandle m = spawn gc(); m.join(); }\nvoid child() { run(); }\n"
+              "u32 main() { ThreadHandle t = spawn child(); g += 1; t.join(); return 0; }\n" },
+            { "scoped grandchild / write in the window, locked", 0,
+              "u32 flagx;\nu32 lk;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { " PR_L "g += 1;" PR_U " } }\n"
+              "void child() { ThreadHandle m = spawn gc(); m.join(); }\n"
+              "u32 main() { ThreadHandle t = spawn child(); " PR_L "g += 1;" PR_U " t.join(); return 0; }\n" },
+            { "scoped grandchild / write before the spawn", 0,
+              "u32 flagx;\nu32 g;\nvoid gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { g += 1; } }\n"
+              "void child() { ThreadHandle m = spawn gc(); m.join(); }\n"
+              "u32 main() { g += 1; ThreadHandle t = spawn child(); t.join(); return 0; }\n" },
+            /* @once */
+            { "@once body vs a reader", 1,
+              "u32 flagx;\nu32 g;\nvoid sink(u32 v) { }\n"
+              "void a() { @atomic_store(&flagx, 1); @once { g += 1; } }\n"
+              "void b() { @atomic_store(&flagx, 1); sink(g); }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "@once body vs itself", 0,
+              "u32 flagx;\nu32 g;\n"
+              "void a() { @atomic_store(&flagx, 1); @once { g += 1; } }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn a(); x.join(); y.join(); return 0; }\n" },
+            { "two @once blocks", 1,
+              "u32 flagx;\nu32 g;\n"
+              "void a() { @atomic_store(&flagx, 1); @once { g += 1; } }\n"
+              "void b() { @atomic_store(&flagx, 1); @once { g += 2; } }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "@once body vs a reader / locked", 0,
+              "u32 flagx;\nu32 lk;\nu32 g;\nvoid sink(u32 v) { }\n"
+              "void a() { @atomic_store(&flagx, 1); @once { " PR_L "g += 1;" PR_U " } }\n"
+              "void b() { @atomic_store(&flagx, 1); " PR_L "u32 v = g;" PR_U " sink(v); }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            /* an async task */
+            { "one task, two pollers", 1,
+              "u32 flagx;\nasync void job() { u32 n = 0; for (u32 i = 0; i < 4; i += 1) { n += 1; yield; } }\n"
+              "_zer_async_job task;\n"
+              "void p() { @atomic_store(&flagx, 1); _zer_async_job_poll(&task); }\n"
+              "u32 main() { _zer_async_job_init(&task); ThreadHandle x = spawn p(); ThreadHandle y = spawn p(); x.join(); y.join(); return 0; }\n" },
+            { "one task, a poller and a re-init", 1,
+              "u32 flagx;\nasync void job() { u32 n = 0; for (u32 i = 0; i < 4; i += 1) { n += 1; yield; } }\n"
+              "_zer_async_job task;\n"
+              "void p() { @atomic_store(&flagx, 1); _zer_async_job_poll(&task); }\n"
+              "void r() { @atomic_store(&flagx, 1); _zer_async_job_init(&task); }\n"
+              "u32 main() { _zer_async_job_init(&task); ThreadHandle x = spawn p(); ThreadHandle y = spawn r(); x.join(); y.join(); return 0; }\n" },
+            { "one task, two pollers / locked", 0,
+              "u32 flagx;\nu32 lk;\nasync void job() { u32 n = 0; for (u32 i = 0; i < 4; i += 1) { n += 1; yield; } }\n"
+              "_zer_async_job task;\n"
+              "void p() { @atomic_store(&flagx, 1); " PR_L "_zer_async_job_poll(&task);" PR_U " }\n"
+              "u32 main() { _zer_async_job_init(&task); ThreadHandle x = spawn p(); ThreadHandle y = spawn p(); x.join(); y.join(); return 0; }\n" },
+            { "a task per thread, on its own stack", 0,
+              "u32 flagx;\nu32 lk;\nu32 total;\nasync void job() { u32 n = 0; for (u32 i = 0; i < 4; i += 1) { n += 1; yield; } }\n"
+              "void p() { @atomic_store(&flagx, 1); _zer_async_job mine; _zer_async_job_init(&mine);\n"
+              "    u32 k = 0; while (_zer_async_job_poll(&mine) == 0) { k += 1; } " PR_L "total += k;" PR_U " }\n"
+              "u32 main() { ThreadHandle x = spawn p(); ThreadHandle y = spawn p(); x.join(); y.join(); return 0; }\n" },
+            /* BUG-1675: an atomic cell touched PLAINLY by a thread that uses an
+             * @atomic of its own (so the walk, not the spawn scan, judges it) */
+            { "atomic cell / plain through a parameter", 1,
+              "u32 flagx;\nu32 g;\nvoid bump(*u32 p) { *p += 1; }\n"
+              "void a() { @atomic_add(&g, 1); }\nvoid b() { @atomic_store(&flagx, 1); bump(&g); }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "atomic cell / plain by name", 1,
+              "u32 flagx;\nu32 g;\n"
+              "void a() { @atomic_add(&g, 1); }\nvoid b() { @atomic_store(&flagx, 1); g += 1; }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "atomic cell / plain through a global pointer", 1,
+              "u32 flagx;\nu32 g;\n*u32 gp = &g;\n"
+              "void a() { @atomic_add(&g, 1); }\nvoid b() { @atomic_store(&flagx, 1); *gp += 1; }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "atomic field / whole-struct write", 1,
+              "u32 flagx;\nstruct S { u32 n; u32 o; }\nS gs;\n"
+              "void a() { @atomic_add(&gs.n, 1); }\nvoid b() { @atomic_store(&flagx, 1); S z; z.n = 0; z.o = 0; gs = z; }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "atomic field / whole-struct read", 1,
+              "u32 flagx;\nstruct S { u32 n; u32 o; }\nS gs;\nS snap;\n"
+              "void a() { @atomic_add(&gs.n, 1); }\nvoid b() { @atomic_store(&flagx, 1); snap = gs; }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "atomic element / plain index", 1,
+              "u32 flagx;\nu32[4] ga;\n"
+              "void a() { @atomic_add(&ga[1], 1); }\nvoid b(u32 k) { @atomic_store(&flagx, 1); ga[k] += 1; }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(1); x.join(); y.join(); return 0; }\n" },
+            { "atomic cell whose address escaped / plain through an unknown pointer", 1,
+              "u32 flagx;\nu32 g;\n*u32 getp() { return &g; }\n"
+              "void a() { @atomic_add(&g, 1); }\nvoid b() { @atomic_store(&flagx, 1); *u32 p = getp(); *p += 1; }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "atomic cell / atomic in both", 0,
+              "u32 flagx;\nu32 lk;\nu32 g;\nu32 r;\n"
+              "void a() { @atomic_add(&g, 1); }\nvoid b() { @atomic_store(&flagx, 1); u32 v = 0; v = @atomic_load(&g); " PR_L "r += v;" PR_U " }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); x.join(); y.join(); return 0; }\n" },
+            { "atomic cell nobody can point at / an unrelated unknown pointer", 0,
+              "u32 flagx;\nu32 hits;\nu32 lk;\nu32 box;\n*u32 bp = &box;\nvoid reaim() { bp = &box; }\n"
+              "void a() { @atomic_add(&hits, 1); }\nvoid b() { @atomic_store(&flagx, 1); " PR_L "*bp += 1;" PR_U " }\n"
+              "u32 main() { ThreadHandle x = spawn a(); ThreadHandle y = spawn b(); ThreadHandle z = spawn b(); x.join(); y.join(); z.join(); return 0; }\n" },
+            /* asm operands */
+            { "asm output, with an @atomic", 1,
+              "u32 flagx;\nu64 gout;\n"
+              "naked void bump() { asm { instructions: \"mov $1, %0\" outputs: { \"rax\" = gout }\n"
+              "    safety: \"writes the constant one into the output register\" } }\n"
+              "void w() { @atomic_store(&flagx, 1); volatile u32 never = 0; if (never == 42) { bump(); } }\n"
+              "u32 main() { ThreadHandle x = spawn w(); ThreadHandle y = spawn w(); x.join(); y.join(); return 0; }\n" },
+            { "asm output, no @atomic", 1,
+              "u64 gout;\n"
+              "naked void bump() { asm { instructions: \"mov $1, %0\" outputs: { \"rax\" = gout }\n"
+              "    safety: \"writes the constant one into the output register\" } }\n"
+              "void w() { volatile u32 never = 0; if (never == 42) { bump(); } }\n"
+              "u32 main() { ThreadHandle x = spawn w(); ThreadHandle y = spawn w(); x.join(); y.join(); return 0; }\n" },
+            { "asm output / locked", 0,
+              "u32 flagx;\nu32 lk;\nu64 gout;\n"
+              "naked void bump() { asm { instructions: \"mov $1, %0\" outputs: { \"rax\" = gout }\n"
+              "    safety: \"writes the constant one into the output register\" } }\n"
+              "void w() { @atomic_store(&flagx, 1); volatile u32 never = 0; " PR_L "if (never == 42) { bump(); }" PR_U " }\n"
+              "u32 main() { ThreadHandle x = spawn w(); ThreadHandle y = spawn w(); x.join(); y.join(); return 0; }\n" },
+        };
+        for (size_t xi = 0; xi < sizeof(hx) / sizeof(hx[0]); xi++) {
+            valid_cells++;
+            char cn[160];
+            snprintf(cn, sizeof(cn), "hyp/%s", hx[xi].name);
+            int ok = hx[xi].neg ? run_neg(cn, hx[xi].code) : run_pos_check_only(cn, hx[xi].code);
+            fprintf(stderr, "  [%-44s][%s] %s\n", hx[xi].name, hx[xi].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
         #undef PR_L
         #undef PR_U
     }

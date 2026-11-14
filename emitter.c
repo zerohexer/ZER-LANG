@@ -7265,6 +7265,31 @@ static void emit_global_var(Emitter *e, Node *node) {
     emit_global_var_inner(e, node);
     e->global_init_depth--;
 }
+
+/* The C storage of a Pool / Ring: an ANONYMOUS struct, spelled here once for
+ * the global and the static-local declaration alike (BUG-1670). Emits
+ * `struct { … } ` and returns true; false for any other type. */
+static bool emit_container_storage_type(Emitter *e, Type *type) {
+    if (!type) return false;
+    TypeKind ck = type_dispatch_kind(type);
+    type = type_unwrap_distinct(type);
+    if (ck == TYPE_POOL) {
+        emit(e, "struct { ");
+        emit_type(e, type->pool.elem);
+        emit(e, " slots[%llu]; uint32_t gen[%llu]; uint8_t used[%llu]; } ",
+             (unsigned long long)type->pool.count, (unsigned long long)type->pool.count,
+             (unsigned long long)type->pool.count);
+        return true;
+    }
+    if (ck == TYPE_RING) {
+        emit(e, "struct { ");
+        emit_type(e, type->ring.elem);
+        emit(e, " data[%llu]; uint32_t head; uint32_t tail; uint32_t count; } ",
+             (unsigned long long)type->ring.count);
+        return true;
+    }
+    return false;
+}
 static void emit_global_var_inner(Emitter *e, Node *node) {
     Type *type = checker_get_type(e->checker,node);
     /* BUG-1482: a builtin container is an anonymous C struct — a second
@@ -7291,23 +7316,8 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
         type = vp;
     }
 
-    /* Pool(T, N) → use macro for struct layout */
-    if (type && type->kind == TYPE_POOL) {
-        emit(e, "struct { ");
-        emit_type(e, type->pool.elem);
-        emit(e, " slots[%llu]; uint32_t gen[%llu]; uint8_t used[%llu]; } ",
-             (unsigned long long)type->pool.count, (unsigned long long)type->pool.count, (unsigned long long)type->pool.count);
-        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
-        emit(e, " = {0};\n\n");
-        return;
-    }
-
-    /* Ring(T, N) → ring struct */
-    if (type && type->kind == TYPE_RING) {
-        emit(e, "struct { ");
-        emit_type(e, type->ring.elem);
-        emit(e, " data[%llu]; uint32_t head; uint32_t tail; uint32_t count; } ",
-             (unsigned long long)type->ring.count);
+    /* Pool(T, N) / Ring(T, N) → the anonymous storage struct */
+    if (emit_container_storage_type(e, type)) {
         emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
         emit(e, " = {0};\n\n");
         return;
@@ -16170,6 +16180,14 @@ static void emit_defer_body(Emitter *e, IRFunc *func, Node *db) {
  * initializer GCC refused. */
 static void emit_local_decl_head(Emitter *e, IRLocal *l) {
     if (l->is_static) emit(e, "static ");
+    /* BUG-1670: a `static` LOCAL Pool / Ring. Its storage is the same
+     * anonymous struct a global one gets; the type emitter's NAME for it
+     * (`struct _zer_pool_T_N`) is defined nowhere, and GCC refused the
+     * declaration ("has initializer but incomplete type"). */
+    if (emit_container_storage_type(e, l->type)) {
+        emit(e, "%.*s", (int)l->name_len, l->name);
+        return;
+    }
     /* #19 (VOL-1): a `volatile` scalar/aggregate local carries no volatile in
      * its Type (only slice/pointer do, propagated by the checker), so emit the
      * qualifier here. Skip pointer/slice — their volatile is already in the

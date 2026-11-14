@@ -896,6 +896,22 @@ REWRITTEN it (`alloc(T)` is `T.alloc_ptr()`, `orelse return` is a flag with no f
 node). A recogniser written against the source spelling compiled, ran, and matched
 nothing; one trace line showed it (rule 8 — verify the edit RUNS).
 
+**Compose the oracles; and a baseline row is an unexamined hypothesis (BUG-1671..1674,
+2026-11-14).** Four oracles, one per ordering mechanism, each proved sound — and no
+statement that together they are enough. Writing the ONE machine (`race_free.v`) took an
+afternoon and paid at once, three ways. (1) Its definitions were more precise than the
+code's comments: "u has finished" (`after`) is not "u was joined, so everything below it
+is over" — two accepted races. (2) Every primitive of the machine needs a construct of
+the language mapped onto it, and going down the constructs — what IS a lock here? a
+`@once` block is one, and the walk skipped its body — found a third. (3) The header's
+COVERAGE line ("every construct that touches memory is an access node") sent me to
+`tools/walker_field_baseline.txt`, where `sync_walk:NODE_ONCE:once.body` and
+`…:NODE_ASM:asm_stmt.outputs` had been sitting as justified rows: the gate had FOUND both
+holes and filed them. So: when a walk's result feeds an ACCEPT, every baseline row of it
+is a probe — write the two-thread negative, do not write the justification. And when the
+model's own accepted example is refused by the theorem, believe the theorem first (mine
+had a lock-guarded and a token-guarded write of one location).
+
 **THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
 precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by
 Rice: the true set "memory-safe on every execution" is undecidable, so no sound,

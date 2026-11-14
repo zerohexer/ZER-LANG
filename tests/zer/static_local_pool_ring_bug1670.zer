@@ -1,0 +1,40 @@
+// BUG-1670: a `static` LOCAL Pool / Ring. The checker accepts it ("a Pool / Ring / Slab / Arena must be a
+// global or a static"); the emitter spelled its type by NAME (`struct _zer_pool_N_4`), which is defined
+// nowhere — a global one is an anonymous struct — and GCC refused the program ("has initializer but
+// incomplete type"). One helper now spells the storage for both.
+struct N { u32 v; }
+
+u32 f() {
+    static Pool(N, 4) sx;
+    static Ring(u32, 4) sr;
+    u32 r = 0;
+    ?Handle(N) mh = sx.alloc();
+    if (mh) |h| { h.v = 7; r = h.v; sx.free(h); }
+    sr.push(r);
+    u32 x = sr.pop() orelse 0;
+    return x;
+}
+
+// in a nested block, and the state persists across calls
+u32 g(u32 k) {
+    u32 r = 0;
+    if (k > 0) {
+        static Ring(u32, 4) hist;
+        hist.push(k);
+        if (k == 3) {
+            r += hist.pop() orelse 0;
+            r += hist.pop() orelse 0;
+            r += hist.pop() orelse 0;
+        }
+    }
+    return r;
+}
+
+i32 main() {
+    if (f() != 7) { return 1; }
+    if (f() != 7) { return 2; }
+    if (g(1) != 0) { return 3; }
+    if (g(2) != 0) { return 4; }
+    if (g(3) != 6) { return 5; }
+    return 0;
+}

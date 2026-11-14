@@ -7036,6 +7036,19 @@ an access of whatever the reference may point at:
   and need none.
 - *a `static` local is one object for every thread* that runs its function, exactly like
   a global.
+- *a thread runs inside the thread that started it.* What is beside the starter — the code
+  between its spawn and its join — is beside the thread it starts; and a join ends the
+  thread it joins, not a thread THAT one detached (`spawn f();` with no handle), which may
+  still be running afterwards.
+- *a `@once` body* runs once program-wide, so it never meets itself; against everything
+  else it is ordinary code.
+- *an async task holds its function's locals:* `_zer_async_NAME_poll(&t)` and `_init`
+  write `t`. Two threads may poll one task under one lock; a task on the thread's own
+  stack is its own.
+- *an asm output operand is a write* of the place it names.
+- *an atomic cell is atomic everywhere:* once a thread touches `g` (or a field or element
+  of it) with an `@atomic_*`, a plain read or write of the same global by another thread
+  is a race — by name, through a pointer, or by copying the whole struct.
 <!-- audit: expect-error: reached through a reference the compiler cannot name -->
 ```zer
 u32 flag;

@@ -1,0 +1,23 @@
+// expect-error: no common lock
+// BUG-1663: the body of the spin loop runs while the lock is NOT held (the test just failed); an access there is an unlocked access.
+u32 lk;
+u32 counter;
+void w() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { counter += 1; }
+        @atomic_store(&lk, 0);
+    }
+}
+void w2() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        counter += 1;
+        @atomic_store(&lk, 0);
+    }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

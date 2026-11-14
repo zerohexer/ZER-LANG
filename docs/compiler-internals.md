@@ -8799,6 +8799,41 @@ walk to the THREAD phase for callees, so "phase == THREAD" does not mean "a thre
 this" (use the walk's mode); and a finding downgraded to a warning because "the function
 has an @atomic somewhere" was a hole for every rule that no atomic elsewhere can repair.
 
+**11n. An idiom recogniser is a relaxation: its hypotheses are the probe list (BUG-1663).**
+"Between this acquire and that release the lock is held" was a pattern match on one
+statement list; five families of counterexample (who writes the word, is it one word,
+which value is free, when does a statement run, is the update in one section) fell out of
+writing `lock_region.v`'s hypotheses — half of them only when the FINISHED fix was read
+against that list again. Shape that held: the three walks that must agree on a region
+(census, `sync_walk`, the main checker's `lock_region` counter) share two SHAPE-only
+functions, and the one that must not miss a boundary uses the shape alone, so it is a
+superset by construction instead of by a matching `if`. For anything judged by lexical
+position, list the constructs that run at another time (`defer`, a loop's own condition
+and body) before trusting "inside". The same name-resolution trap twice in one fix: a
+post-pass resolves a NAME in the global scope, so a function-local of that name (a
+`static`, an inner shadow) is answered with the global — pass the function node and ask
+`fn_binds_name`. The flag hand-off (BUG-1664) repeated the whole story the same day: shape
+match → token model (`flag_handoff.v`) → 95 red cells. Two things specific to it: a
+verdict that needs every STORE SITE of a word is taken from the census (context-free, sees
+every body) and checked against what the context walks RECORDED — a site no walk met, or
+met without a hold, voids the flag — and "the walk saw everything" was itself false past
+the depth cap (BUG-1665: a bounded walk feeding an ACCEPT must mark its result incomplete).
+
+**11o. The context walk's access records (BUG-1666..1668).** A record is Named(global) or
+Typed(pointee type); `sync_record_place` makes one per DEREFERENCE STEP of a place (the
+step nearest the leaf carries the write, deeper ones are loads), and `sync_ref_unknown`
+decides whether the reference at that step is known. Three traps. (1) A local's class is
+computed at its declaration over the WHOLE function (`ast_name_writes` for a reference,
+`_parts` for an aggregate): the walk visits statements in source order, and the write
+that re-aims the pointer may sit later in the loop body than the access. (2) Names resolve
+through `sync_ident_global`, never `global_decl_lookup`: a `static` local is program-wide
+storage under a local name (a `self` binding, from the checker's `var_decl.static_sym`
+annotation), and a struct / enum NAME is not memory although it has a symbol. (3) The
+checker has REWRITTEN the tree by the time the walk runs: `alloc(T)` is `T.alloc_ptr()`,
+`free(p)` is `T.free_ptr(p)`, `x orelse return` has no fallback node, only a flag — a
+recogniser written against the source spelling matches nothing (measured: the own-heap
+rule recognised no allocation at all until it read the flags).
+
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key
 built from `&tbl[i]` names a different slot per evaluation and re-broke the valid teardown

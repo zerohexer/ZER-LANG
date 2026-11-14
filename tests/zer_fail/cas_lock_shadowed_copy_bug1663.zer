@@ -1,0 +1,19 @@
+// expect-error: was read outside this critical section
+// BUG-1663: the copy written back is the OUTER `t`, read before the lock was taken; an inner `t` declared inside the region has the same name. A name bound twice in a function is never a fresh copy.
+volatile u32 g;
+u32 lk;
+void w() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        u32 t = g;
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        { u32 t = g; if (t == 7) { return; } }
+        g = t + 1;
+        @atomic_store(&lk, 0);
+    }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

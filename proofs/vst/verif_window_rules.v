@@ -18,7 +18,8 @@
      zer_window_counts_at_spawn   an open window in a latched walk is counted
                                   from the function entry, not at its spawn
 
-   The specs are written against that oracle, not against the C.
+   The specs are written against that oracle, not against the C — and since
+   2026-11-14 they ARE the oracle's definitions (one shared file, see below).
 
    Imports the SAME clightgen output as verif_concurrency_rules.v
    (zer_safety.concurrency_rules); this file proves only the three window
@@ -28,35 +29,17 @@
 Require Import VST.floyd.proofauto.
 Require Import VST.floyd.compat.
 Require Import zer_safety.concurrency_rules.
+From zer_conc Require Import concurrency_decisions.
 
 #[export] Instance CompSpecs : compspecs. make_compspecs prog. Defined.
 Definition Vprog : varspecs. mk_varspecs prog. Defined.
 
-(* ---- Coq specifications (from window_cfg.v) ---- *)
-
-(* closed -> the textual join releases; otherwise the tail-join conditions. *)
-Definition zer_window_join_releases_coq
-    (closed branch_depth in_once after_last_jump : Z) : Z :=
-  if Z.eq_dec closed 0 then
-    (if Z.eq_dec branch_depth 0 then
-      (if Z.eq_dec in_once 0 then
-        (if Z.eq_dec after_last_jump 0 then 0 else 1)
-      else 0)
-    else 0)
-  else 1.
-
-(* return / goto always leave; break / continue only at loop depth 0. *)
-Definition zer_window_stmt_leaves_coq
-    (is_return_or_goto is_loop_jump loop_depth : Z) : Z :=
-  if Z.eq_dec is_return_or_goto 0 then
-    (if Z.eq_dec is_loop_jump 0 then 0
-     else (if Z.eq_dec loop_depth 0 then 1 else 0))
-  else 1.
-
-Definition zer_window_counts_at_spawn_coq (closed latched : Z) : Z :=
-  if Z.eq_dec closed 0 then
-    (if Z.eq_dec latched 0 then 1 else 0)
-  else 1.
+(* ---- Coq specifications: the oracle's own ----
+   zer_window_join_releases_coq, zer_window_stmt_leaves_coq and
+   zer_window_counts_at_spawn_coq are IMPORTED from
+   proofs/operational/lambda_zer_concurrency/concurrency_decisions.v, the file
+   window_cfg.v proves its meaning lemmas about. They used to be written out
+   again here, and nothing kept the two copies equal. *)
 
 (* ---- VST funspecs ---- *)
 

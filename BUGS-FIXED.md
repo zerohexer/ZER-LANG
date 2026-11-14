@@ -589,6 +589,196 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   CRLF are brought back under budget by the Dockerfile's own `find … sed` line. NOT measured:
   a real Windows checkout (the CRLF path was simulated inside the Linux image).
 
+**What an access touches — the unnamed pointer, and three accesses with no record at all (2026-11-14)**
+- **BUG-1666 — an access through a reference the context walk could not NAME was nobody's.**
+  When a thread uses an `@atomic_*` / `@barrier` the spawn scan's "touches a non-shared
+  global" finding is a warning, and the context walk judges each access against the other
+  threads' by comparing RECORDS. A record existed only for an access the walk could
+  attribute to a global by name: a write through a pointer loaded out of memory, returned
+  by a call, planted in a local struct or a local pointer by a callee, or re-aimed later in
+  the loop than the access, was taken for the thread's own stack; two global pointers to
+  one heap object, two Handles for one slot, a struct's pointer field against the global
+  it points at, and a READ through a never-re-aimed global pointer were each keyed by the
+  wrong name and never met. Every baseline accepts all of them; ThreadSanitizer reports a
+  race on each (the eight `tests/zer_gaps/spawn_race_*` reproducers of limitations B.11).
+  Fix — the oracle first (`access_alias.v`): memory is typed objects, an access a path in
+  one, and a record is either "inside global g" or "inside some object of type t". Two
+  overlapping accesses with sound records have records that MAY ALIAS (`overlap_may_alias`:
+  same global; the global's type holds the type; either type holds the other), so a
+  judgement over every may-aliasing pair misses none. In `checker.c` (the block "WHAT AN
+  ACCESS TOUCHES"): every dereference step whose reference is not KNOWN to point only into
+  recorded globals or the thread's own stack gets a typed record of the pointee
+  (`sync_record_place`); a Handle dereference names its allocator; an `@atomic_*` through
+  such a reference gets an ATOMIC typed record (no race against another atomic, one
+  against a plain access). KNOWN is the relaxation and is granted narrowly: `&place` on a
+  global or an own local, a never-mutated global reference (its initializer), and a local
+  bound once, never address-taken, whose every assigned value — declaration AND every write
+  anywhere in the function, flow-insensitively (`ast_name_writes` / `_parts`) — is itself
+  known (`local_value_listed` is why those three hypotheses, `foreign_write_escapes` why
+  not fewer). A read through a known global reference is recorded at its target, as a
+  write already was. THE OWN-HEAP RULE (`fresh_stays_own`, `published_is_shared`): a
+  fresh `alloc` is as private as the stack while its reference never LEAVES the name —
+  every occurrence is the base of a field / element access or the argument of `free`
+  (`sync_name_leaves`, a complete no-`default` walk; a copy, a call argument, a return, a
+  store, `&name.f`, a sub-slice, `.ptr`, an array field read as a value all answer
+  "leaves"). A struct / union / enum NAME (and the builtin `Arena`) is no longer recorded
+  as a read of a "global" — `@size(T)` met every typed record of a `T`. Four decisions
+  extracted to `src/safety/concurrency_rules.c` and VST-verified
+  (`verif_alias_rules.v`). The diagnostic names the global, or "memory of type 'T' reached
+  through a reference the compiler cannot name". Tests: positive
+  `spawn_pointer_reach_ok_bug1666` (own stack, own heap, a locked list; exact results,
+  TSan-clean), twelve negatives `spawn_race_*_bug1666` (eight were the gap files), the
+  conc-matrix "pointer reach" grid (how the reference was obtained x who else touches the
+  object x the lock, plus a second binding of a known name) and "own heap" grid (how the
+  reference leaves) — 60 of their cells compile clean on the previous compiler. Corpus
+  (4,000 files): no verdict change but the eight gap files.
+- **BUG-1667 — a builtin container method was a READ of its container.** `pool.alloc()`,
+  `slab.free(h)`, `ring.push(x)`, `arena.alloc(T)`, `Task.alloc()` and the universal
+  `alloc(T)` / `free(p)` rewrite the container's bookkeeping; the walk recorded only the
+  read of the receiver's name that walking the callee makes, so two threads allocating
+  from one Pool met as two readers. Accepted by every baseline whenever the thread uses an
+  `@atomic` (without one the spawn scan refuses the mention outright); TSan reports the
+  race for each container, and the slab variants TRAP on their corrupted bookkeeping.
+  Found while writing BUG-1666's own-heap positive: its `alloc(Node)` in two threads was
+  accepted and should not have been. Fix: `sync_method_receiver` — every such method
+  WRITES its receiver, `get` reads it; a struct TYPE as receiver means that type's
+  auto-slab, the same Symbol a Handle dereference names (they did not meet before: the
+  call was keyed by the type's symbol). The diagnostic says "the allocator behind alloc /
+  free of 'T'". Tests: positive `spawn_container_methods_locked_ok_bug1667`, four
+  negatives `spawn_race_{pool_alloc,universal_alloc,ring_push_pop,arena_alloc}_unlocked_bug1667`,
+  the "container methods" grid (8 containers x the lock, plus an allocator call against a
+  Handle use; nine false negatives on the previous compiler).
+- **BUG-1668 — a `static` local was the walking thread's own.** It is one object for every
+  thread that runs its function. The spawn scan knows (BUG-971); the context walk bound it
+  like any local and recorded nothing, so `static u32 cnt; cnt += 1;` in two threads that
+  use an `@atomic` compiled (TSan: race) — by name, through a field, an element, a pointer,
+  a slice, a callee handed its address, a static Pool, and mixed atomic / plain use. Fix:
+  the checker annotates the declaration with its Symbol (`var_decl.static_sym`); the walk
+  binds the name as `self` (the name IS the object) and `sync_ident_global` — THE query
+  "is this name program-wide storage?" — answers for it; reads, writes, views, addresses
+  and method receivers go through it. A static-local reference is always unknown. An
+  atomic access of a static cell is recorded as atomic (the atomic-cell rule is keyed by
+  global and never saw it), so it meets a plain access and not another atomic. Tests:
+  three negatives `spawn_race_static_local_*_bug1668`, the "static locals" grid (7 shapes
+  x the lock, atomic-in-both, atomic-vs-plain; seven false negatives on the previous
+  compiler — the static-Pool cell's old verdict was GCC's, see limitations), positives in
+  `spawn_container_methods_locked_ok_bug1667`.
+- **BUG-1669 — an array argument had no root in the lent-argument rule.** `both(arr, arr)`
+  where `both([*]u32 a, [*]u32 b)` lends `a` to a scoped spawn and writes through `b`
+  before the join compiled, with or without an `@atomic` (TSan: race); `both(&x, &x)` was
+  refused. `alias_call_record` (BUG-1303 / 1645 / 1654) asked the ARGUMENT's type — an
+  array, "not a reference" — instead of what the parameter receives: an array handed to a
+  slice parameter is a view of it. Also through a forwarder, an array field, `arr` beside
+  `arr[0..2]`, and a global array lent while touched by name. Fix: an array argument whose
+  parameter is not an array is rooted like `&place` (`alias_place_root`, the tail of
+  `alias_arg_root` extracted); an array PARAMETER takes a copy and stays out. Found while
+  probing whether BUG-1666's "a callee handed the thread's own stack" was sound. Tests:
+  positive `spawn_lend_distinct_arrays_ok_bug1669` (exact results), three negatives
+  `spawn_{param_alias_array_coerced,param_alias_array_forwarded,lent_global_array_by_name}_bug1669`,
+  nine cells added to the "one object as two arguments" table.
+
+**The flag hand-off, modelled; and a walk that stopped in silence (2026-11-14)**
+- **BUG-1664 — the flag hand-off was matched by SHAPE.** `data = v; @atomic_store(&ready,
+  1);` against a reader that "waited on `ready`" ordered the two accesses whenever some
+  later statement stored a flag and some earlier loop read one (`SyncCtx.pub` / `.acq`,
+  BUG-1562 / 1563 / 1565). Nothing related the value waited for to the value stored, or
+  either to the flag's initial value, and nothing said the publication runs once. Accepted
+  and racing under ThreadSanitizer: a writer that publishes again in a loop, through a
+  callee called twice, or by `goto`; a wait with the wrong polarity (`!= 0` leaves at
+  once); a loop that reads the flag and leaves for another reason, or has a `break`, or a
+  second conjunct; a `defer` body that writes after the store; a store before any thread
+  exists; a `threadlocal` flag; a non-literal store; a function that stores the flag run
+  by a thread AND by main where nothing is watching. 95 negative cells of the new grid
+  compile clean on the previous compiler.
+  Fix — the oracle first (`flag_handoff.v`): the flag is a TOKEN. A thread HOLDS value V
+  from an atomic load that returned V until its own next store; if every store is made by
+  a thread that holds, and a value that is stored FROM has one owner, every holder holds
+  the CURRENT value — so two accesses under two DIFFERENT held values never run together
+  (`holders_agree`, `claims_exclusive`; one counterexample trace per hypothesis). The
+  checker tags each access with the value its thread holds — EXPLICIT (dominated by an
+  observation `load == V`, no store of the flag by that thread since: a statement or loop
+  that may store it, directly or through a call, ends the hold — `flag_scan`) or IMPLICIT
+  (it precedes the thread's first store, made once: entry function, no loop, no label,
+  `zer_flag_store_from`) — and judges the flag program-wide (`handoff_flag_ok`): one shared
+  word touched only by loads and stores of a literal; every store SITE met by a thread walk,
+  under a tag, in every context, and unable to run where no walk looks; one unwaited site
+  at most; each value stored from, stored from by one thread started once. A claim of a
+  value another thread stores from is simply not a hold (`flag_claim_granted`). The old
+  `acq` / `pub` / `sync_flag_forged` are gone. Four decisions extracted and VST-verified
+  (`verif_handoff_rules.v`). Newly ACCEPTED, each inside the model and TSan-clean: the
+  spawner publishing to two readers, a three-stage relay, the `else` branch, `!= V` waits,
+  a flag that starts at 1. Tests: positive `flag_handoff_shapes_ok_bug1664` (exact results),
+  nineteen negatives `flag_handoff_*_bug1664` (four were the recorded gap files), the
+  conc-matrix "hand-off" grid (who publishes x how x how the other side waits, 204 cells).
+  Corpus: no verdict change but the four gap files.
+- **BUG-1665 — the context walk stopped at its depth cap in silence.** An unlocked access
+  some eighty calls below a thread's entry was accepted: the spawn scan's own "call chain
+  too deep" finding is downgraded to a warning when the thread uses an `@atomic`, and the
+  walk that should then judge the access returned without recording it. Every baseline
+  accepts it. Fix: the cap (and every allocation failure of the walk) marks the access
+  set `lost`; a lost set of a downgraded spawn is an error. Found by asking, for
+  BUG-1664's "a thread-only function is walked whole", whether that is true. Tests:
+  `spawn_race_behind_deep_chain_bug1665`, three grid cells.
+
+**Found by writing the model the lock relaxations never had (2026-11-14)**
+- **BUG-1663 — "the code between a spin acquire and its release holds the lock" was read
+  off one statement list.** It is a claim about the whole program, and its operational
+  preconditions were never written down. Writing them as the hypotheses of an oracle
+  (`lock_region.v`), and then reviewing the fix against the same list, found accepted
+  programs that lose updates on EVERY run (6 of 6, measured; ThreadSanitizer-confirmed) —
+  29 cells of the new grid compile clean on the previous compiler:
+  - *Who may write the lock word.* A release nested in an `if` inside the region, in a
+    callee, through a pointer (`rel(&lk)`), by another thread, a second release after a
+    `defer`red one, a `goto` to a label inside the region.
+  - *Whether it is ONE word.* Two threads spinning on two FIELDS of one struct (both
+    resolve to the same global); a `threadlocal` lock word (one per thread); a `static`
+    local shadowing the global lock (the resolver answers with the global of that name).
+  - *Which value means "free".* `!@atomic_cas(&L, 0, 1)` in one thread and
+    `!@atomic_cas(&L, 1, 2)` in another both "acquired L".
+  - *When a statement runs.* A `defer` body registered in the region's own block fires at
+    the block's exit — after a direct release, and after a release deferred later than it;
+    the spin loop's own body runs while the lock is NOT held, and was not walked at all.
+  - *Whether an update's read and write-back are in the same critical section.* The lock
+    was looked up at the write-back alone: `LOCK; u32 t = g; UNLOCK; LOCK; g = t + 1;
+    UNLOCK;` passed in the spawner and in a thread, as did a copy kept in a global, carried
+    over from an earlier iteration, or hidden behind an inner local of the same name.
+  History: the plain-global forms predate this session (the recogniser dates from
+  BUG-1562 / 1565 / 1644); the volatile-flag forms in the SPAWNER were opened by this
+  session's own BUG-1656 relaxation, which made that rule rely on the same recogniser.
+  Fix. (1) ONE definition of a lock word (`sync_lock_word`: a whole global, not
+  threadlocal, not a name the function binds), and the atomic-cell resolver every
+  recogniser uses is shadow-aware (`sync_intrinsic_lock(…, fn)` — the flag hand-off
+  accepted the shadowed lock as a "wait"). (2) The census — the one walk over every body
+  of the program — pairs each spin acquire with the one release that closes its region
+  and records every other atomic write of the word, every `&L`, every label inside a
+  region, every acquire that tests a different free value; such a word is a lock NOWHERE
+  (`lock_word_broken`), and a warning at the acquire says why. (3) The context walk
+  judges the spin body and a too-early `defer` body without the lock. (4) A
+  read-modify-write fact carries `cont`: one statement, or only local copies read by the
+  copy's own declaration with no statement that could begin or end a critical section
+  between it and the write-back (`Checker.lock_region`, a counter that steps at a
+  shape-only superset of the recognisers and never steps back), the name being bound
+  once in the function. A held lock covers only a `cont` fact. Ten decisions are
+  extracted to `src/safety/concurrency_rules.c` and VST-verified (`verif_lock_rules.v`)
+  against the oracle's own definitions. Kept: a `defer`red release, a `defer` body
+  registered after it, an update split inside one section or inside a callee, a lock whose
+  free value is not 0, a statement in the spin body that does not touch the guarded data,
+  a plain `lk = 0;` before the first spawn. Tests: positive
+  `cas_lock_regions_ok_bug1663` (exact counts, TSan clean), sixteen negatives
+  `cas_lock_*_bug1663` (each ACCEPTED before), the conc-matrix "lock-region" grid (data
+  kind x region shape, 45 cells; 29 false negatives on the previous compiler). Corpus: no
+  verdict change (one during development — a plain `lock = 0;` initialisation — removed
+  by not counting plain stores: the atomic-cell rule already refuses them in a concurrent
+  context).
+- **BUG-1663 (found beside it) — an inner declaration of the same name cleared the outer
+  copy's taint.** `u32 t = g; { u32 t = 5; … } g = t + 1;` compiled in a thread: the
+  split-update tables are keyed by NAME and a declaration rebinds (clears) the name.
+  Predates the lock rules; ThreadSanitizer-confirmed. Fix: a name the function binds more
+  than once only accumulates (`checker_name_bound_once`); the same test decides whether a
+  copy may be fresh. Test `volatile_rmw_shadowed_copy_bug1663`.
+  (The flag HAND-OFF idiom, found by the same probing, was recorded as open in that
+  commit and closed in the next — BUG-1664, above.)
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

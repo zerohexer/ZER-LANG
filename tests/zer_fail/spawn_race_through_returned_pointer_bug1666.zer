@@ -1,0 +1,15 @@
+// expect-error: reached through a reference the compiler cannot name
+// BUG-1666 (was docs/limitations.md B.11): `*getp() += 1` and `*u32 q = getp(); *q += 1;` both write the global `g`, and the context
+// walk attributed neither to it.
+// ThreadSanitizer reported a data race on the pre-fix compiler, which accepted this.
+u32 flagx;
+u32 g;
+*u32 getp() { return &g; }
+void w() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { *getp() += 1; } }
+void w2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { *u32 q = getp(); *q += 1; } }
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

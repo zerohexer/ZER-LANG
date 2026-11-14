@@ -1,0 +1,15 @@
+// expect-error: two stores are made without a wait
+// BUG-1664: the spawner publishes in two windows, each time without waiting: the flag still holds 1 from the first round when the second reader starts.
+u32 ready;
+u32 data;
+u32 sink;
+void reader() { while (@atomic_load(&ready) == 0) { } sink = data; }
+u32 main() {
+    ThreadHandle a = spawn reader();
+    data = 1; @atomic_store(&ready, 1);
+    a.join();
+    ThreadHandle b = spawn reader();
+    data = 2; @atomic_store(&ready, 1);
+    b.join();
+    return 0;
+}

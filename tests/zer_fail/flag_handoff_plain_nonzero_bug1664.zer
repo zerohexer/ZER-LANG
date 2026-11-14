@@ -1,0 +1,14 @@
+// expect-error: a plain statement stores a value other than its initial one
+// BUG-1664: `ready = 1;` before the spawns moves the flag off its initial value: the reader leaves its wait at once.
+u32 ready;
+u32 data;
+u32 sink;
+void writer() { data = 1; @atomic_store(&ready, 1); }
+void reader() { while (@atomic_load(&ready) == 0) { } sink = data; }
+u32 main() {
+    ready = 1;
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

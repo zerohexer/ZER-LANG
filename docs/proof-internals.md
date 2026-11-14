@@ -239,6 +239,37 @@ cat zer-vst-images.part-* | zstd -d | docker load
 Rebuild and re-upload it when a Dockerfile under `proofs/` changes; the release notes say
 which versions are inside.
 
+**In a cloud session** (measured 2026-11-14: Docker Hub reachable, `opam.ocaml.org` and
+GitHub source tarballs denied, so the images cannot be BUILT there): fetch the two release
+assets with `curl -L` from `…/releases/download/vst-images/`, check the sum, start a
+daemon with SHORT runtime paths — `dockerd --data-root <scratch>/root --exec-root /run/zd/x
+-H unix:///run/zd/d.sock --storage-driver=overlay2 --iptables=false --bridge=none` (a long
+`--exec-root` fails on the 108-byte unix-socket limit) — and `zstd -dc … | docker load`.
+The images run as uid 1000 and `make check-vst` bind-mounts the tree read-write, so run the
+gates on a COPY of the tree owned by 1000 (`git ls-files -co --exclude-standard | tar …`,
+`chown -R 1000:1000`), which also keeps generated `.v` / `.vo` out of the checkout.
+
+**One source for a decision's Coq definition.** The `_coq` definition of an extracted
+predicate lives in the oracle directory, in a plain-Coq file both sides import
+(`lambda_zer_concurrency/concurrency_decisions.v`: the oracle proves what it MEANS, the
+`verif_*.v` file proves the C equals it; `make check-vst` compiles it with
+`-Q ../operational/lambda_zer_concurrency zer_conc`). Do not write a definition out in a
+`verif_*.v` file — two copies drift with both gates green.
+
+**The concurrency oracles (2026-11-14).** `lambda_zer_concurrency/` holds four plain-Coq
+models, each with its meaning lemmas over `concurrency_decisions.v` and a VST file:
+`window_cfg.v` (the scoped-spawn window; `verif_window_rules.v`), `lock_region.v` (the spin
+lock: mutual exclusion + exactness of an update; `verif_lock_rules.v`), `flag_handoff.v`
+(the flag as a token: holders agree on the current value; `verif_handoff_rules.v`),
+`access_alias.v` (what an access touches: typed objects and paths, records that may-alias
+whenever the accesses overlap; a local holds one of its listed values; a fresh object
+never published is its thread's alone; `verif_alias_rules.v`). Each states, in its header,
+the hypotheses the compiler must establish and which syntactic check establishes each —
+that list is the probe list (playbook, "The oracle's hypothesis list"). `access_alias.v`
+is the first of them that is not a trace model of ONE protocol: it certifies the
+COMPARISON of two records, and says nothing about whether an access got a record at all —
+BUG-1667 and BUG-1668 were accesses with none, and no theorem there could have failed.
+
 **File structure per function verified:**
 ```
 proofs/vst/

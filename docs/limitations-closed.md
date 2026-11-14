@@ -8184,3 +8184,122 @@ axioms VST and the Coq standard library already rest on (`Classical_Prop.classic
 **What it left open** is its own entry in B2, tagged `[residual of: …]`: the `_coq`
 definitions are written twice (oracle file and VST file) and nothing keeps the two copies
 equal.
+
+---
+
+## CLOSED 2026-11-14 (with BUG-1663) — the window decisions' `_coq` definitions existed twice
+
+Closed by moving the definitions into ONE file,
+`proofs/operational/lambda_zer_concurrency/concurrency_decisions.v` (plain Coq), imported by
+`window_cfg.v` / `lock_region.v` (the meaning lemmas) and by `proofs/vst/verif_window_rules.v`
+/ `verif_lock_rules.v` (the C equals them); `make check-vst` compiles the shared file under
+the same logical path. The entry as it stood in `docs/limitations.md` B2:
+
+- [residual of: `verif_window_rules.v` written but not machine-checked — closed 2026-11-14]
+  **The `_coq` definitions exist TWICE** — in `window_cfg.v`, where the meaning lemmas
+  (`join_releases_meaning`, `stmt_leaves_meaning`, `counts_at_spawn_meaning`) are proved,
+  and again in `verif_window_rules.v`, where VST proves the C equal to them. The two copies
+  are byte-identical today (diffed 2026-11-14) and NOTHING checks that they stay so:
+  the two files are built by different targets in different images. An edit to one copy
+  alone leaves both gates green while "the C satisfies the proven rule" stops being what
+  was proved. Fix sketch: `Require` the oracle file from the VST file (stdpp is in the
+  `zer-vst` image; qualify the names, `window_cfg.v` exports `step` / `init` / `exec`),
+  compile it in `make check-vst`, and delete the copies.
+
+---
+
+## CLOSED 2026-11-14 by BUG-1664 — the flag HAND-OFF idiom had no model
+
+Closed by modelling it (`flag_handoff.v`: the flag is a token; an access is made under the
+value its thread holds) and replacing the shape match with value-tagged accesses and a
+program-wide validity check of the flag. The four reproducers moved from `tests/zer_gaps/`
+to `tests/zer_fail/flag_handoff_*_bug1664.zer`. What it left open is `docs/limitations.md`
+B.9. The entry as it stood (it was opened and closed on the same day):
+
+9. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; predates this
+   session): the flag HAND-OFF idiom has no model, and trusts more than it checks.**
+   `data = v; @atomic_store(&ready, 1);` is accepted as "published through `ready`" and a
+   reader that "waited on `ready`" as ordered after it (`SyncCtx.pub` / `.acq`,
+   `sync_ordered`). Neither half is checked to be what it is taken for:
+   - *the publication may run again.* A writer that does it in a loop, or through a callee
+     called twice, writes `data` while the reader reads it
+     (`tests/zer_gaps/publish_flag_republished_in_loop.zer`, `…_by_callee.zer`);
+   - *the "wait" may not wait.* ANY loop that reads the flag atomically counts: one that
+     spins while the flag is NON-zero and so exits at once
+     (`…/publish_flag_wait_wrong_polarity.zer`), or one that reads it in its body and
+     leaves for another reason (`…/publish_flag_loop_is_not_a_wait.zer`). Nothing relates
+     the value waited for to the value published, or either to the flag's initial value.
+   What IS checked: a write after the store in the same statement list, and a flag another
+   instance sets without having waited on it (`sync_flag_forged`). The single publication
+   with a `== 0` wait is TSan-clean. Not fixed with BUG-1663: "no loop" is the wrong rule —
+   a ping-pong hand-off (each side waits for its own value, then stores the other's) is
+   correct and loops. The idiom needs its own oracle, ownership of the data by the flag's
+   VALUE, exactly as the spin lock got one; its hypotheses will be the probe list. Until
+   then guard such data with a spin lock or a `shared struct`. Reproducers are executed
+   with the expectation inverted (compile-clean IS the gap).
+
+## CLOSED 2026-11-14 by BUG-1663 / BUG-1664 — "what the atomic/barrier downgrade check still trusts"
+
+The lock half was closed by BUG-1663 (the lock discipline), the hand-off half — "it does
+not compare VALUES" — by BUG-1664. The part about pointer bindings and C callers stays
+open as its own entry in `docs/limitations.md`. The entry as it stood:
+
+1. **What the atomic/barrier downgrade check (BUG-1562/1563/1565) still trusts.** The
+   orderings it RECOGNISES are spelled in one statement list: a lock is a spin `while` on
+   `@atomic_cas` / `@atomic_xchg` up to its release; a hand-off is a write followed by a
+   non-load atomic on the flag, and a read after a loop / `if` reading the flag atomically.
+   It does not compare VALUES: a store to the flag after the storer's own wait on it is a
+   relay (allowed), and the publisher's own store BEFORE its write is not distinguished
+   from its publish. Bindings of pointers to globals follow `&g`, a slice, a struct
+   literal, a pointer name's declaration and reassignments, and parameters — not a pointer
+   read back out of memory (`*pp`, a pointer field of a global loaded at run time). A
+   C caller is still invisible beyond "may run more than once".
+
+## CLOSED 2026-11-14 by BUG-1666 — an access through a pointer the context walk cannot name (section B item 11)
+
+Closed model-first (`access_alias.v`): an access through a reference that is not KNOWN to
+point only into recorded globals or the thread's own stack is recorded as "some object of
+the pointee type", and records are compared by may-alias. Built as designed below, except
+(iv): unknown does not make the set incomplete — it gets a typed record, which is the
+"payable over-rejection" the entry named, paid at once. The eight reproducers moved to
+`tests/zer_fail/spawn_race_*_bug1666.zer`. What the fix left open is the residual entry in
+`docs/limitations.md` section B item 11. The entry as it stood:
+
+11. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; every baseline
+   accepts it): an access through a pointer the context walk cannot NAME.** When a thread
+   uses any `@atomic_*` / `@barrier`, the spawn scan's "touches a non-shared global"
+   finding is a warning and the context walk judges each access against the other
+   threads'. The walk has three answers for where a reference points — KNOWN globals
+   (recorded), the thread's OWN STACK (private), and UNKNOWN — and treats unknown as
+   private. Eight measured shapes, one executed reproducer each in `tests/zer_gaps/`
+   (`spawn_race_*`; two threads, two warnings, a data race):
+   - *unknown, taken for private:* a pointer loaded out of memory and bound to a new name
+     (`…through_loaded_pointer`), returned by a call (`…through_returned_pointer`),
+     planted in a local struct by a callee (`…local_struct_filled_by_callee`) or in a
+     local pointer through a pointer to it (`…pointer_to_local_pointer`), or assigned
+     LATER in the loop than the access (`…pointer_reassigned_in_loop` — bindings are read
+     in source order);
+   - *known, keyed by the wrong name:* two global pointers to one heap object
+     (`…two_pointers_one_object`), two Handles for one pool slot
+     (`…two_handles_one_slot` — a Handle dereference is not recorded as an access to its
+     Pool), a global struct's pointer field against the global it points at
+     (`…global_struct_pointer_vs_name`).
+   (A never-reassigned global pointer used by name, `**gpp`, a view slice, two threads
+   through the SAME global struct or Handle ARE caught: measured.)
+   **Design of the fix, measured but not built.** (i) A local's class must be
+   flow-INSENSITIVE: its declaration plus every write of the name or of part of it
+   anywhere in the function, and its address being taken — `ast_name_writes_parts` is that
+   walk; a name bound more than once is unknown. (ii) A dereference through a GLOBAL must
+   record what the global may hold (the enumerating resolver `for_each_write_target_ex`,
+   not the single-answer `resolve_write_target_global` the walk uses), and that resolver
+   needs a "could not follow" answer. (iii) A Handle dereference records its allocator
+   (`field.handle_alloc`). (iv) What remains unknown makes the access set INCOMPLETE, as
+   the depth cap does (BUG-1665): an incomplete set of such a thread is an error. A
+   scratch build of (iii) + (iv) with a source-ordered (i) rejects five of the eight shapes
+   and changes NO other verdict in the corpus (4,000 files) — the cost of being strict is
+   small, and threads that use no `@atomic` are already held to "touch no non-shared
+   global at all". The payable over-rejection afterwards: an access through an unknown
+   pointer under a lock every writer holds (key such accesses by pointee TYPE instead of
+   refusing them), and a thread's own never-published heap object. Until it is built:
+   reach shared data by name or by index, not through a pointer fetched at run time, or
+   keep it in a `shared struct`.

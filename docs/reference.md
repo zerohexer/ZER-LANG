@@ -6942,6 +6942,29 @@ u32 main() {
 - A scoped-spawn argument that is an address INTO a pool slot (`&pool.get(h).v`)
   lends `h` exactly as `&h.v` does: freeing or using `h` before `.join()` is refused
 
+**What counts as a spin lock (BUG-1663).** The statements between
+`while (!@atomic_cas(&L, 0, 1)) { }` and `@atomic_store(&L, 0);` in ONE statement list
+are a critical section only if `L` really is a lock, program-wide:
+- `L` is ONE word every thread shares: a whole global scalar — not a struct field or an
+  array element, not `threadlocal`, and not a name the function also declares locally;
+- every acquire of `L` tests the same "free" value (`0` above; `@atomic_cas(&L, 1, 0)`
+  everywhere is as good);
+- every atomic write of `L` anywhere is either an acquire test or the ONE release that
+  closes that acquire's region — a direct statement of the same block, or
+  `defer @atomic_store(&L, 0);` there (released at the block's exit). A release nested
+  in an `if`, in a callee, in another thread, or a second release, means `L` is not a
+  lock anywhere, and the compiler says so at the acquire;
+- `&L` is not taken anywhere else, and no label sits inside the region.
+Two things written inside a region do not run inside it: the body of the spin loop (the
+test has just failed) and a `defer` body registered before the release was deferred
+(defers fire last-in first-out at the block's exit). Write `LOCK; defer UNLOCK;` first.
+A plain `L = 0;` before the first `spawn` is fine. Under such a lock, an update of a
+`volatile` flag is exact when it is ONE statement (`g += 1;`, `g = g + 1;`) or goes
+through a local that is DECLARED inside the critical section with the read as its
+initializer (`u32 t = g; ... g = t + 1;`), under a name the function uses once. A read
+in one critical section and a write-back in the next is refused: another thread's store
+lands between them.
+
 Two writers under ONE lock, and a flag hand-off — warnings, not errors (BUG-1562/1563):
 ```zer
 u32 lock;
@@ -6967,6 +6990,76 @@ u32 main() {
     return got - 42;
 }
 ```
+
+**What counts as a flag hand-off (BUG-1664).** The flag is a TOKEN: its value says which
+thread may touch the data. A thread HOLDS a value from the moment it has seen the flag
+hold it until its own next store of the flag, and two plain accesses are ordered when they
+are made under two DIFFERENT held values of one flag.
+- *Taking a turn:* `while (@atomic_load(&F) != V) { }` (afterwards the thread holds `V`), or
+  the branch of `if (@atomic_load(&F) == V) { … } else { … }` that proves a value. For a
+  flag with exactly two values, `while (@atomic_load(&F) == 0) { }` proves the other one.
+  The loop must have no `break` and the comparison must be the whole condition.
+- *Ending it:* `@atomic_store(&F, W);` — after it the thread holds nothing: touching the
+  data again needs a new wait. A loop or a call that may store the flag ends the hold too.
+- *Starting:* the one thread that holds the flag's INITIAL value may skip the wait — up to
+  its first store, which must run once: in the thread's entry function (or in the spawning
+  function, between the spawn and the join), outside every loop, in a function with no label.
+- *The flag:* one global word every thread shares; only `@atomic_load` and `@atomic_store`
+  of a literal touch it; its address is not taken; a plain `F = <initial value>;` is allowed
+  where no thread runs. Each value that is stored FROM is handed on by one thread, started
+  once.
+A reader that waits for the value the flag STARTS with (`while (@atomic_load(&ready) != 0)
+{ }`) has seen nothing; a writer that publishes in a loop writes the data while the reader
+reads it — both are compile errors, and a warning at the store says which rule broke. A
+ping-pong (each side waits for its own value and stores the other's) may loop for ever.
+
+**What a thread touches when it goes through a reference (BUG-1666..1668).** In a thread
+that uses an `@atomic_*` / `@barrier`, every plain access is judged against the other
+threads' — two accesses of one object, one of them a write, need a common lock or a
+hand-off. An access by name is an access of that global. An access through a reference is
+an access of whatever the reference may point at:
+- *known:* `&g`, a view of `g`, a local bound to one and never re-aimed elsewhere — the
+  global itself; `&x` of the thread's own local — nothing another thread can reach;
+- *unknown:* a pointer returned by a call, loaded out of a struct or another pointer,
+  captured by `|v|`, or held in a local that anything else writes (a later assignment, a
+  callee through `&p`) — "some object of the pointee type". It meets every unordered
+  access through another unknown reference to that type, and every unordered access of a
+  global that contains one.
+- *a fresh allocation is the thread's own* — `[*]u32 buf = alloc(u32, n) orelse return;`,
+  `*T n = alloc(T) orelse return;` — for as long as the reference stays in that one name:
+  `buf[i]`, `n.field`, `buf.len` and `free(buf)` are all the name may be used for. Copy
+  it, pass it to a function, return it, take `&buf[i]` or a sub-slice, and it is unknown.
+- *a container method runs inside the container:* `pool.alloc()`, `slab.free(h)`,
+  `ring.push(x)`, `arena.alloc(T)`, `T.alloc()`, and `alloc(T)` / `free(p)` (the
+  allocator behind a struct type takes no lock) are writes of it; `get` is a read. Two
+  threads may call them under one lock. `alloc(T, n)` and `free(slice)` are the C heap's,
+  and need none.
+- *a `static` local is one object for every thread* that runs its function, exactly like
+  a global.
+<!-- audit: expect-error: reached through a reference the compiler cannot name -->
+```zer
+u32 flag;
+u32 total;
+*u32 current() { return &total; }
+void worker() {
+    @atomic_store(&flag, 1);
+    for (u32 i = 0; i < 100; i += 1) {
+        *u32 p = current();
+        *p += 1;          // some u32 — the other worker's `*p` may be the same one
+    }
+}
+u32 main() {
+    ThreadHandle a = spawn worker();
+    ThreadHandle b = spawn worker();
+    a.join(); b.join();
+    return 0;
+}
+```
+Take one lock around the access (`while (!@atomic_cas(&lk, 0, 1)) { }` … `@atomic_store(&lk,
+0);`), or reach the data by name. A function that lends one slice parameter to a scoped
+spawn and uses another before the join must be given two objects: an array handed to a
+slice parameter is a view of it, so `both(arr, arr)` is refused like `both(&x, &x)`
+(BUG-1669).
 
 ### Condvar — Thread Synchronization
 ```zer

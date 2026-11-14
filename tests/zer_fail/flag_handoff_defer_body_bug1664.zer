@@ -1,0 +1,13 @@
+// expect-error: no release/acquire flag ordering them
+// BUG-1664: a `defer` body runs at the block exit — after the store: its write of the data is made by a thread that no longer holds.
+u32 ready;
+u32 data;
+u32 sink;
+void writer() { defer { data = 2; } data = 1; @atomic_store(&ready, 1); }
+void reader() { while (@atomic_load(&ready) == 0) { } sink = data; }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

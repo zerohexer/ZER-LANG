@@ -1,0 +1,13 @@
+// expect-error: does not hold the flag
+// BUG-1664: the publication sits in a callee that is called twice: the same store, made twice without a wait in between. (Was a recorded gap; ThreadSanitizer: data race.)
+u32 data;
+u32 ready;
+u32 sink;
+void again() { data = 7; @atomic_store(&ready, 1); }
+void writer() { data = 41; @atomic_store(&ready, 1); for (u32 i = 0; i < 100000; i += 1) { again(); } }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    for (u32 i = 0; i < 100000; i += 1) { if (@atomic_load(&ready) == 1) { sink = data; } }
+    a.join();
+    return 0;
+}

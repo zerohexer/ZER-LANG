@@ -116,6 +116,16 @@ Each item was run on the build that carries BUG-1658..1661. None is accept-unsaf
    `docs/limitations-closed.md`, "[ARCHIVED 2026-11-14] OPEN — BRANCH
    `loving-davinci-ii7a90`", sections L and M.
 
+## OPEN — a `static` LOCAL Pool or Ring emits C that GCC refuses (2026-11-14, LOW — loud, valid program refused)
+
+`u32 f() { static Pool(N, 4) sp; … }` passes the checker ("Pool / Ring / Slab / Arena must
+be global or static") and GCC then reports `variable 'sp' has initializer but incomplete
+type`: the struct for a Pool / Ring stamp is emitted from the GLOBAL declarations, and a
+static local's stamp has no definition before the function. A static-local Slab or Arena
+builds. Measured while writing the BUG-1668 grid (whose static-Pool cells are therefore
+checker-only). Fix sketch: collect the stamps of static locals in the same pre-pass that
+collects the globals'. Until then declare the Pool / Ring at file scope.
+
 ## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1643; measured, reproducers in `tests/zer_gaps/`)
 
 Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
@@ -192,7 +202,9 @@ each a missing SUMMARY fact, not a missing key:
 4. [residual of: A helper lends its pointer param and touches the same global by NAME — closed by BUG-1645, BUG-1646]
    **Residual (precision, loud):** the pair is keyed on the
    ROOT object, so two arguments naming DISJOINT fields of one struct (`sp(&t.x, &t.y)`) are
-   refused as "both reach 't'"; a field-path disjointness test would recover it.
+   refused as "both reach 't'"; a field-path disjointness test would recover it. (An array
+   handed to a slice parameter is rooted the same way since BUG-1669: two array FIELDS of
+   one struct are "both reach" it.)
 
 7. [residual of: ISR split read-modify-write through MEMORY — closed by BUG-1650]
    **Residuals:** (a) the global carrier relation is flow-INSENSITIVE, so `mem = g; mem = 0;
@@ -211,7 +223,91 @@ each a missing SUMMARY fact, not a missing key:
    **Residual (precision, loud):** that late check does not apply the `@once`
    single-owner exemption — declare the spawn target above its spawn site.
 
-**B2. Proof status of the data-race class (2026-11-13 — read before claiming "proven").**
+9. [residual of: the flag HAND-OFF idiom has no model — closed by BUG-1664]
+   **Residuals (over-rejections, loud — a warning at the store or the generic "no flag
+   ordering them" error):** a wait made in a CALLEE (`wait_ready(); use(data);` — the
+   hold is the callee's; write the wait where the access is); a first, unwaited store in
+   a callee, a loop, a function with a label, or a function that runs more than once; a
+   store by the MAIN thread anywhere but in the spawning function, between the spawn and
+   the join, outside every loop (so main cannot be a looping ping-pong player — give both
+   sides a thread); a flag with three or more values under an `== V` wait or a `!= V`
+   branch (only a two-valued flag has "the other value" — wait with `!= W`); a wait
+   condition that is not `@atomic_load(&F) ==/!= literal` alone (a mask, `<`, a local
+   copy of the load, a second conjunct); a counter hand-off (`@atomic_add`); two flags
+   held at once (the walk keeps one explicit hold); a `defer` body (it never holds); a
+   reader that keeps reading after it reset the flag, even when the writer is finished.
+   **Not derived:** that the lexical tags are right on every execution — argued at the
+   checks and gated by the "hand-off" grid.
+
+10. [residual of: the spin-lock region was read off one statement list — closed by BUG-1663]
+   **Residuals (over-rejections, loud — each has a warning or an error naming it):**
+   two spin locks nested in ONE block (the inner one is no longer a lock anywhere; nest
+   the inner one in its own block); a release on an early-exit path (`LOCK; if (e) {
+   UNLOCK; return; } …; UNLOCK;` — use `defer @atomic_store(&L, 0);` after the acquire);
+   a lock word that is a struct field or an array element; an atomic write of the lock
+   word outside its acquire/release pair, an atomic initialisation included (a plain
+   `L = 0;` before the first spawn is accepted); `&L` anywhere but as an atomic's cell
+   operand; a copy of the flag that is ASSIGNED inside the critical section instead of
+   declared there (`t = g; g = t + 1;` with `t` declared earlier — declare it at the
+   read), or declared between the acquire and a `defer`red release (declare it after the
+   `defer`); a copy whose NAME the function binds twice (two sibling blocks each with
+   their own `t`) — it is never fresh under a lock, and without one it keeps what any
+   binding of that name carried (give the copies distinct names); a `defer` body that
+   touches the guarded data, registered before the release was deferred (register it
+   after `defer @atomic_store(&L, 0);`).
+   **Not derived:** that the list of statements which sit lexically in a region and do
+   not run in it (a `defer` body, the spin body) is complete — it was found by probing.
+
+11. [residual of: an access through a pointer the context walk cannot NAME — closed by BUG-1666]
+   **Residuals (over-rejections, loud — the error says "memory of type 'T' reached through
+   a reference the compiler cannot name"):**
+   - *keyed by TYPE.* An access through an unknown reference is recorded as "some object
+     of the pointee type". Two threads each working on ITS OWN object of one type, through
+     pointers fetched at run time, are refused unless one lock (or a hand-off) covers both;
+     and such an access meets any unordered access of a global whose type CONTAINS that
+     type.
+   - *what is unknown:* a call's result; a pointer loaded from memory behind a reference or
+     out of a global; a capture (`|v|`); a name the function binds twice; a name whose
+     address is taken; a mutable global pointer; a static-local reference; every local of a
+     function containing inline asm, a `static_assert` or a cast node the write walk does
+     not see into.
+   - *the own-heap rule is name-local.* A fresh `alloc` is the thread's own only while its
+     reference never leaves the name it was FIRST bound to: handing the buffer to a helper
+     (`fill(buf)`), copying it, unwrapping it in two steps (`?*T m = alloc(T); *T n = m
+     orelse return;` — bind directly, `*T n = alloc(T) orelse return;`), returning it,
+     `&buf[i]`, a sub-slice, an array field read as a value all make it unknown. The
+     payable part is a callee whose parameter is not `keep` and whose result carries no
+     reference (`keep_value_roots` is the query); it needs the publish model extended to
+     calls first.
+   - *a thread's own LOCAL Arena.* Objects carved from it are unknown. Design: `Arena.over(x)`
+     points where `x` does and `a.alloc(T)` where `a` does, through the existing bindings.
+   - *an allocator call is a write of the whole allocator*, so it meets an access through
+     an unknown pointer to one of its objects made outside the allocator's lock — although
+     the call rewrites only bookkeeping and the slot it hands out. (A third record kind,
+     "bookkeeping only", would recover it.)
+   - *a view formed outside the lock* (`[*]u32 s = garr; LOCK; s[0] += 1; UNLOCK;`) counts
+     as an unlocked READ of the array, for a global and a static local alike, on every
+     compiler measured; `&garr[0]` does not. Form the view inside the region.
+   **By fiat, not modelled:** a union contains every variant; an Arena contains anything,
+   and in a program with an arena-backed buffer a byte access aliases every typed record.
+   **Not derived:** that the syntactic classification — known, unknown,
+   fresh-and-never-leaves — is right on every execution. Argued at the checks and gated by
+   the "pointer reach" and "own heap" grids. Privacy of the STACK rests on the
+   scoped-borrow rules and the escape analysis; of the heap, on zercheck's use-after-free
+   rule (the model has no `free`).
+
+12. [residual of: a builtin container method was recorded as a READ of its receiver — closed by BUG-1667]
+   **Residuals (loud):** `get` is the one method recorded as a read. A Ring shared by a
+   pushing thread and a popping thread is refused unless both hold one lock — correctly:
+   the emitted `count` is a plain field both sides rewrite, so the Ring is single-CORE
+   (ISR and main) safe, not two-thread safe.
+
+13. [residual of: a `static` local was the walking thread's own — closed by BUG-1668]
+   **Residuals (over-rejections, loud):** a static local cannot be a spin-lock word or a
+   hand-off flag (both recognisers are keyed by global), so data guarded by one is
+   refused; a static-local reference is always unknown.
+
+**B2. Proof status of the data-race class (2026-11-14 — read before claiming "proven").**
 What is machine-checked, and where the chain stops:
 - `window_cfg.v` (Coq 8.18 + stdpp, zero admits, compiled in the session): the spawn-window
   RULE is sound for every control-flow graph (`window_sound`), with the closed, tail and
@@ -222,29 +318,69 @@ What is machine-checked, and where the chain stops:
   `zer_window_counts_at_spawn`) that is linked into zerc returns the value of its `_coq`
   definition. Each lemma was also seen to FAIL on a broken C (a flipped return in each
   function, one inverted test).
-- [residual of: `verif_window_rules.v` written but not machine-checked — closed 2026-11-14]
-  **The `_coq` definitions exist TWICE** — in `window_cfg.v`, where the meaning lemmas
-  (`join_releases_meaning`, `stmt_leaves_meaning`, `counts_at_spawn_meaning`) are proved,
-  and again in `verif_window_rules.v`, where VST proves the C equal to them. The two copies
-  are byte-identical today (diffed 2026-11-14) and NOTHING checks that they stay so:
-  the two files are built by different targets in different images. An edit to one copy
-  alone leaves both gates green while "the C satisfies the proven rule" stops being what
-  was proved. Fix sketch: `Require` the oracle file from the VST file (stdpp is in the
-  `zer-vst` image; qualify the names, `window_cfg.v` exports `step` / `init` / `exec`),
-  compile it in `make check-vst`, and delete the copies.
+- `lock_region.v` (plain Coq, zero admits, no axioms; in `make check-proofs`): the
+  spin-lock RULE — if every acquire tests the same free value and every release is made
+  by a thread inside its own region, at most one thread is inside (`mutual_exclusion`); if
+  in addition every access of the guarded cell is made inside and an update's thread makes
+  no release between its read and its write-back, no other thread writes in between
+  (`rmw_exact`). One counterexample trace per hypothesis dropped — mixed free values, two
+  words, a rogue release, an unguarded store, a `defer` body run after the release, a
+  spinning thread — including the trace that satisfies everything the compiler checked
+  before BUG-1663 and still loses an update (`split_sections_lose`).
+- `proofs/vst/verif_lock_rules.v` (in `make check-vst`): the C of the ten extracted
+  lock decisions returns the value of its `_coq` definition for every input.
+- The `_coq` definitions of the window AND lock decisions exist ONCE, in
+  `concurrency_decisions.v`; the oracle files prove their meaning lemmas about that file
+  and the VST files prove the C equal to that file (the "written twice" residual of
+  2026-11-14 is closed).
+- `flag_handoff.v` (plain Coq, zero admits, no axioms; in `make check-proofs`): the flag
+  hand-off RULE — if every store of the flag is made by a thread that holds a value and
+  is that value's one owner, every thread that holds, holds the current value
+  (`holders_agree`), so two accesses under two different held values are never enabled
+  together (`claims_exclusive`). One counterexample trace per hypothesis dropped (a
+  republished flag, a forged store, a second claimant, a wait satisfied by the initial
+  value). `proofs/vst/verif_handoff_rules.v` (in `make check-vst`): the C of the four
+  extracted hand-off decisions equals its `_coq` definition.
+- `access_alias.v` (plain Coq, zero admits, no axioms; in `make check-proofs`): WHAT AN
+  ACCESS TOUCHES. Memory is typed objects, an access a path in one; a record is "inside
+  global g" or "inside some object of type t". Two overlapping accesses with sound
+  records have records that MAY ALIAS (`overlap_may_alias`), so judging every may-aliasing
+  pair misses no overlapping pair; each way of may-aliasing is realised (three necessity
+  theorems) and unrelated records do not alias. A local written only by its listed
+  assignments holds one of the listed values (`local_value_listed`; one foreign write and
+  it need not). A FRESH object its thread never publishes is used by that thread alone
+  (`fresh_stays_own`); one publication and any thread may use it (`published_is_shared`).
+  `proofs/vst/verif_alias_rules.v` (in `make check-vst`): the C of the four extracted
+  decisions (`zer_access_may_alias`, `zer_local_ref_known`, `zer_global_ref_known`,
+  `zer_fresh_ref_own`) equals its `_coq` definition for every input.
 - NOT proven: that `checker.c` discharges each hypothesis of the instances (the syntactic
-  walk `win_exits_live`, the branch-depth / jump census at the join) — by inspection and the
-  conc-matrix "jump x spawn-window" cells only. NOT modelled at all: the spawn-target race
-  scan, the atomic-cell and atomic-downgrade rules, shared-struct locking, the ISR rules.
+  walk `win_exits_live`, the branch-depth / jump census at the join; for the lock, that a
+  lexical region with no label, no nested release and no out-of-role write IS a dynamic
+  critical section for every statement judged inside it, and that a local declared in it
+  carries nothing from an earlier one) — by inspection and the conc-matrix "jump x
+  spawn-window" and "lock-region" cells only. NOT modelled at all: the spawn-target race
+  scan, the atomic-cell and atomic-downgrade rules, shared-struct locking, the ISR rules,
+  (for the hand-off: that an access tagged with a held value is made while its thread
+  holds it; for the access records: that every reference is classified correctly, that
+  every access the program makes is recorded at all — BUG-1667 and BUG-1668 were two
+  kinds of access with no record, found by probing, not by a failing proof — and that the
+  leak walk sees every way a reference moves). The spin lock and the hand-off each had NO
+  model until 2026-11-14, and each was holed in a dozen shapes the day it got one.
   The Iris subset proves the four-condition closure sufficient; nothing proves the checker
   enforces it on every program form. "100% data-race-free, proven" is therefore NOT a claim
   this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
   proven" is.
-- Accept-unsafe items still recorded as OPEN in this class: none as of 2026-11-14 — the last
-  three (a thread's split read-modify-write through memory, the `*opaque` handle handed on,
-  one object passed under two names to a lending function) were closed by BUG-1652..1654.
-  That is a statement about this ledger — what was probed and measured — and not a proof:
-  each of those three was found by probing, not by a failing proof. Recorded and NOT a race
+- Accept-unsafe items still recorded as OPEN in this class: none known as of 2026-11-14.
+  Closed that day: the lock regions (BUG-1663), the flag hand-off (BUG-1664), the silent
+  depth cap (BUG-1665), the unnamed pointer (BUG-1666), container methods recorded as
+  reads (BUG-1667), static locals taken for the thread's own (BUG-1668), an array argument
+  the lend rule gave no root (BUG-1669); before them BUG-1652..1654. That is a statement
+  about this ledger — what was probed and measured — and NOT a proof, and its record is
+  poor: "none" was written here on 2026-11-13 and seven families were found the next day.
+  The last three were found while writing the POSITIVE tests for the fourth: each
+  construct a safe program needed (an allocator call, a static counter, an array handed
+  to a helper) turned out to have an unsafe twin nothing recorded. What has not had that
+  treatment is the list just above ("NOT modelled at all").
   as far as measured: the handler-side split RMW done in helpers (a handler is not preempted
   by main code). `cinclude` code is a floor.
 
@@ -295,16 +431,13 @@ What is machine-checked, and where the chain stops:
 
 ## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
 
-1. **What the atomic/barrier downgrade check (BUG-1562/1563/1565) still trusts.** The
-   orderings it RECOGNISES are spelled in one statement list: a lock is a spin `while` on
-   `@atomic_cas` / `@atomic_xchg` up to its release; a hand-off is a write followed by a
-   non-load atomic on the flag, and a read after a loop / `if` reading the flag atomically.
-   It does not compare VALUES: a store to the flag after the storer's own wait on it is a
-   relay (allowed), and the publisher's own store BEFORE its write is not distinguished
-   from its publish. Bindings of pointers to globals follow `&g`, a slice, a struct
-   literal, a pointer name's declaration and reassignments, and parameters — not a pointer
-   read back out of memory (`*pp`, a pointer field of a global loaded at run time). A
-   C caller is still invisible beyond "may run more than once".
+1. [residual of: What the atomic/barrier downgrade check still trusts — closed by BUG-1663, BUG-1664]
+   **What the context walk still does not follow.** A C caller is invisible beyond "may
+   run more than once". (A pointer it cannot name is no longer taken for private —
+   BUG-1666; what that costs is section B item 11.)
+   [residual of BUG-1665] A thread whose code is deeper than the walk's cap (about eighty
+   calls on one path) is refused even when every access is locked: shorten the chain or
+   use a `shared struct`.
 2. **The split RMW through CALLS (BUG-1561/1564)** follows returns, stores into globals,
    through pointers (global, local, parameter), forwarding and call cycles. Not followed: a
    value passed back through memory a pointer argument points at (an out-parameter

@@ -1,0 +1,16 @@
+// expect-error: both access non-shared global 'g'
+// BUG-1666: an @atomic_* whose cell is reached THROUGH a pointer (`@atomic_add(p, 1)`, `p` a call result)
+// touches the object behind it; another thread writes that object plainly by name. The atomic-cell rule is
+// keyed by global NAME, so the atomic access had no record. Atomic against atomic is no race; against a
+// plain access of the same object it is. TSan: data race on the pre-fix compiler.
+u32 flagx;
+u32 g;
+*u32 getp() { return &g; }
+void w() { @atomic_store(&flagx, 1); *u32 p = getp(); for (u32 i = 0; i < 100000; i += 1) { @atomic_add(p, 1); } }
+void w2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { g += 1; } }
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

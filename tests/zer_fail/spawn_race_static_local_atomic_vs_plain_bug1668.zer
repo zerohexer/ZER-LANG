@@ -1,0 +1,17 @@
+// expect-error: both access static local 'cnt'
+// BUG-1668: one thread touches the static local atomically, the other plainly. The atomic-cell rule (every
+// access of an atomically-touched cell must be atomic) is keyed by GLOBAL; a static local has no global
+// name, so the mixed use went unseen. The atomic access is now recorded and meets the plain one.
+u32 flagx;
+void bump(bool plain) {
+    static u32 cnt;
+    if (plain) { cnt += 1; } else { @atomic_add(&cnt, 1); }
+}
+void wa() { @atomic_store(&flagx, 1); for (u32 r = 0; r < 100000; r += 1) { bump(false); } }
+void wp() { @atomic_store(&flagx, 1); for (u32 r = 0; r < 100000; r += 1) { bump(true); } }
+i32 main() {
+    ThreadHandle a = spawn wa();
+    ThreadHandle b = spawn wp();
+    a.join(); b.join();
+    return 0;
+}

@@ -1,0 +1,24 @@
+// expect-error: two different 'free' values
+// BUG-1663: one thread acquires with free value 0, the other with free value 1 — the second wins exactly while the first holds the word. Every acquire of a lock word must test the same free value.
+u32 lk;
+u32 counter;
+void w() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        counter += 1;
+        @atomic_store(&lk, 0);
+    }
+}
+void w2() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 1, 2)) { }
+        counter += 1;
+        @atomic_store(&lk, 1);
+    }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

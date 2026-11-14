@@ -1,0 +1,66 @@
+// BUG-1663: the lock shapes that ARE critical sections, with exact counts.
+// A lock word is written only by its acquire test and by the one release that
+// closes that region (here: a direct statement, and a `defer`); a copy of the
+// flag is read by the declaration of the local that carries it, inside the
+// region; a callee may split the update (its locals are new on every call);
+// a plain `lk = 0;` before the first spawn is an initialisation, not a release.
+// A `defer` body registered AFTER the deferred release fires before it (defers
+// run last-in first-out), so it runs with the lock; the spin body may hold a
+// statement that does not touch the guarded data; a lock whose free value is 1
+// (`@atomic_cas(&inv, 1, 0)`) is a lock as long as every acquire agrees.
+volatile u32 g;
+volatile u32 h;
+u32 plain;
+u32 lk;
+u32 deferred_sum;
+u32 inv = 1;                                    // a lock whose FREE value is 1
+u32 inv_sum;
+u32 spins;                                      // touched by ONE thread only
+
+void bump() { u32 t = g; g = t + 1; }          // a split update, in a callee
+
+void w() {
+    for (u32 i = 0; i < 20000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        defer @atomic_store(&lk, 0);            // released at the block's exit
+        u32 t = g;                              // copy read by its own declaration
+        u32 t2 = t + 1;                         // a second step
+        g = t2;
+        bump();
+        if (h > 0) { h -= 1; }                  // check-then-act, one statement inside
+        plain += 1;
+        defer { deferred_sum += 1; }            // registered after the release: runs before it
+    }
+    for (u32 i = 0; i < 20000; i += 1) {
+        while (!@atomic_cas(&inv, 1, 0)) { spins += 1; }
+        inv_sum += 1;
+        @atomic_store(&inv, 1);
+    }
+}
+
+u32 main() {
+    lk = 0;                                     // plain init before any thread exists
+    h = 20000;
+    ThreadHandle a = spawn w();
+    for (u32 i = 0; i < 20000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        g += 1;
+        bump();
+        h += 1;
+        plain += 1;
+        deferred_sum += 1;
+        @atomic_store(&lk, 0);
+    }
+    for (u32 i = 0; i < 20000; i += 1) {
+        while (!@atomic_cas(&inv, 1, 0)) { }
+        inv_sum += 1;
+        @atomic_store(&inv, 1);
+    }
+    a.join();
+    if (g != 80000) { return 1; }
+    if (h != 20000) { return 2; }
+    if (plain != 40000) { return 3; }
+    if (deferred_sum != 40000) { return 4; }
+    if (inv_sum != 40000) { return 5; }
+    return 0;
+}

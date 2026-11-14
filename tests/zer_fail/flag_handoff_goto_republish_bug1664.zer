@@ -1,0 +1,20 @@
+// expect-error: does not hold the flag
+// BUG-1664: a `goto` runs the publication again: in a function with a label nothing is known to run once.
+u32 ready;
+u32 data;
+u32 sink;
+void writer() {
+    u32 i = 0;
+again:
+    data = i;
+    @atomic_store(&ready, 1);
+    i += 1;
+    if (i < 1000) { goto again; }
+}
+void reader() { while (@atomic_load(&ready) == 0) { } sink = data; }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

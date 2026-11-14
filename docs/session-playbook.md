@@ -858,6 +858,44 @@ three while the soundness floor never moves. Writing the oracle is pure spec wor
 no re-architecture, doesn't worsen soundness) so it goes FIRST; the implementation against
 it is mechanical afterward.
 
+**The oracle's hypothesis list is a PROBE list — use it twice (BUG-1663, 2026-11-14).** The
+spin-lock relaxations (BUG-1652, BUG-1656) shipped with tests and no model. Writing the
+model afterwards found nine accepted lost-update programs in an afternoon: each hypothesis
+of the theorem ("a release is made by a thread that is inside", "no release between the
+read and the write-back") is a sentence that names what to break, and each broke. Then the
+FIX was read against the same list and five more families fell out (two acquires testing
+different free values, a lock word that is one word per thread, a `defer` body that runs
+after the release it is written before, the spin body, an inner local of the copy's name) —
+because the first model had quietly assumed them (`word : bool`, one `word` field, a trace
+with no syntax). So: (1) write the oracle BEFORE a relaxation or an idiom recogniser ships;
+(2) for every field and every event of the model ask "what in the language could make this
+two things, or happen at another time?"; (3) when the model's own types answered a question
+by construction, that is a hypothesis too — say it and probe it. The neighbouring flag
+hand-off idiom had no model either: it was holed in four shapes the same day, modelled the
+next hour (BUG-1664), and its grid shows 95 accepted races on the compiler before. And
+(4) a rule that says "the walk sees every X" must be checked against the walk's own caps —
+asking that found BUG-1665.
+
+**A model certifies the JUDGEMENT; what was never written down has no theorem to fail
+(BUG-1666..1669, 2026-11-14).** `access_alias.v` proves that two overlapping accesses with
+sound records have records that may alias. Three of the four holes closed with it were
+not about that at all: a container method (`pool.alloc()`), a `static` local and an array
+argument were accesses — or aliases — that produced NO record, so the comparison never
+ran. They were found the cheap way, while writing the POSITIVE tests: the own-heap
+positive needed `alloc(Node)` in two threads, and that was accepted where it should not
+have been; the "callee handed the thread's own stack" positive needed an array argument.
+So: (1) for every construct a new positive USES — an allocator call, a static, an
+implicit coercion, a builtin method — write its two-thread negative before believing the
+positive; (2) "which constructs touch memory without naming it in an assignment or an
+identifier read?" is a list nobody maintains — when a walk's records feed an ACCEPT, that
+list is a hypothesis of the model, and the honest statement is "sound over the accesses
+recorded"; (3) the first safety net (here the spawn scan's outright refusal) hides the
+second net's holes until something downgrades the first — probe with the downgrade ON.
+A fourth lesson is mechanical: by the time a post-pass walks the tree the checker has
+REWRITTEN it (`alloc(T)` is `T.alloc_ptr()`, `orelse return` is a flag with no fallback
+node). A recogniser written against the source spelling compiled, ran, and matched
+nothing; one trace line showed it (rule 8 — verify the edit RUNS).
+
 **THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
 precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by
 Rice: the true set "memory-safe on every execution" is undecidable, so no sound,

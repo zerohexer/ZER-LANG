@@ -764,6 +764,9 @@ Count tests from the tree (`ls tests/zer/*.zer | wc -l`), never from a document.
   ISR, BOTH the assign and the var-decl spelling, all value-flow sites (init, assign, call
   arg, return). Then write one REAL 10-60 line program: real programs found bugs that
   1,700 unit tests missed.
+- **Every construct a new POSITIVE uses gets its negative twin first** (an allocator call, a
+  `static`, a builtin method, an implicit coercion): three of BUG-1666's four siblings were
+  accesses no walk recorded, found only by writing the positive (playbook, "A model certifies").
 - A new diagnostic that fires on a corpus file which is not your own new negative is either
   a real bug or a test that was passing for the wrong reason — check which, every time.
   Measure the corpus cost of any tightening by COMPILING the corpus with the rule and
@@ -859,7 +862,9 @@ questions (see "Confirmed NOT bugs"). Full text: playbook, same title.
 - **The max-oracle standard.** Every distinguishable state AND every operational
   PRECONDITION the decision relies on is a variable of the model — a soundness hole found by
   red team rather than by a failing proof means the model lacked that variable (Level B's
-  guard stability; BUG-1651's edges leaving the window). Merge = JOIN with the unsafe class
+  guard stability; BUG-1651's edges leaving the window; BUG-1663 / 1664's lock and hand-off
+  recognisers, shipped with NO model — write the oracle BEFORE a relaxation or an idiom
+  recogniser, its hypotheses are the probe list). Merge = JOIN with the unsafe class
   as the default. Per oracle: T1 soundness, T3 a precision witness, T4 no-under-rejection.
   Zero admits, listed in `_CoqProject` AND in the `make check-proofs` admit gate. Name the
   honest LIMIT.

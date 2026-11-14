@@ -1,0 +1,25 @@
+// expect-error: no common lock
+// BUG-1663: `static u32 lk;` inside w shadows the global `lk`: w spins on its own word, w2 on the global. The recogniser named both by the global.
+u32 lk;
+u32 counter;
+void w() {
+    static u32 lk;
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        counter += 1;
+        @atomic_store(&lk, 0);
+    }
+}
+void w2() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        counter += 1;
+        @atomic_store(&lk, 0);
+    }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

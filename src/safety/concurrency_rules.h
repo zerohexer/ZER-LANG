@@ -67,4 +67,39 @@ int zer_window_stmt_leaves(int is_return_or_goto, int is_loop_jump, int loop_dep
  * latched walk (a function with a goto / label) was counted at the entry. */
 int zer_window_counts_at_spawn(int closed, int latched);
 
+/* ---- spin-lock REGION decisions (BUG-1663) — oracle: lock_region.v ----
+ * A lock word may be written only by its acquire test and by the one release
+ * that closes that acquire's region; a read-modify-write is covered by a held
+ * lock only when its read and its write-back are inside one critical section. */
+int zer_lock_release_in_role(int closes_own_region, int already_released);
+int zer_lock_write_in_role(int sanctioned, int whole_word);
+int zer_rmw_copy_fresh(int by_own_declaration, int is_static, int sources_in_section);
+int zer_rmw_copy_in_section(int fresh, int same_region);
+int zer_rmw_one_section(int one_statement, int copies_in_section);
+int zer_rmw_lock_covers(int lock_held, int one_section);
+int zer_rmw_locked_exempt(int seen, int lock_held, int mixed, int store_outside);
+int zer_lock_word_ok(int whole_word, int thread_local, int shadowed);
+int zer_lock_acquire_agrees(int first, int same_free);
+int zer_lock_covers_defer(int opened_here, int release_deferred);
+
+/* ---- flag HAND-OFF decisions (BUG-1664) — oracle: flag_handoff.v ----
+ * The flag is a token: its value says which thread may touch the data. An
+ * access is made under the value its thread HOLDS; two accesses under two
+ * different held values of one disciplined flag never run together. */
+int zer_flag_obs(int agrees, int two_valued);
+int zer_flag_store_from(int holds_explicit, int entry_fn, int in_loop, int in_jump_fn,
+                        int stored_before);
+int zer_flag_claim_unique(int single_thread, int repeated);
+int zer_flag_orders(int flag_valid, int values_differ);
+
+/* ---- WHAT AN ACCESS TOUCHES (BUG-1666) — oracle: access_alias.v ----
+ * An access is recorded as inside a named global, or as inside "some object of
+ * type T" when it goes through a reference that is not KNOWN to point only
+ * into recorded globals or the thread's own stack. Two records are compared
+ * when they may alias. */
+int zer_access_may_alias(int same_global, int both_named, int a_holds_b, int b_holds_a);
+int zer_local_ref_known(int bound_once, int addr_taken, int values_known);
+int zer_global_ref_known(int is_const, int never_mutated);
+int zer_fresh_ref_own(int fresh, int leaves);
+
 #endif

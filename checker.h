@@ -34,6 +34,17 @@ typedef struct {
     const char *name;
     uint32_t name_len;
     Symbol *global;      /* the global this local's value came from */
+    /* BUG-1663: WHERE the copy was taken, for the lock exemption. `fresh` — the
+     * row was made by the local's OWN declaration initializer, from a read made
+     * in that statement (or from copies that are themselves fresh in the same
+     * region); `region` — the lexical lock region the checker was in. A
+     * read-modify-write through this local is "inside one critical section"
+     * only if the write-back sits in that same region. Any other way a row
+     * comes to exist (an assignment, a callee's out-parameter, a pointer
+     * store) leaves fresh == false: the local may have been filled in an
+     * earlier critical section, or outside one. */
+    uint32_t region;
+    bool fresh;
 } RmwTaintEnt;
 
 /* typemap entry — maps AST Node* to resolved Type* */
@@ -283,6 +294,14 @@ typedef struct {
      * elide a check; here the consequence is only that a shadowing local of the
      * same name can inherit a taint it did not earn, which over-rejects and
      * cannot under-reject). */
+    /* BUG-1663: the lexical critical-section counter — the number the statement
+     * being checked carries, and the last number handed out. It steps at every
+     * statement that could begin or end a spin-lock region
+     * (sync_stmt_is_lock_boundary) and never steps back. */
+    uint32_t lock_region, lock_region_seq;
+    /* BUG-1666: some buffer backs an Arena (arena_backing_note) — typed objects
+     * are then carved out of BYTE storage, and a byte access may overlap any type */
+    bool any_arena_backing;
     RmwTaintEnt *rmw_taints;
     int rmw_taint_count;
     int rmw_taint_capacity;
@@ -537,7 +556,10 @@ typedef struct {
                                * scan found no plain global access at all */
         /* BUG-1565: the globals each argument points at (or carries a pointer
          * to), resolved at the spawn while its scope is live */
-        struct SyncArgBind { int param; Symbol *g; bool direct; } *binds;
+        /* `g` NULL with `unk`: the argument may carry a reference the spawn
+         * site could not follow (BUG-1666) */
+        struct SyncArgBind { int param; Symbol *g; bool direct; bool unk; } *binds;
+        bool binds_lost;   /* a row could not be recorded: the thread's walk is incomplete */
         int nbind;
         const char *file; const char *source;
         int line;

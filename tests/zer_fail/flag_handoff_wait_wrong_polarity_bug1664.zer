@@ -1,0 +1,16 @@
+// expect-error: Seeing it gives no turn
+// BUG-1664: the reader spins while the flag is NON-zero, so it leaves at once: it has seen 0, the value the writer has yet to hand on. Only the thread that stores FROM a value holds it. (Was a recorded gap; ThreadSanitizer: data race.)
+u32 ready;
+u32 data;
+u32 sink;
+void writer() { data = 42; @atomic_store(&ready, 1); }
+void reader() {
+    while (@atomic_load(&ready) != 0) { }
+    sink = data;
+}
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

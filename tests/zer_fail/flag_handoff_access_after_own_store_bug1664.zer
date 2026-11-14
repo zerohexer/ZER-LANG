@@ -1,0 +1,13 @@
+// expect-error: no release/acquire flag ordering them
+// BUG-1664: the reader hands the flag back and THEN reads the data again: after its own store it holds nothing.
+u32 ready;
+u32 data;
+u32 sink;
+void writer() { data = 1; @atomic_store(&ready, 1); while (@atomic_load(&ready) != 0) { } data = 2; @atomic_store(&ready, 1); }
+void reader() { while (@atomic_load(&ready) != 1) { } sink = data; @atomic_store(&ready, 0); sink = data; }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

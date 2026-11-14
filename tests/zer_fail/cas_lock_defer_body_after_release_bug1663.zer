@@ -1,0 +1,17 @@
+// expect-error: no common lock
+// BUG-1663: a `defer` body registered in the region's own block fires at the block's exit — after the release that was deferred LATER than it. Lexically inside the region, it runs without the lock.
+u32 lk;
+u32 counter;
+void w() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        defer { counter += 1; }
+        defer @atomic_store(&lk, 0);
+    }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

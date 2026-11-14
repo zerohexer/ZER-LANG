@@ -1,0 +1,16 @@
+// expect-error: both reach 'b'
+// BUG-1669: the same through a forwarder and an array FIELD — `outer(b.arr, b.arr)` hands one object to
+// both parameters of a function that passes them on to the one that lends.
+struct Box { u32[4] arr; u32 n; }
+void child([*]u32 q) { for (u32 r = 0; r < 100000; r += 1) { q[0] += 1; } }
+void both([*]u32 s1, [*]u32 s2) {
+    ThreadHandle t = spawn child(s1);
+    for (u32 r = 0; r < 100000; r += 1) { s2[0] += 1; }
+    t.join();
+}
+void outer([*]u32 a, [*]u32 c) { both(a, c); }
+i32 main() {
+    Box b;
+    outer(b.arr, b.arr);
+    return 0;
+}

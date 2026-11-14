@@ -1,0 +1,15 @@
+// expect-error: outside every thread
+// BUG-1664: the flag is stored before any thread exists, so the thread that "starts" does not hold its initial value: the reader leaves its wait at once.
+u32 ready;
+u32 data;
+u32 sink;
+void reader() { while (@atomic_load(&ready) == 0) { } sink = data; }
+void pre() { @atomic_store(&ready, 1); }
+u32 main() {
+    pre();
+    ThreadHandle b = spawn reader();
+    data = 7;
+    @atomic_store(&ready, 1);
+    b.join();
+    return 0;
+}

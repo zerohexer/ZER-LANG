@@ -1,0 +1,13 @@
+// expect-error: does not hold the flag
+// BUG-1664: the reader waits ONCE and then loops, storing the flag on every turn: from the second turn on it holds nothing.
+u32 ready;
+u32 data;
+u32 sink;
+void writer() { for (u32 i = 0; i < 100; i += 1) { while (@atomic_load(&ready) != 0) { } data = i; @atomic_store(&ready, 1); } }
+void reader() { while (@atomic_load(&ready) != 1) { } for (u32 i = 0; i < 100; i += 1) { sink = data; @atomic_store(&ready, 0); } }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

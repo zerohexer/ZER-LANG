@@ -1,0 +1,34 @@
+// BUG-1669, the precision half. An array handed to a slice parameter is a view of it, so a function that
+// lends one slice parameter to a thread and writes through another must be given two OBJECTS. Two arrays,
+// two array fields of two structs, and an array passed twice BY VALUE (two copies) are all fine.
+struct Box { u32[4] arr; u32 n; }
+
+void child([*]u32 q) { for (u32 r = 0; r < 1000; r += 1) { q[0] += 1; } }
+
+void both([*]u32 s1, [*]u32 s2) {
+    ThreadHandle t = spawn child(s1);
+    for (u32 r = 0; r < 1000; r += 1) { s2[0] += 2; }
+    t.join();
+}
+
+void outer([*]u32 a, [*]u32 b) { both(a, b); }
+
+u32 by_value(u32[4] a, u32[4] b) { return a[0] + b[0]; }
+
+i32 main() {
+    u32[4] a1;
+    u32[4] a2;
+    both(a1, a2);
+    if (a1[0] != 1000) { return 1; }
+    if (a2[0] != 2000) { return 2; }
+    Box b1;
+    Box b2;
+    outer(b1.arr, b2.arr);
+    if (b1.arr[0] != 1000) { return 3; }
+    if (b2.arr[0] != 2000) { return 4; }
+    both(a1[0..2], a2[2..]);
+    if (a1[0] != 2000) { return 5; }
+    if (a2[2] != 2000) { return 6; }
+    if (by_value(a1, a1) != 4000) { return 7; }
+    return 0;
+}

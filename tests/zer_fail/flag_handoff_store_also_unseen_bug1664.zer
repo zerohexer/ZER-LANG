@@ -1,0 +1,15 @@
+// expect-error: can also run where no thread walk sees it
+// BUG-1664: `turn0()` is run by a thread AND by main before any thread exists: main moves the flag where nothing is watching, and the writer no longer holds the initial value.
+u32 ready;
+u32 data;
+u32 sink;
+void turn0() { while (@atomic_load(&ready) != 0) { } data = 9; @atomic_store(&ready, 1); }
+void writer() { data = 1; @atomic_store(&ready, 1); turn0(); }
+void reader() { while (@atomic_load(&ready) != 1) { } sink = data; @atomic_store(&ready, 0); }
+u32 main() {
+    turn0();
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

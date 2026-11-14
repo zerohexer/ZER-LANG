@@ -1547,6 +1547,12 @@ int main(void) {
                    "void f(*u32 p, *u32 q){ ThreadHandle th = spawn w(p); *q += 1; th.join(); }\n" \
                    "*u32 id(*u32 x){ return x; }\nstruct H { *u32 p; }\nu32 g;\n*u32 getg(){ return &g; }\n" \
                    "void plain(*u32 p, *u32 q){ *p += 1; *q += 1; }\n"
+        #define AS "void ws([*]u32 a){ for (u32 i = 0; i < 4; i += 1) { a[0] += 1; } }\n" \
+                   "void fs([*]u32 p, [*]u32 q){ ThreadHandle th = spawn ws(p); q[0] += 1; th.join(); }\n" \
+                   "void fwd([*]u32 a, [*]u32 b){ fs(a, b); }\n" \
+                   "struct B { u32[4] arr; u32 n; }\nu32[4] ga;\n" \
+                   "void lendg([*]u32 p){ ThreadHandle th = spawn ws(p); ga[0] += 1; th.join(); }\n" \
+                   "u32 byval(u32[4] a, u32[4] b){ return a[0] + b[0]; }\n"
         static const struct { const char *name; int neg; const char *code; } ac[] = {
             { "same name twice", 1, AF "u32 main(){ u32 v = 0; f(&v, &v); return 0; }\n" },
             { "pointer local alias", 1, AF "u32 main(){ u32 v = 0; *u32 q = &v; f(&v, q); return 0; }\n" },
@@ -1558,8 +1564,22 @@ int main(void) {
             { "ok: two names", 0, AF "u32 main(){ u32 a = 0; u32 b = 0; f(&a, &b); return 0; }\n" },
             { "ok: carrier of another object", 0, AF "u32 main(){ u32 a = 0; u32 b = 0; H h; h.p = &b; f(&a, h.p); return 0; }\n" },
             { "ok: unknown, callee lends nothing", 0, AF "u32 main(){ u32 a = 0; plain(&a, id(&a)); return 0; }\n" },
+            /* BUG-1669: an ARRAY handed to a slice parameter is a view of it —
+             * `fs(arr, arr)` is `fs(arr[0..], arr[0..])`. The rule asked the
+             * ARGUMENT's type (an array: "not a reference"), not what the
+             * parameter receives, so the coercion spelling had no root at all. */
+            { "array twice (coerced)", 1, AS "u32 main(){ u32[4] v; fs(v, v); return 0; }\n" },
+            { "array and a slice of it", 1, AS "u32 main(){ u32[4] v; fs(v, v[0..2]); return 0; }\n" },
+            { "slice of it and the array", 1, AS "u32 main(){ u32[4] v; fs(v[1..], v); return 0; }\n" },
+            { "array field twice", 1, AS "u32 main(){ B b; fs(b.arr, b.arr); return 0; }\n" },
+            { "array through a forwarder", 1, AS "u32 main(){ u32[4] v; fwd(v, v); return 0; }\n" },
+            { "global array lent, touched by name", 1, AS "u32 main(){ lendg(ga); return 0; }\n" },
+            { "ok: two arrays", 0, AS "u32 main(){ u32[4] a; u32[4] b; fs(a, b); return 0; }\n" },
+            { "ok: two array fields of two objects", 0, AS "u32 main(){ B a; B b; fs(a.arr, b.arr); return 0; }\n" },
+            { "ok: array by value twice", 0, AS "u32 main(){ u32[4] v; byval(v, v); return 0; }\n" },
         };
         #undef AF
+        #undef AS
         for (size_t ai = 0; ai < sizeof(ac) / sizeof(ac[0]); ai++) {
             valid_cells++;
             char nm[160];
@@ -1569,6 +1589,617 @@ int main(void) {
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }
+    }
+
+    /* ---- BUG-1663: the SPIN-LOCK REGION grid ------------------------------------
+     * "The code between a spin acquire and its release runs with the lock held"
+     * was read off one statement list. It is a claim about the whole program:
+     * every write of the lock word must be its own acquire test or the ONE release
+     * that closes that acquire's region, and (for a volatile flag) the read and
+     * the write-back of an update must sit in ONE region instance. Crossed over
+     * the DATA the lock guards — a volatile flag (the read-modify-write rule) and
+     * a plain global (the two-accessor rule) — because the two are judged by
+     * different sinks reading the same lock context. Model:
+     * proofs/operational/lambda_zer_concurrency/lock_region.v. Every negative
+     * cell compiles clean on the pre-fix compiler (run it with ZER_MATRIX_ZERC). */
+    {
+        typedef enum { LD_VOLATILE, LD_PLAIN, LD_COUNT } LockData;
+        typedef enum {
+            LS_OK_DIRECT,             /* POS  LOCK; g += 1; UNLOCK;                       */
+            LS_OK_DEFER_RELEASE,      /* POS  LOCK; defer UNLOCK; g += 1;                 */
+            LS_OK_DECL_SPLIT,         /* POS  LOCK; u32 t = g; g = t + 1; UNLOCK;         */
+            LS_OK_CALLEE_SPLIT,       /* POS  LOCK; bump(); UNLOCK;  (bump splits)        */
+            LS_OK_PLAIN_INIT,         /* POS  lk = 0; before the first spawn              */
+            LS_OK_DEFER_BODY_LATER,   /* POS  LOCK; defer UNLOCK; defer { g += 1; }       */
+            LS_OK_INVERTED_FREE,      /* POS  free value 1, every acquire agreeing        */
+            LS_NESTED_RELEASE,        /* NEG  a release inside an `if` in the region      */
+            LS_CALLEE_RELEASE,        /* NEG  a callee releases the lock                  */
+            LS_POINTER_RELEASE,       /* NEG  released through a pointer to the word      */
+            LS_NONHOLDER_RELEASE,     /* NEG  another thread stores 0 into the word       */
+            LS_LABEL_IN_REGION,       /* NEG  a goto enters past the acquire              */
+            LS_TWO_FIELDS_ONE_LOCK,   /* NEG  &s.a in one thread, &s.b in the other       */
+            LS_RELEASE_AFTER_DEFER,   /* NEG  a second release of a defer-released region */
+            LS_SPLIT_TWO_REGIONS,     /* NEG  read in one region, write-back in the next  */
+            LS_SPLIT_STALE_CARRIER,   /* NEG  the copy survives from an earlier iteration */
+            LS_SPLIT_GLOBAL_CARRIER,  /* NEG  the copy sits in a global between regions   */
+            LS_THREAD_SPLIT,          /* NEG  the THREAD splits across two regions        */
+            LS_DEFER_BODY_EARLIER,    /* NEG  LOCK; defer { g += 1; } defer UNLOCK;       */
+            LS_DEFER_BODY_DIRECT_REL, /* NEG  LOCK; defer { g += 1; } UNLOCK;             */
+            LS_SPIN_BODY_ACCESS,      /* NEG  the data touched in the spin body           */
+            LS_MIXED_FREE_VALUE,      /* NEG  cas(0->1) in one thread, cas(1->2) in other */
+            LS_THREADLOCAL_WORD,      /* NEG  the lock word is threadlocal                */
+            LS_STATIC_SHADOW,         /* NEG  a `static` local shadows the global lock    */
+            LS_SHADOWED_COPY,         /* NEG  an inner local of the copy's name           */
+            LS_COUNT
+        } LockShape;
+        static const char *const ld_name[LD_COUNT] = { "volatile-flag", "plain-global" };
+        #define LK  "while (!@atomic_cas(&lk, 0, 1)) { }"
+        #define ULK "@atomic_store(&lk, 0);"
+        for (LockData d = 0; d < LD_COUNT; d++) {
+            for (LockShape sh = 0; sh < LS_COUNT; sh++) {
+                const char *nm = "?", *extra = "", *body = NULL, *pre = "", *tail = "";
+                const char *wbody = LK " g += 1; " ULK;
+                const char *locks = "u32 lk;\n";
+                int neg = 1, vol_only = 0;
+                switch (sh) {
+                case LS_OK_DIRECT: nm = "ok-direct"; neg = 0;
+                    body = LK " g += 1; " ULK; break;
+                case LS_OK_DEFER_RELEASE: nm = "ok-defer-release"; neg = 0;
+                    body = LK " defer " ULK " g += 1;"; break;
+                case LS_OK_DECL_SPLIT: nm = "ok-declared-in-region"; neg = 0;
+                    body = LK " u32 t = g; u32 t2 = t + 1; g = t2; " ULK; break;
+                case LS_OK_CALLEE_SPLIT: nm = "ok-callee-split"; neg = 0;
+                    extra = "void bump() { u32 t = g; g = t + 1; }\n";
+                    body = LK " bump(); " ULK; break;
+                case LS_OK_PLAIN_INIT: nm = "ok-plain-init-before-spawn"; neg = 0;
+                    pre = "    lk = 0;\n";
+                    body = LK " g += 1; " ULK; break;
+                case LS_OK_DEFER_BODY_LATER: nm = "ok-defer-body-after-deferred-release"; neg = 0;
+                    body = LK " defer " ULK " defer { g += 1; }"; break;
+                case LS_OK_INVERTED_FREE: nm = "ok-inverted-free-value"; neg = 0;
+                    locks = "u32 lk = 1;\n";
+                    wbody = "while (!@atomic_cas(&lk, 1, 0)) { } g += 1; @atomic_store(&lk, 1);";
+                    body  = "while (!@atomic_cas(&lk, 1, 0)) { } g += 1; @atomic_store(&lk, 1);";
+                    break;
+                case LS_NESTED_RELEASE: nm = "nested-release";
+                    extra = "volatile u32 one = 1;\n";
+                    body = LK " if (one == 1) { " ULK " } g += 1; " ULK; break;
+                case LS_CALLEE_RELEASE: nm = "callee-release";
+                    extra = "void unl() { " ULK " }\n";
+                    body = LK " unl(); g += 1; " ULK; break;
+                case LS_POINTER_RELEASE: nm = "pointer-release";
+                    extra = "void rel(*u32 p) { @atomic_store(p, 0); }\n";
+                    body = LK " rel(&lk); g += 1; " ULK; break;
+                case LS_NONHOLDER_RELEASE: nm = "non-holder-release";
+                    extra = "void breaker() { for (u32 i = 0; i < 100; i += 1) { " ULK " } }\n";
+                    pre = "    ThreadHandle b = spawn breaker();\n";
+                    tail = "    b.join();\n";
+                    body = LK " g += 1; " ULK; break;
+                case LS_LABEL_IN_REGION: nm = "label-in-region";
+                    extra = "volatile u32 one = 1;\n";
+                    body = "if (one == 0) { goto inside; } " LK "\ninside:\n g += 1; " ULK; break;
+                case LS_TWO_FIELDS_ONE_LOCK: nm = "two-fields-one-lock";
+                    locks = "struct L { u32 a; u32 b; }\nL s;\n";
+                    wbody = "while (!@atomic_cas(&s.a, 0, 1)) { } g += 1; @atomic_store(&s.a, 0);";
+                    body  = "while (!@atomic_cas(&s.b, 0, 1)) { } g += 1; @atomic_store(&s.b, 0);";
+                    break;
+                case LS_RELEASE_AFTER_DEFER: nm = "release-after-defer";
+                    body = LK " defer " ULK " g += 1; " ULK; break;
+                case LS_SPLIT_TWO_REGIONS: nm = "split-two-regions"; vol_only = 1;
+                    body = LK " u32 t = g; " ULK " " LK " g = t + 1; " ULK; break;
+                case LS_SPLIT_STALE_CARRIER: nm = "split-stale-carrier"; vol_only = 1;
+                    extra = "volatile u32 one = 1;\n";
+                    pre = "    u32 t = 0;\n";
+                    body = LK " if (one == 0) { t = g; } g = t + 1; " ULK; break;
+                case LS_SPLIT_GLOBAL_CARRIER: nm = "split-global-carrier"; vol_only = 1;
+                    extra = "u32 mem;\n";
+                    body = LK " mem = g; " ULK " " LK " g = mem + 1; " ULK; break;
+                case LS_THREAD_SPLIT: nm = "thread-split-two-regions"; vol_only = 1;
+                    wbody = LK " u32 t = g; " ULK " " LK " g = t + 1; " ULK;
+                    body = LK " g += 1; " ULK; break;
+                case LS_DEFER_BODY_EARLIER: nm = "defer-body-before-deferred-release";
+                    body = LK " defer { g += 1; } defer " ULK; break;
+                case LS_DEFER_BODY_DIRECT_REL: nm = "defer-body-with-direct-release";
+                    body = LK " defer { g += 1; } " ULK; break;
+                case LS_SPIN_BODY_ACCESS: nm = "spin-body-access";
+                    body = "while (!@atomic_cas(&lk, 0, 1)) { g += 1; } " ULK; break;
+                case LS_MIXED_FREE_VALUE: nm = "mixed-free-value";
+                    wbody = "while (!@atomic_cas(&lk, 1, 2)) { } g += 1; @atomic_store(&lk, 1);";
+                    body = LK " g += 1; " ULK; break;
+                case LS_THREADLOCAL_WORD: nm = "threadlocal-word";
+                    locks = "threadlocal u32 lk;\n";
+                    body = LK " g += 1; " ULK; break;
+                case LS_STATIC_SHADOW: nm = "static-local-shadows-lock";
+                    wbody = "static u32 lk; " LK " g += 1; " ULK;
+                    body = LK " g += 1; " ULK; break;
+                case LS_SHADOWED_COPY: nm = "shadowed-copy"; vol_only = 1;
+                    body = "u32 t = g; " LK " { u32 t = g; if (t == 7) { return 1; } } g = t + 1; " ULK;
+                    break;
+                case LS_COUNT: break;
+                }
+                /* a split update of a PLAIN global is a logic matter (each access
+                 * holds the lock: no race); the exactness rule is the volatile one */
+                if (vol_only && d == LD_PLAIN) continue;
+                valid_cells++;
+                char lb[2400], cn[160];
+                snprintf(lb, sizeof(lb),
+                    "%su32 g;\n%s%s"
+                    "void w() {\n    for (u32 i = 0; i < 100; i += 1) {\n        %s\n    }\n}\n"
+                    "u32 main() {\n%s"
+                    "    ThreadHandle a = spawn w();\n"
+                    "    for (u32 i = 0; i < 100; i += 1) {\n        %s\n    }\n"
+                    "    a.join();\n%s    return 0;\n}\n",
+                    d == LD_VOLATILE ? "volatile " : "", locks, extra, wbody, pre, body, tail);
+                snprintf(cn, sizeof(cn), "lock-region/%s/%s", ld_name[d], nm);
+                int ok = neg ? run_neg(cn, lb) : run_pos(cn, lb);
+                fprintf(stderr, "  [%-13s][%-36s][%s] %s\n", ld_name[d], nm, neg ? "neg" : "pos",
+                        ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
+        }
+        #undef LK
+        #undef ULK
+    }
+
+    /* ---- BUG-1664: the flag HAND-OFF grid ---------------------------------------
+     * `data = v; @atomic_store(&ready, 1);` against a wait on `ready` used to be
+     * matched by shape: "some later statement stores a flag" / "some earlier loop
+     * reads a flag". The model (proofs/operational/lambda_zer_concurrency/
+     * flag_handoff.v): the flag is a token, and a thread touches the data only
+     * while it HOLDS a value — the one it waited for, or, for the one thread that
+     * starts, the initial value until its first store, made once. Crossed:
+     *   WHO publishes  a spawned thread | the spawner, in its window
+     *   HOW it does    a publication that runs once, in four spellings — or one
+     *                  that runs again (loop, callee, goto), keeps writing after
+     *                  it, or writes from a `defer`
+     *   HOW the other  a wait / branch that really observes the published value,
+     *     side waits   in six spellings — or one that does not (wrong polarity,
+     *                  a loop that is not a wait, a `break`, a compound
+     *                  condition, the wrong branch, no wait at all)
+     * A cell is positive iff BOTH sides are right; every negative cell is a real
+     * race (ThreadSanitizer on the pure forms). Run against the pre-fix compiler:
+     * most negative cells compile clean. */
+    {
+        typedef enum { HP_THREAD, HP_SPAWNER, HP_COUNT } HandWho;
+        static const struct { const char *nm; int ok; const char *extra; const char *body; } hw[] = {
+            { "one-shot",          1, "", "data = 1; @atomic_store(&ready, 1);" },
+            { "fill-loop",         1, "", "for (u32 i = 0; i < 4; i += 1) { data += i; } @atomic_store(&ready, 1);" },
+            { "callee-fill",       1, "void fill() { data = 1; }\n", "fill(); @atomic_store(&ready, 1);" },
+            { "conditional",       1, "volatile u32 onec = 1;\n", "if (onec == 1) { data = 1; @atomic_store(&ready, 1); }" },
+            { "republish-loop",    0, "", "for (u32 i = 0; i < 4; i += 1) { data = i; @atomic_store(&ready, 1); }" },
+            { "republish-callee",  0, "void pub(u32 v) { data = v; @atomic_store(&ready, 1); }\n", "pub(1); pub(2);" },
+            { "republish-goto",    0, "", "u32 gi = 0;\nagain:\n    data = gi; @atomic_store(&ready, 1); gi += 1; if (gi < 4) { goto again; }" },
+            { "write-after-store", 0, "", "data = 1; @atomic_store(&ready, 1); data = 2;" },
+            { "defer-body",        0, "", "defer { data = 2; } data = 1; @atomic_store(&ready, 1);" },
+        };
+        static const struct { const char *nm; int ok; const char *extra; const char *body; } hr[] = {
+            { "eq-wait",        1, "", "while (@atomic_load(&ready) == 0) { } sink = data;" },
+            { "ne-wait",        1, "", "while (@atomic_load(&ready) != 1) { } sink = data;" },
+            { "do-while-wait",  1, "", "do { } while (@atomic_load(&ready) == 0); sink = data;" },
+            { "if-then",        1, "", "if (@atomic_load(&ready) == 1) { sink = data; }" },
+            { "if-else",        1, "", "if (@atomic_load(&ready) == 0) { sink = 0; } else { sink = data; }" },
+            { "wait-then-call", 1, "void use() { sink = data; }\n", "while (@atomic_load(&ready) == 0) { } use();" },
+            { "wrong-polarity", 0, "", "while (@atomic_load(&ready) != 0) { } sink = data;" },
+            { "not-a-wait",     0, "", "u32 nw = 0; while (nw < 10) { nw += 1; u32 lb = @atomic_load(&ready); } sink = data;" },
+            { "break-in-wait",  0, "", "while (@atomic_load(&ready) == 0) { break; } sink = data;" },
+            { "compound-wait",  0, "", "u32 nc = 0; while (@atomic_load(&ready) == 0 && nc < 5) { nc += 1; } sink = data;" },
+            { "wrong-branch",   0, "", "if (@atomic_load(&ready) == 1) { sink = 0; } else { sink = data; }" },
+            { "no-wait",        0, "", "sink = data;" },
+        };
+        static const char *const who_name[HP_COUNT] = { "thread", "spawner" };
+        int nhw = (int)(sizeof(hw) / sizeof(hw[0])), nhr = (int)(sizeof(hr) / sizeof(hr[0]));
+        for (HandWho who = 0; who < HP_COUNT; who++) {
+            for (int wi = 0; wi < nhw; wi++) {
+                /* a `goto` in the SPAWNING function is the window rules' own subject */
+                if (who == HP_SPAWNER && strcmp(hw[wi].nm, "republish-goto") == 0) continue;
+                for (int ri = 0; ri < nhr; ri++) {
+                    int neg = !(hw[wi].ok && hr[ri].ok);
+                    valid_cells++;
+                    char lb[2400], cn[160];
+                    if (who == HP_THREAD)
+                        snprintf(lb, sizeof(lb),
+                            "u32 ready;\nu32 data;\nu32 sink;\n%s%s"
+                            "void writer() {\n    %s\n}\n"
+                            "void reader() {\n    %s\n}\n"
+                            "u32 main() {\n    ThreadHandle a = spawn writer();\n"
+                            "    ThreadHandle b = spawn reader();\n    a.join(); b.join();\n"
+                            "    return 0;\n}\n",
+                            hw[wi].extra, hr[ri].extra, hw[wi].body, hr[ri].body);
+                    else
+                        snprintf(lb, sizeof(lb),
+                            "u32 ready;\nu32 data;\nu32 sink;\n%s%s"
+                            "void reader() {\n    %s\n}\n"
+                            "u32 main() {\n    ThreadHandle b = spawn reader();\n"
+                            "    %s\n    b.join();\n    return 0;\n}\n",
+                            hw[wi].extra, hr[ri].extra, hr[ri].body, hw[wi].body);
+                    snprintf(cn, sizeof(cn), "hand-off/%s/%s/%s", who_name[who], hw[wi].nm, hr[ri].nm);
+                    int ok = neg ? run_neg(cn, lb) : run_pos_check_only(cn, lb);
+                    fprintf(stderr, "  [%-7s][%-17s][%-14s][%s] %s\n", who_name[who], hw[wi].nm,
+                            hr[ri].nm, neg ? "neg" : "pos", ok ? "ok" : "*** FAIL ***");
+                    if (!ok) grid_ok = 0;
+                }
+            }
+        }
+    }
+
+    /* ---- BUG-1665: an incomplete walk orders nothing ----------------------------
+     * The context walk stops at a depth cap. It used to stop in silence, so an
+     * unlocked access some eighty calls deep was accepted (the spawn scan's own
+     * "too deep" finding had been downgraded to a warning by the @atomic in the
+     * thread). depth x locked: a short chain is judged; a long one is refused. */
+    {
+        static const int depths[] = { 20, 100 };
+        for (int di = 0; di < 2; di++) {
+            for (int locked = 0; locked < 2; locked++) {
+                int dn = depths[di];
+                /* (100, locked) is refused too — the walk cannot see that far — and
+                 * is a recorded over-rejection, not a cell */
+                if (dn == 100 && locked) continue;
+                valid_cells++;
+                size_t cap = (size_t)dn * 64 + 1024, len = 0;
+                char *lb = (char *)malloc(cap);
+                if (!lb) { grid_ok = 0; continue; }
+                len += (size_t)snprintf(lb + len, cap - len,
+                    "u32 lk;\nu32 counter;\nvoid fn_%d() { counter += 1; }\n", dn);
+                for (int fi = dn - 1; fi >= 0; fi--)
+                    len += (size_t)snprintf(lb + len, cap - len, "void fn_%d() { fn_%d(); }\n", fi, fi + 1);
+                len += (size_t)snprintf(lb + len, cap - len,
+                    "void w() {\n    while (!@atomic_cas(&lk, 0, 1)) { }\n    %s\n"
+                    "    @atomic_store(&lk, 0);\n    %s\n}\n"
+                    "u32 main() {\n    ThreadHandle a = spawn w();\n    ThreadHandle b = spawn w();\n"
+                    "    a.join(); b.join();\n    return 0;\n}\n",
+                    locked ? "fn_0();" : "", locked ? "" : "fn_0();");
+                char cn[96];
+                snprintf(cn, sizeof(cn), "deep-chain/%d/%s", dn, locked ? "locked" : "unlocked");
+                int ok = locked ? run_pos_check_only(cn, lb) : run_neg(cn, lb);
+                fprintf(stderr, "  [deep-chain][%3d][%-8s][%s] %s\n", dn, locked ? "locked" : "unlocked",
+                        locked ? "pos" : "neg", ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+                free(lb);
+            }
+        }
+    }
+
+    /* ---- BUG-1666: the POINTER-REACH grid ----------------------------------------
+     * "Two accesses of one object, one a write, nothing ordering them" compares
+     * RECORDS, and a record existed only for an access the walk could attribute
+     * to a global by NAME. An access through a reference it could not name was
+     * attributed to nothing. HOW THE THREAD GOT ITS REFERENCE x HOW THE OTHER
+     * THREAD TOUCHES THE OBJECT x THE LOCK: unlocked and half-locked are races;
+     * both under one lock is not (the precision half — the rule must not refuse
+     * the locked form of what it now sees). Oracle: access_alias.v. */
+    fprintf(stderr, "\n  -- pointer reach: how the reference was obtained x who else touches the object --\n");
+    {
+        #define PR_PRE \
+            "u32 flagx;\nu32 lk;\nu32 g;\nu32[4] ga;\nstruct H { ?*u32 p; ?[*]u32 s; }\nH h;\n" \
+            "*u32 gp = &g;\nvoid reaim() { gp = &g; }\n" \
+            "*u32 getp() { return &g; }\n?*u32 geto() { return &g; }\n" \
+            "void set(**u32 pp) { *pp = &g; }\nvoid fill(*H out) { out.p = &g; }\n" \
+            "void bump(*u32 q) { *q += 1; }\n"
+        /* `tgt`: 0 the scalar g, 1 the array element ga[0] */
+        static const struct { const char *name; int tgt; const char *body; } reach[] = {
+            { "loaded from a field",      0, "if (h.p) |q| { *q += 1; }" },
+            { "returned by a call",       0, "*u32 q = getp(); *q += 1;" },
+            { "optional result capture",  0, "?*u32 m = geto(); if (m) |q| { *q += 1; }" },
+            { "re-aimed global pointer",  0, "*gp += 1;" },
+            { "local re-aimed later",     0, "u32 own = 0; *u32 q = &own; q = getp(); *q += 1;" },
+            { "local re-aimed by callee", 0, "u32 own = 0; *u32 q = &own; set(&q); *q += 1;" },
+            { "struct filled by callee",  0, "H hh; fill(&hh); if (hh.p) |q| { *q += 1; }" },
+            { "callee parameter",         0, "bump(getp());" },
+            { "slice loaded from a field", 1, "if (h.s) |s| { s[0] += 1; }" },
+        };
+        static const char *const other_name[] = { "by name", "same reach", "known pointer" };
+        static const char *const lock_name[] = { "unlocked", "both locked", "other locked" };
+        #define PR_L "while (!@atomic_cas(&lk, 0, 1)) { } "
+        #define PR_U " @atomic_store(&lk, 0);"
+        for (size_t ri = 0; ri < sizeof(reach) / sizeof(reach[0]); ri++) {
+            for (int oi = 0; oi < 3; oi++) {
+                for (int li = 0; li < 3; li++) {
+                    valid_cells++;
+                    const char *ob = oi == 1 ? reach[ri].body
+                        : oi == 0 ? (reach[ri].tgt ? "ga[0] += 1;" : "g += 1;")
+                                  : (reach[ri].tgt ? "[*]u32 k = ga; k[0] += 1;" : "*u32 k = &g; *k += 1;");
+                    char code[2048];
+                    snprintf(code, sizeof(code),
+                        PR_PRE
+                        "void t1() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { %s%s%s } }\n"
+                        "void t2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { %s%s%s } }\n"
+                        "u32 main() {\n    h.p = &g; h.s = ga;\n    ThreadHandle a = spawn t1();\n"
+                        "    ThreadHandle b = spawn t2();\n    a.join(); b.join();\n    return 0;\n}\n",
+                        li == 1 ? PR_L : "", reach[ri].body, li == 1 ? PR_U : "",
+                        li ? PR_L : "", ob, li ? PR_U : "");
+                    char cn[160];
+                    snprintf(cn, sizeof(cn), "ptr-reach/%s/%s/%s", reach[ri].name, other_name[oi], lock_name[li]);
+                    int neg = li != 1;
+                    int ok = neg ? run_neg(cn, code) : run_pos_check_only(cn, code);
+                    fprintf(stderr, "  [%-26s][%-13s][%-12s][%s] %s\n", reach[ri].name, other_name[oi],
+                            lock_name[li], neg ? "neg" : "pos", ok ? "ok" : "*** FAIL ***");
+                    if (!ok) grid_ok = 0;
+                }
+            }
+        }
+        #undef PR_PRE
+
+        /* What needs NO record (precision), each unlocked in two threads: the
+         * thread's own stack through a pointer, a callee handed that stack, a
+         * struct on the stack holding a pointer to it, two unrelated types. */
+        static const struct { const char *name; const char *code; } own[] = {
+            { "own stack through a pointer",
+              "u32 flagx;\nu32 lk;\nu32 total;\n"
+              "void t() { @atomic_store(&flagx, 1); u32 x = 0; *u32 q = &x;\n"
+              "    for (u32 i = 0; i < 4; i += 1) { *q += 1; }\n"
+              "    " PR_L "total += x;" PR_U " }\n" },
+            { "callee handed the own stack",
+              "u32 flagx;\nu32 lk;\nu32 total;\nvoid bump(*u32 q) { *q += 1; }\n"
+              "void t() { @atomic_store(&flagx, 1); u32 x = 0;\n"
+              "    for (u32 i = 0; i < 4; i += 1) { bump(&x); }\n"
+              "    " PR_L "total += x;" PR_U " }\n" },
+            { "own array through a slice",
+              "u32 flagx;\nu32 lk;\nu32 total;\n"
+              "void t() { @atomic_store(&flagx, 1); u32[4] a; [*]u32 s = a;\n"
+              "    for (u32 i = 0; i < 4; i += 1) { s[i] += 1; }\n"
+              "    " PR_L "total += s[0];" PR_U " }\n" },
+            { "own struct holding an own pointer",
+              "u32 flagx;\nu32 lk;\nu32 total;\nstruct C { *u32 p; }\n"
+              "void t() { @atomic_store(&flagx, 1); u32 x = 0; C c = { .p = &x };\n"
+              "    for (u32 i = 0; i < 4; i += 1) { *c.p += 1; }\n"
+              "    " PR_L "total += x;" PR_U " }\n" },
+        };
+        for (size_t wi = 0; wi < sizeof(own) / sizeof(own[0]); wi++) {
+            valid_cells++;
+            char code[2048];
+            snprintf(code, sizeof(code),
+                "%su32 main() {\n    ThreadHandle a = spawn t();\n    ThreadHandle b = spawn t();\n"
+                "    a.join(); b.join();\n    return 0;\n}\n", own[wi].code);
+            char cn[160];
+            snprintf(cn, sizeof(cn), "ptr-reach/own/%s", own[wi].name);
+            int ok = run_pos_check_only(cn, code);
+            fprintf(stderr, "  [%-40s][pos] %s\n", own[wi].name, ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+        /* "bound once" (local_value_listed): a SECOND binding of a known name —
+         * an if-capture, a switch-arm capture, an inner block's local — holds a
+         * reference the first binding's answer says nothing about. */
+        static const struct { const char *name; const char *pre; const char *inner; } twice[] = {
+            { "if-capture of the same name",     "struct H { ?*u32 p; }\nH h;\n",
+              "if (h.p) |q| { *q += 1; }" },
+            { "switch capture of the same name", "union U { *u32 p; u32 n; }\nU gu;\n",
+              "switch (gu) { .p => |q| { *q += 1; } .n => |k| { own += k; } }" },
+            { "inner block local of the same name", "*u32 getp() { return &g; }\n",
+              "{ *u32 q = getp(); *q += 1; }" },
+        };
+        for (size_t ti = 0; ti < sizeof(twice) / sizeof(twice[0]); ti++) {
+            valid_cells++;
+            char code[2048];
+            snprintf(code, sizeof(code),
+                "u32 flagx;\nu32 g;\n%s"
+                "void t() {\n    @atomic_store(&flagx, 1);\n    u32 own = 0;\n    *u32 q = &own;\n    *q += 1;\n"
+                "    for (u32 i = 0; i < 4; i += 1) { %s }\n}\n"
+                "u32 main() {\n    %s\n    ThreadHandle a = spawn t();\n    ThreadHandle b = spawn t();\n"
+                "    a.join(); b.join();\n    return 0;\n}\n",
+                twice[ti].pre, twice[ti].inner,
+                ti == 0 ? "h.p = &g;" : ti == 1 ? "gu.p = &g;" : "");
+            char cn[160];
+            snprintf(cn, sizeof(cn), "ptr-reach/bound twice/%s", twice[ti].name);
+            int ok = run_neg(cn, code);
+            fprintf(stderr, "  [%-40s][neg] %s\n", twice[ti].name, ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+        /* unrelated types never alias: a typed write of one struct against a
+         * named global of another, and against a typed write of a third */
+        {
+            valid_cells++;
+            const char *code =
+                "u32 flagx;\nu32 lk;\nstruct A { u32 v; }\nstruct Bq { u64 w; }\nA ga;\nBq gb;\n"
+                "*A pa = &ga;\nvoid reaim() { pa = &ga; }\n"
+                "void t1() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { " PR_L "pa.v += 1;" PR_U " } }\n"
+                "void t2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { gb.w += 1; } }\n"
+                "u32 main() {\n    ThreadHandle a = spawn t1();\n    ThreadHandle b = spawn t2();\n"
+                "    a.join(); b.join();\n    return 0;\n}\n";
+            int ok = run_pos_check_only("ptr-reach/unrelated types", code);
+            fprintf(stderr, "  [%-40s][pos] %s\n", "unrelated types", ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+        /* a type NAME is not memory: `@size(T)` beside a typed write of a T */
+        {
+            valid_cells++;
+            const char *code =
+                "u32 flagx;\nu32 lk;\nu32 total;\nstruct A { u32 v; }\nA ga;\n"
+                "*A pa = &ga;\nvoid reaim() { pa = &ga; }\n"
+                "void t1() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { " PR_L "pa.v += 1;" PR_U " } }\n"
+                "void t2() { @atomic_store(&flagx, 1); usize n = @size(A); " PR_L "total += (u32)n;" PR_U " }\n"
+                "u32 main() {\n    ThreadHandle a = spawn t1();\n    ThreadHandle b = spawn t2();\n"
+                "    a.join(); b.join();\n    return 0;\n}\n";
+            int ok = run_pos_check_only("ptr-reach/type name is not memory", code);
+            fprintf(stderr, "  [%-40s][pos] %s\n", "type name is not memory", ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+
+        /* ---- the OWN-HEAP rule (access_alias.v, fresh_stays_own) ----
+         * A fresh `alloc` bound to a name that never lets the reference leave is
+         * the thread's own, like its stack. One publication and it is anyone's
+         * (published_is_shared): the writer keeps writing through the name, the
+         * reader takes the reference under a lock and writes through it. HOW THE
+         * REFERENCE LEAVES: "nowhere" is the one accepted cell. */
+        fprintf(stderr, "\n  -- own heap: how a fresh object's reference leaves its name --\n");
+        static const struct { const char *name; int neg; const char *pub; const char *get; } leak[] = {
+            { "nowhere",                 0, "gh.s = null;",                         "m = gh.s;" },
+            { "a global",                1, "gopt = buf;",                          "m = gopt;" },
+            { "a field of a global",     1, "gh.s = buf;",                          "m = gh.s;" },
+            { "a struct literal",        1, "H2 t = { .s = buf }; gh = t;",         "m = gh.s;" },
+            { "a local copy",            1, "[*]u32 al = buf; gh.s = al;",          "m = gh.s;" },
+            { "a local struct",          1, "H2 t; t.s = buf; gh.s = t.s;",         "m = gh.s;" },
+            { "a sub-slice",             1, "[*]u32 al = buf[1..9]; gh.s = al;",    "m = gh.s;" },
+            { "its .ptr",                1, "gh.e = buf.ptr;",                      "me = gh.e;" },
+            { "a helper that keeps it",  1, "stash(buf);",                          "m = gh.s;" },
+            { "a helper that returns it", 1, "[*]u32 al = same(buf); gh.s = al;",   "m = gh.s;" },
+        };
+        for (size_t ki = 0; ki < sizeof(leak) / sizeof(leak[0]); ki++) {
+            valid_cells++;
+            char code[3072];
+            snprintf(code, sizeof(code),
+                "u32 flagx;\nu32 lk;\nstruct H2 { ?[*]u32 s; ?*u32 e; }\nH2 gh;\n?[*]u32 gopt = null;\n"
+                "void stash(keep [*]u32 s) { gh.s = s; }\n[*]u32 same([*]u32 s) { return s; }\n"
+                "void wr() {\n    @atomic_store(&flagx, 1);\n    [*]u32 buf = alloc(u32, 64) orelse return;\n"
+                "    " PR_L "%s" PR_U "\n"
+                "    for (u32 r = 0; r < 4; r += 1) { buf[0] += 1; }\n%s}\n"
+                "void rd() {\n    @atomic_store(&flagx, 1);\n    for (u32 r = 0; r < 4; r += 1) {\n"
+                "        ?[*]u32 m = null;\n        ?*u32 me = null;\n"
+                "        " PR_L "%s" PR_U "\n"
+                "        if (m) |s| { s[0] += 1; }\n        if (me) |e| { *e += 1; }\n    }\n}\n"
+                "u32 main() {\n    ThreadHandle a = spawn wr();\n    ThreadHandle b = spawn rd();\n"
+                "    a.join(); b.join();\n    return 0;\n}\n",
+                leak[ki].pub, leak[ki].neg ? "" : "    free(buf);\n", leak[ki].get);
+            char cn[160];
+            snprintf(cn, sizeof(cn), "own-heap/leaves to %s", leak[ki].name);
+            int ok = leak[ki].neg ? run_neg(cn, code) : run_pos_check_only(cn, code);
+            fprintf(stderr, "  [%-26s][%s] %s\n", leak[ki].name, leak[ki].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+        /* one object from `alloc(T)`: its allocator is not thread-safe, so the
+         * calls take the lock; the object is the thread's own outside it */
+        {
+            static const struct { const char *name; int neg; const char *a, *f; } node[] = {
+                { "allocator locked, object unlocked", 0, PR_L "*N n = alloc(N) orelse return;" PR_U, PR_L "free(n);" PR_U },
+                { "allocator unlocked",                1, "*N n = alloc(N) orelse return;", "free(n);" },
+                { "slab pointer, allocator locked",    0, PR_L "*N n = ns.alloc_ptr() orelse return;" PR_U, PR_L "ns.free_ptr(n);" PR_U },
+            };
+            for (size_t ni = 0; ni < sizeof(node) / sizeof(node[0]); ni++) {
+                valid_cells++;
+                char code[2048];
+                snprintf(code, sizeof(code),
+                    "u32 flagx;\nu32 lk;\nu32 total;\nstruct N { u32 v; u32[4] arr; }\nSlab(N) ns;\n"
+                    "void t() {\n    @atomic_store(&flagx, 1);\n    %s\n"
+                    "    for (u32 i = 0; i < 4; i += 1) { n.v += 1; n.arr[i] = n.v; }\n"
+                    "    " PR_L "total += n.v;" PR_U "\n    %s\n}\n"
+                    "u32 main() {\n    ThreadHandle a = spawn t();\n    ThreadHandle b = spawn t();\n"
+                    "    a.join(); b.join();\n    return 0;\n}\n", node[ni].a, node[ni].f);
+                char cn[160];
+                snprintf(cn, sizeof(cn), "own-heap/%s", node[ni].name);
+                int ok = node[ni].neg ? run_neg(cn, code) : run_pos_check_only(cn, code);
+                fprintf(stderr, "  [%-36s][%s] %s\n", node[ni].name, node[ni].neg ? "neg" : "pos",
+                        ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
+        }
+
+        /* ---- BUG-1667: a builtin container method runs INSIDE its receiver ----
+         * `pool.alloc()` rewrites the used map; the walk recorded only the READ
+         * of the receiver's name that walking the callee makes, so two threads
+         * allocating from one Pool met as two readers (TSan: races, and the slab
+         * traps on its corrupted bookkeeping). CONTAINER x LOCK. */
+        fprintf(stderr, "\n  -- container methods: which container x the lock --\n");
+        static const struct { const char *name; const char *body; } cont[] = {
+            { "Pool alloc/free",        "Handle(N) x = pl.alloc() orelse return; pl.free(x);" },
+            { "Slab alloc/free",        "Handle(N) x = sl.alloc() orelse return; sl.free(x);" },
+            { "Slab alloc_ptr/free_ptr", "*N x = sl.alloc_ptr() orelse return; sl.free_ptr(x);" },
+            { "T.alloc/T.free",         "Handle(N) x = N.alloc() orelse return; N.free(x);" },
+            { "alloc(T)/free",          "*N x = alloc(N) orelse return; free(x);" },
+            { "Ring push/pop",          "rg.push(i); u32 y = rg.pop() orelse 0; sink(y);" },
+            { "Arena alloc",            "?*N x = ar.alloc(N); if (x) |q| { sink(1); }" },
+            { "Arena reset",            "ar.reset();" },
+        };
+        for (size_t ci = 0; ci < sizeof(cont) / sizeof(cont[0]); ci++) {
+            for (int locked = 0; locked < 2; locked++) {
+                valid_cells++;
+                char code[2048];
+                snprintf(code, sizeof(code),
+                    "u32 flagx;\nu32 lk;\nstruct N { u32 v; }\nPool(N, 8) pl;\nSlab(N) sl;\nRing(u32, 8) rg;\n"
+                    "u8[1024] mem;\nArena ar;\nvoid sink(u32 v) { }\n"
+                    "void t() {\n    @atomic_store(&flagx, 1);\n    for (u32 i = 0; i < 4; i += 1) {\n"
+                    "        %s%s%s\n    }\n}\n"
+                    "u32 main() {\n    ar = Arena.over(mem);\n    ThreadHandle a = spawn t();\n"
+                    "    ThreadHandle b = spawn t();\n    a.join(); b.join();\n    return 0;\n}\n",
+                    locked ? PR_L : "", cont[ci].body, locked ? PR_U : "");
+                char cn[160];
+                snprintf(cn, sizeof(cn), "container-method/%s/%s", cont[ci].name, locked ? "locked" : "unlocked");
+                int ok = locked ? run_pos_check_only(cn, code) : run_neg(cn, code);
+                fprintf(stderr, "  [%-24s][%-8s][%s] %s\n", cont[ci].name, locked ? "locked" : "unlocked",
+                        locked ? "pos" : "neg", ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
+        }
+        /* the allocator call under a lock against a Handle dereference outside it
+         * (the dereference reads the generation table the call rewrites) */
+        for (int locked = 0; locked < 2; locked++) {
+            valid_cells++;
+            char code[2048];
+            snprintf(code, sizeof(code),
+                "u32 flagx;\nu32 lk;\nstruct N { u32 v; }\nSlab(N) sl;\n?Handle(N) gh = null;\n"
+                "void mk() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) {\n"
+                "    " PR_L "?Handle(N) x = sl.alloc(); if (x) |hx| { sl.free(hx); }" PR_U " } }\n"
+                "void us() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) {\n"
+                "    %sif (gh) |hh| { hh.v += 1; }%s } }\n"
+                "u32 main() {\n    gh = sl.alloc();\n    ThreadHandle a = spawn mk();\n"
+                "    ThreadHandle b = spawn us();\n    a.join(); b.join();\n    return 0;\n}\n",
+                locked ? PR_L : "", locked ? PR_U : "");
+            const char *nm = locked ? "container-method/alloc vs handle use/locked"
+                                    : "container-method/alloc vs handle use/unlocked";
+            int ok = locked ? run_pos_check_only(nm, code) : run_neg(nm, code);
+            fprintf(stderr, "  [%-24s][%-8s][%s] %s\n", "alloc vs Handle use", locked ? "locked" : "unlocked",
+                    locked ? "pos" : "neg", ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+
+        /* ---- BUG-1668: a `static` local is ONE object for every thread ----
+         * The spawn scan knows it; the walk that judges a thread using an @atomic
+         * bound it like any local — the thread's own. HOW IT IS TOUCHED x LOCK. */
+        fprintf(stderr, "\n  -- static locals: how the object is touched x the lock --\n");
+        static const struct { const char *name; const char *pre; const char *body; } stl[] = {
+            { "scalar by name",       "", "static u32 c; %sc += 1;%s" },
+            { "struct field",         "struct St { u32 hits; u32 miss; }\n", "static St st; %sst.hits += 1;%s" },
+            { "array element",        "", "static u32[4] cs; %scs[1] += 1;%s" },
+            { "through a pointer",    "", "static u32 c; *u32 p = &c; %s*p += 1;%s" },
+            /* (the view is formed INSIDE the region: taking a view of an array
+             * counts as a read of it, for a global as for a static) */
+            { "through a slice",      "", "static u32[4] cs; %s[*]u32 s = cs; s[0] += 1;%s" },
+            { "handed to a callee",   "void inc(*u32 p) { *p += 1; }\n", "static u32 c; %sinc(&c);%s" },
+            { "a Pool",               "struct N { u32 v; }\n", "static Pool(N, 4) sp; %sHandle(N) x = sp.alloc() orelse return; sp.free(x);%s" },
+        };
+        for (size_t si = 0; si < sizeof(stl) / sizeof(stl[0]); si++) {
+            for (int locked = 0; locked < 2; locked++) {
+                valid_cells++;
+                char body[512], code[2048];
+                snprintf(body, sizeof(body), stl[si].body, locked ? PR_L : "", locked ? PR_U : "");
+                snprintf(code, sizeof(code),
+                    "u32 flagx;\nu32 lk;\n%s"
+                    "void t() {\n    @atomic_store(&flagx, 1);\n    for (u32 i = 0; i < 4; i += 1) { %s }\n}\n"
+                    "u32 main() {\n    ThreadHandle a = spawn t();\n    ThreadHandle b = spawn t();\n"
+                    "    a.join(); b.join();\n    return 0;\n}\n", stl[si].pre, body);
+                char cn[160];
+                snprintf(cn, sizeof(cn), "static-local/%s/%s", stl[si].name, locked ? "locked" : "unlocked");
+                int ok = locked ? run_pos_check_only(cn, code) : run_neg(cn, code);
+                fprintf(stderr, "  [%-20s][%-8s][%s] %s\n", stl[si].name, locked ? "locked" : "unlocked",
+                        locked ? "pos" : "neg", ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
+        }
+        {
+            /* an atomic cell: atomic against atomic is no race, against a plain access it is */
+            static const struct { const char *name; int neg; const char *b2; } atm[] = {
+                { "atomic in both",   0, "@atomic_add(&c, 1);" },
+                { "atomic vs plain",  1, "c += 1;" },
+            };
+            for (size_t ai = 0; ai < 2; ai++) {
+                valid_cells++;
+                char code[2048];
+                snprintf(code, sizeof(code),
+                    "u32 flagx;\nvoid cell(bool plain) { static u32 c; if (plain) { %s } else { @atomic_add(&c, 1); } }\n"
+                    "void t1() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { cell(false); } }\n"
+                    "void t2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 4; i += 1) { cell(true); } }\n"
+                    "u32 main() {\n    ThreadHandle a = spawn t1();\n    ThreadHandle b = spawn t2();\n"
+                    "    a.join(); b.join();\n    return 0;\n}\n", atm[ai].b2);
+                char cn[160];
+                snprintf(cn, sizeof(cn), "static-local/%s", atm[ai].name);
+                int ok = atm[ai].neg ? run_neg(cn, code) : run_pos_check_only(cn, code);
+                fprintf(stderr, "  [%-20s][%-8s][%s] %s\n", atm[ai].name, "", atm[ai].neg ? "neg" : "pos",
+                        ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
+        }
+        #undef PR_L
+        #undef PR_U
     }
 
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);

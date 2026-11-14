@@ -24,12 +24,20 @@ COPY tests/ tests/
 COPY rust_tests/ rust_tests/
 COPY zig_tests/ zig_tests/
 COPY scripts/ scripts/
+# The doc audits `make check` runs (audit_limitations, audit_docs_budget,
+# audit_reference_examples) READ these. A script wired into `make check` whose
+# input is not copied here passes natively and fails only in this image, and
+# every gate after it then never runs (BUG-1662).
+COPY CLAUDE.md ./
+COPY docs/ docs/
 
-# Fix CRLF line endings from Windows git checkout
+# Fix CRLF line endings from Windows git checkout (.md too: the doc budgets
+# count bytes, and reference.md's examples are compiled)
 RUN find . -name "*.sh" -exec sed -i 's/\r$//' {} + && \
     find . -name "*.zer" -exec sed -i 's/\r$//' {} + && \
     find . -name "*.c" -exec sed -i 's/\r$//' {} + && \
-    find . -name "*.h" -exec sed -i 's/\r$//' {} +
+    find . -name "*.h" -exec sed -i 's/\r$//' {} + && \
+    find . -name "*.md" -exec sed -i 's/\r$//' {} +
 
 # Build and test
 CMD ["make", "check"]

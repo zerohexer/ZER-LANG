@@ -566,6 +566,29 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   member before), `test_modules/cond_user` + `cond_mod` (GCC error before; wired into
   `run_tests.sh`). `vigilant-tesla-ef9cao` had fixed half of (a).
 
+**The gate itself (2026-11-14, found by running it)**
+- **BUG-1662 — `make docker-check` stopped at the first doc audit and ran none of the gates
+  after it.** Measured on main (01bdaf2c): `MAKE_CHECK_EXIT=2`, `FAIL — docs/limitations.md
+  not found`, `make: *** [Makefile:250: check] Error 1`. Eight of the fourteen verdict lines
+  were printed; the six missing ones are the limitations ledger, the docs budget, the emit
+  audit, the flag-handler matrix, the sink matrix and the reference examples. Root cause:
+  `docker-check` runs `make check` in an image built from the Dockerfile's COPY list, and
+  `.dockerignore` has excluded `docs/` and every root `*.md` since 2026-03-25. Three scripts
+  in `make check` read those files and fail hard when one is missing —
+  `audit_reference_examples.sh` (wired 2026-08-26, the last step), `audit_limitations.sh`
+  (2026-11-13) and `audit_docs_budget.sh` (2026-11-14). Each was verified with a native
+  `make check`, where the files are there. So on the documented Windows path the run has not
+  been able to exit 0 since 2026-08-26, and since 2026-11-13 it also skipped three gates that
+  read no doc at all. Fix: the image carries what the gate reads — `COPY CLAUDE.md` and
+  `COPY docs/` in the Dockerfile, `docs/` no longer ignored and `!CLAUDE.md` excepted in
+  `.dockerignore`; and the CRLF step normalises `*.md` too, because the budgets count bytes
+  (a CRLF checkout of `compiler-internals.md` is over its budget by its line count) and
+  `reference.md`'s examples are compiled. Test: `make docker-check` itself — after the fix
+  `MAKE_CHECK_EXIT=0` with all fourteen verdict lines; inside the image a `## CLOSED` heading
+  appended to `docs/limitations.md` turns `audit_limitations.sh` red, and files converted to
+  CRLF are brought back under budget by the Dockerfile's own `find … sed` line. NOT measured:
+  a real Windows checkout (the CRLF path was simulated inside the Linux image).
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

@@ -556,34 +556,6 @@ ir_lower.c:rewrite_capture_name:NODE_GLOBAL_VAR:var_decl.init
 ir_lower.c:rewrite_capture_name:NODE_INTERRUPT:interrupt.body
 ir_lower.c:rewrite_capture_name:NODE_SPAWN:spawn_stmt.args
 
-# --- ir_lower.c: rewrite_defer_body_idents ---
-ir_lower.c:rewrite_defer_body_idents:NODE_ASM:asm_stmt.inputs
-ir_lower.c:rewrite_defer_body_idents:NODE_ASM:asm_stmt.outputs
-ir_lower.c:rewrite_defer_body_idents:NODE_ASSIGN:assign.target
-ir_lower.c:rewrite_defer_body_idents:NODE_ASSIGN:assign.value
-ir_lower.c:rewrite_defer_body_idents:NODE_AWAIT:await_stmt.cond
-ir_lower.c:rewrite_defer_body_idents:NODE_BINARY:binary.left
-ir_lower.c:rewrite_defer_body_idents:NODE_BINARY:binary.right
-ir_lower.c:rewrite_defer_body_idents:NODE_CALL:call.args
-ir_lower.c:rewrite_defer_body_idents:NODE_CALL:call.callee
-ir_lower.c:rewrite_defer_body_idents:NODE_FIELD:field.object
-ir_lower.c:rewrite_defer_body_idents:NODE_FILE:file.decls
-ir_lower.c:rewrite_defer_body_idents:NODE_FUNC_DECL:func_decl.body
-ir_lower.c:rewrite_defer_body_idents:NODE_GLOBAL_VAR:var_decl.init
-ir_lower.c:rewrite_defer_body_idents:NODE_INDEX:index_expr.index
-ir_lower.c:rewrite_defer_body_idents:NODE_INDEX:index_expr.object
-ir_lower.c:rewrite_defer_body_idents:NODE_INTERRUPT:interrupt.body
-ir_lower.c:rewrite_defer_body_idents:NODE_INTRINSIC:intrinsic.args
-ir_lower.c:rewrite_defer_body_idents:NODE_ORELSE:orelse.expr
-ir_lower.c:rewrite_defer_body_idents:NODE_ORELSE:orelse.fallback
-ir_lower.c:rewrite_defer_body_idents:NODE_SLICE:slice.end
-ir_lower.c:rewrite_defer_body_idents:NODE_SLICE:slice.object
-ir_lower.c:rewrite_defer_body_idents:NODE_SLICE:slice.start
-ir_lower.c:rewrite_defer_body_idents:NODE_SPAWN:spawn_stmt.args
-ir_lower.c:rewrite_defer_body_idents:NODE_STATIC_ASSERT:static_assert_stmt.cond
-ir_lower.c:rewrite_defer_body_idents:NODE_STRUCT_INIT:struct_init.fields
-ir_lower.c:rewrite_defer_body_idents:NODE_TYPECAST:typecast.expr
-ir_lower.c:rewrite_defer_body_idents:NODE_UNARY:unary.operand
 
 # --- ir_lower.c: rewrite_idents ---
 ir_lower.c:rewrite_idents:NODE_ASM:asm_stmt.inputs

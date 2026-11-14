@@ -5054,6 +5054,18 @@ u32 main() {
 }
 ```
 
+**STRUCTURAL RULES (both forms)**
+A block holds **at most 16 instructions** and **no label**. Both rules read the text
+the assembler will see — the string literals' contents with their escapes decoded —
+so the separator may be a `;`, a line break, or an escape (`\n`, `\x0a`), in the
+structured `instructions:` string and in the inline `asm("...")` form alike. An asm string
+takes the escapes of any ZER string (`\n \t \r \\ \" \0 \xHH`); it is written into the
+generated C so that C reads the same bytes.
+A trailing separator or a blank line is not an instruction. A label is a statement's
+first token followed by `:`, in any assembler spelling (`again:`, `.L1:`, `1:`).
+These are audit rules over a block's shape, not a control-flow guarantee: split a
+longer sequence into several blocks, and express branching in ZER (`if` / `while`).
+
 **WHEN TO USE**
 - Prefer `@intrinsic()` calls — verified, safe, portable across archs.
 - Use `asm` only for operations not yet covered by intrinsics (new vendor extensions, experimental hardware, niche use cases).
@@ -5739,14 +5751,15 @@ void stack_push(*Stack(u32) s, u32 val) {
 ```
 
 **NOTES**
-- T substitution works in: `T`, `*T`, `?T`, `[*]T`, `T[N]`, and `Handle(T)` field types
-  (including nested — `?Handle(T)`, `Handle(T)[N]`, and a container field holding
-  another container over the same T).
-- `Pool(T, N)`, `Slab(T)` and `Ring(T, N)` are NOT supported as container fields —
-  the compiler cannot stamp their inline storage for a monomorphized container.
-  `Handle(T)` works because a Handle is a `u64` (index + generation), so the
-  stamped struct needs no per-T layout. Declare the allocator as a global and
-  store `Handle(T)` in the container instead.
+- T substitution works in every field type that can mention it: `T`, `*T`, `?T`,
+  `[*]T`, `T[N]`, `Handle(T)`, another container over T, and a function pointer
+  whose parameters or return type mention T — `*(T) -> u32 cb;`,
+  `?*(*T, u32) -> void fix;` (nested forms included).
+- A container field obeys the rules of a struct field: no `void` field, no
+  duplicate name, no async task held by value, and **`Pool`, `Slab`, `Ring` and
+  `Arena` cannot be a field** ("cannot be container fields") — an allocator is
+  storage with an identity, always a global. Declare it as a global and keep a
+  `Handle(T)` (a `u64`: index + generation) or an index in the container.
 - Instances cached — same `Stack(u32)` reuses cached stamp.
 - NOT generics — no type constraints, no SFINAE.
 - Type ARGUMENT must be a plain named type (primitive or struct/enum/union).

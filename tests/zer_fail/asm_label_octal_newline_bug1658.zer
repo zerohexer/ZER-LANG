@@ -1,0 +1,11 @@
+// expect-error: contains a label
+// BUG-1658: `\012`. When the string reached C verbatim this was an OCTAL line break
+// to the assembler and nothing to the rule. It is emitted as ZER reads it now — a NUL,
+// then "12" — and what follows a NUL is still judged, never trusted to be cut off.
+naked void spin() {
+    asm {
+        instructions: "nop\012again: jmp again"
+        safety: "structural asm rule test: the text here is never meant to be assembled"
+    }
+}
+u32 main() { return 0; }

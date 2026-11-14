@@ -9,7 +9,6 @@ so does a file past its size budget (`tools/audit_docs_budget.sh`).
 |---|---|
 | **this file** | what is open NOW — each entry measured, with a reproducer or a pointer to one |
 | `docs/limitations-closed.md` | entries that were closed, moved here verbatim. Append-only. Never read whole: `grep -n "BUG-1651" docs/limitations-closed.md` |
-| `docs/limitations-legacy.md` | entries written before 2026-09-11 that nobody has re-measured. HYPOTHESES, not facts — see its header |
 | `BUGS-FIXED.md` | the fix ledger (symptom, root cause, fix, test) |
 
 **Writing an entry.** Symptom, the smallest reproducer (or its `tests/zer_gaps/` file), root
@@ -27,7 +26,10 @@ loud (GCC or a trap reports it), or floor (outside the language).
    memory — once a gate carries the knowledge, nothing needs to cite the closed entry again.
 
 **A citation to a section that is not here** (other docs cite `docs/limitations.md "<title>"`):
-the section was closed or is legacy — grep the title in the two files above.
+the section was closed — grep the title in `docs/limitations-closed.md`. The old
+`docs/limitations-legacy.md` (unmeasured pre-2026-09 entries) was triaged and deleted on
+2026-11-14; its sections are in the closed archive under `[ARCHIVED 2026-11-14]` headings,
+behind the measurement record "LEGACY LEDGER RETIRED 2026-11-14".
 
 ---
 
@@ -48,16 +50,71 @@ the section was closed or is legacy — grep the title in the two files above.
   rework (`docs/option_e_plan.md`). For true naked code today, write the stub in C and
   bring it in with `cinclude`. (An earlier revision of this entry called it a silent
   miscompile; that was wrong — the probe had grepped for errors only.)
-- **Bare-metal `.bss` zeroing is a build-system contract** — auto-zero of globals relies on
-  the startup code clearing `.bss`. Not re-measured in the 2026-11-13 split; see legacy
-  "Bare-metal: `.bss` zeroing requirement".
+- **Bare-metal `.bss` zeroing is a build-system contract (floor).** "Everything is
+  auto-zeroed" holds for globals only if the startup code clears `.bss` before `main`. A
+  hosted C runtime does; on bare metal the user's linker script and startup assembly must
+  (the usual `__bss_start` .. `__bss_end` loop). ZER cannot enforce this from inside the
+  emitted code: if the target's startup does not zero `.bss`, every guarantee about a
+  global's initial state is void.
+- **A `*opaque` that comes from C is tracked by a NAME heuristic (floor: `cinclude`).** A
+  bodyless `void f(*opaque)` and a bodyless function whose name contains a destructor word
+  (free, destroy, close, release, delete, dispose, drop, cleanup, deinit, fini, shutdown,
+  term) are assumed to free their argument; a C destructor with an idiosyncratic name and
+  no visible body is not recognised. Wrap it in a ZER function, whose body the analysis can
+  read. **`--track-cptrs` is NOT a run-time backup for this**: its double-free check runs
+  (inside the `malloc` / `free` wrappers), but its use-after-free check, `_zer_check_alive`,
+  is emitted and never called from a function body (measured 2026-11-14 — zero call sites
+  in the emitted C for `@ptrcast(*T, o)` and `(*T)o`). It is not wired on purpose: the check
+  reads a 16-byte header in front of the pointer, which is itself an out-of-bounds read for
+  any `*opaque` that did not come from the wrapped `malloc` (the address of a global, a
+  stack object, an interior pointer) and a read of freed memory for one that did.
+- **An intrinsic's result carries no value range (precision only).** `u32 i = @popcount(x);
+  tbl[i]` with `u8[33] tbl` is not proven in range although the result is at most 32; the
+  index keeps its run-time guard, so nothing is unsafe — the check is just not elided.
+- **The text of an `asm` block is a floor.** The Z-rules guard the typed operands; the
+  structural rules (16 instructions, no label — one reading for both forms since BUG-1658)
+  are audit rules over the block's shape. A jump to a symbol defined elsewhere, a computed
+  jump, or a directive that defines a symbol without a colon is not seen: recognising those
+  needs the per-instruction tables Option E delegates to GCC.
 - **Proof coverage** — what is and is not machine-checked for the data-race class is entry
   B2 below; `proofs/vst/verif_window_rules.v` is written and has never been compiled.
-- **The legacy file is a triage queue.** Each of its entries is either promoted here with a
-  measurement and a reproducer, or moved to the closed archive with the measurement that
-  shows it is gone.
 
 
+
+## OPEN — measured while retiring the legacy ledger (2026-11-14; BUG-1658..1661)
+
+Each item was run on the build that carries BUG-1658..1661. None is accept-unsafe.
+
+1. **`orelse` with a value or block fallback inside a `defer` body is refused**
+   (over-rejection). `defer cleanup(maybe() orelse 0);` and `defer { u32 z = none() orelse
+   g; }` report *"cannot use 'orelse' with a value/block fallback inside a defer body"*.
+   The ban dates from when a defer body was emitted from raw AST by an emitter with no
+   orelse arm; the body is real IR now (refactor L, stage 2), so the reason is gone, but
+   lifting a ban is a RELAXATION and has not been done. Rewrite: compute the value before
+   the `defer`, or use `if (opt) |v| { … }` in the body.
+2. **`@truncate` / `@saturate` do not fold in a `comptime` function body** (over-rejection):
+   `comptime u32 TR() { u32 x = 300; return @truncate(u8, x); }` reports *"body could not be
+   evaluated at compile time"*. A C-style cast does fold (`u8 y = (u8)x;`) — use it.
+3. **A call whose callee returns only literals is treated as possibly returning its
+   argument** (over-rejection, precision of the return summary):
+   ```zer
+   const [*]u8 pick(const [*]u8 unused) { return "literal"; }
+   const [*]u8 via() { u8[4] b; return pick(b); }   // "stack memory may escape through function return"
+   ```
+   A literal return has no provenance, so the summary could classify it static
+   (`ret_param_mask` 0), as `return null` already is. Real precision work on
+   `call_result_static_given_args`, and a relaxation.
+4. **Two emitter refactors are unfinished (architectural debt, no known defect).**
+   *L, stage 3*: `emit_defer_stmt`, the last raw-AST statement emitter, still exists; a
+   defer body is lowered to IR at registration and every fire clones that template, but the
+   raw path is kept for the forms below. *M*: five bounds auto-guards are still spliced as
+   C by `emit_auto_guards` instead of being IR branches — the ones in a loop condition or
+   an `await` condition (re-evaluated, so a guard hoisted before the statement would be
+   checked once) and the ones whose early return needs a zero value of an optional or
+   struct type. The risk of both is the class they were started to remove: a safety rule
+   that must be implemented twice. Design and measurements:
+   `docs/limitations-closed.md`, "[ARCHIVED 2026-11-14] OPEN — BRANCH
+   `loving-davinci-ii7a90`", sections L and M.
 
 ## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1643; measured, reproducers in `tests/zer_gaps/`)
 
@@ -1215,3 +1272,49 @@ walks, not just this one.
 **Tripwire:** `tests/zer_fail/resource_walk_stopped_100_deep.zer`.
 
 ---
+
+---
+
+## OPEN — WASM CLI: multi-file imports + macOS terminal zerc (LOW–MEDIUM; NOT re-measured 2026-11-14)
+
+> **Carried over from the retired legacy ledger without a measurement.** Verifying it needs
+> the emscripten build of `zer_wasm.c` and the editor bridge, neither of which is available
+> in the environment the 2026-11-14 triage ran in. Treat it as a hypothesis until someone
+> runs the wasm CLI on a two-file program.
+
+> **NOTE 2026-08-10 — the original Defender motivation no longer reproduces for the
+> maintainer.** The WASM bridge exists because unsigned mingw PEs tripped Defender
+> `Wacatac.B!ml` (CLAUDE.md "VS Code Extension (VSIX) Build"); the shipping VSIX is now
+> reported to install and run with no scan. That is a single-machine observation, not a
+> general guarantee — do NOT rip out the WASM bridge on the strength of it. **The two
+> gaps below are FUNCTIONAL and independent of the scanning question:** multi-file
+> `import` genuinely does not resolve through the wasm CLI/LSP regardless of why the
+> wasm path exists. This entry stays canon.
+
+
+The VS Code extension ships the compiler as WebAssembly (`zer_wasm.c` →
+`lsp/zer.wasm`, driven by `lsp/server.js` and `lsp/zerc-cli.js`). As of
+2026-06-16 the flag plumbing, `--emit-ir`, and full LSP safety parity are DONE
+(`zer_set_target` carries `--target-bits/-arch/-features`, `--no-strict-mmio`,
+`--stack-limit`; `zer_emit_ir`; `zer_diagnostics_json` runs `zercheck_ir` and
+`server.js` merges its stderr into editor diagnostics). Two gaps remain:
+
+- **Single-file only:** `zer_emit_c`/`zer_diagnostics_json` set
+  `import_asts = NULL` and process one `file_node`. Multi-module programs
+  (`import`) won't resolve cross-module symbols through the wasm CLI/LSP. Native
+  zerc handles modules (topological emit across files). Fix sketch: thread a
+  node-side import resolver (read imported `.zer` by path, parse, pass the AST
+  array in) — emscripten `NODERAWFS` would let the checker's `fopen`-based
+  import loader work directly, or pass `import_asts`/`import_ast_count` built in
+  JS. Largest remaining piece; needs replicating zerc_main's module loop.
+- **macOS terminal `zerc` dropped:** the wasm VSIX bundles a signed Windows
+  `node.exe` for `zerc.cmd` and keeps a native `linux-x64` `zerc`, but no darwin
+  CLI build remains. macOS LSP still works (wasm via Electron-node); only the
+  macOS *terminal* `zerc` is absent. Fix sketch: bundle a signed darwin node +
+  a `zerc` shell shim.
+- **Cosmetic:** the CLI prints some checker errors twice (checker records
+  certain diagnostics twice); pre-existing, not wasm-specific.
+
+Cross-arch caveat: `--target-arch aarch64|riscv64` configures the *checker*
+correctly, but the wasm CLI compiles with the bundled **x86_64** gcc — actual
+cross-compilation needs a cross-gcc the bundle doesn't ship.

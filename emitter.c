@@ -662,8 +662,6 @@ static bool expr_needs_single_eval(Emitter *e, Node *n, IRFunc *func) {
 
 /* ---- Type emission ---- */
 static void prescan_async_temps(Emitter *e, Node *node);
-static bool is_condvar_type(Emitter *e, uint32_t type_id);
-
 /* Refactor 3: unified shared struct ensure-init emission.
  * Emits _zer_mtx_ensure_init[_cv] for a shared struct access.
  * Handles both condvar and non-condvar types, pointer and direct access.
@@ -673,7 +671,7 @@ static void emit_shared_ensure_init(Emitter *e, Node *root, const char *arrow) {
     Type *rte = rt ? type_unwrap_distinct(rt) : NULL;
     if (rte && rte->kind == TYPE_POINTER) rte = type_unwrap_distinct(rte->pointer.inner);
     bool needs_cv = rte && rte->kind == TYPE_STRUCT &&
-        is_condvar_type(e, rte->struct_type.type_id);
+        rte->struct_type.uses_condvar;   /* BUG-1661: the checker's fact */
     if (needs_cv) {
         emit(e, "_zer_mtx_ensure_init_cv(&");
         emit_expr(e, root);
@@ -1025,7 +1023,6 @@ static Node *find_shared_root(Emitter *e, Node *expr) {
     return found;
 }
 
-static bool is_condvar_type(Emitter *e, uint32_t type_id); /* forward decl */
 static bool is_async_local(Emitter *e, const char *name, size_t len); /* forward decl */
 
 
@@ -6282,7 +6279,7 @@ static void emit_struct_decl(Emitter *e, Node *node) {
             Type *st = checker_get_type(e->checker, (Node *)node);
             bool needs_condvar = false;
             if (st && st->kind == TYPE_STRUCT)
-                needs_condvar = is_condvar_type(e, st->struct_type.type_id);
+                needs_condvar = st->struct_type.uses_condvar;   /* BUG-1661 */
             /* BUG-473: all shared structs use recursive pthread_mutex_t.
              * Lazy-init via _zer_mtx_inited flag (auto-zeroed). */
             emit_indent(e); emit(e, "pthread_mutex_t _zer_mtx;\n");
@@ -6487,13 +6484,71 @@ static const char *asm_register_to_gcc_constraint(const char *name, size_t len) 
  * Each operand: "=CONSTRAINT"(expr) for outputs, "CONSTRAINT"(expr) for inputs.
  * Clobbers are quoted strings.
  * Safety string emitted as a preceding comment for audit-trail visibility. */
+/* Free user text written INSIDE a C block comment (BUG-1658). The asm `safety:`
+ * string is the only such text the emitter writes — every other comment carries an
+ * identifier — and it went out verbatim, so a safety string containing the two
+ * characters that END a block comment closed it: whatever followed was C the
+ * checker never saw, compiled into the program (`safety: "... (close) g = 99;
+ * (open) ..."` ran the assignment). The text is kept readable and can no longer
+ * terminate the comment: the closing pair is written with a space inside it. */
+static void emit_comment_text(Emitter *e, const char *s, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        /* A line break never goes out: C removes a backslash-newline BEFORE it
+         * recognises comments, and the driver compiles with -std=c99, where the
+         * trigraph `??/` IS a backslash — so `*??/<newline>/` in the text became
+         * the terminator after the first version of this fix (measured: the
+         * injected statement ran). With no newline in the text there is no
+         * splice, and no trigraph or digraph spells `*` or `/`. */
+        if (s[i] == '\n' || s[i] == '\r') { emit(e, " "); continue; }
+        if (s[i] == '/' && i > 0 && s[i - 1] == '*') emit(e, " ");
+        emit(e, "%c", s[i]);
+    }
+}
+
+/* User text written INSIDE a C string literal goes through emit_c_string_text
+ * (BUG-1350 / 1583: `?` as `\?` so no trigraph forms, a raw line break as `\n`,
+ * ZER's fixed-width escapes closed so C reads the same bytes). Ordinary string
+ * literals always did; these did not (BUG-1658): the asm `instructions:` string,
+ * a clobber name, a `section("...")` name and the inline `asm("...")` literals
+ * were copied between the quotes verbatim, so `"nop??/"` ended in a backslash
+ * that escaped the closing quote — the C string then ran on into whatever
+ * followed, and the next user string was compiled as CODE. One helper for all. */
+static void emit_c_string_lit(Emitter *e, const char *t, size_t n) {
+    emit(e, "\"");
+    emit_c_string_text(e, t, (int)n);
+    emit(e, "\"");
+}
+
+/* The inline form's argument is a run of string literals (the checker refuses
+ * anything else, BUG-1580): re-emit each one through the same escaper. */
+static void emit_inline_asm(Emitter *e, Node *a) {
+    const char *q = a->asm_stmt.code;
+    const char *qe = q + a->asm_stmt.code_len;
+    bool any = false;
+    emit(e, "__asm__ __volatile__(");
+    while (q < qe) {
+        if (*q != '"') { q++; continue; }
+        const char *b = ++q;
+        while (q < qe && *q != '"') { if (*q == '\\' && q + 1 < qe) q++; q++; }
+        if (any) emit(e, " ");
+        emit_c_string_lit(e, b, (size_t)(q - b));
+        any = true;
+        if (q < qe) q++;
+    }
+    if (!any) emit(e, "\"\"");
+    emit(e, ");\n");
+}
+
 static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
     /* Audit-trail comment: every escape hatch documents itself in emitted C. */
-    emit(e, "/* asm safety: %.*s */\n",
-         (int)a->asm_stmt.safety_len, a->asm_stmt.safety);
+    emit(e, "/* asm safety: ");
+    if (a->asm_stmt.safety)
+        emit_comment_text(e, a->asm_stmt.safety, a->asm_stmt.safety_len);
+    emit(e, " */\n");
     emit_indent(e);
-    emit(e, "__asm__ __volatile__ (\"%.*s\"",
-         (int)a->asm_stmt.instructions_len, a->asm_stmt.instructions);
+    emit(e, "__asm__ __volatile__ (");
+    emit_c_string_lit(e, a->asm_stmt.instructions ? a->asm_stmt.instructions : "",
+                      a->asm_stmt.instructions ? a->asm_stmt.instructions_len : 0);
 
     /* Outputs */
     if (a->asm_stmt.output_count > 0 || a->asm_stmt.input_count > 0
@@ -6526,7 +6581,7 @@ static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
         for (int i = 0; i < a->asm_stmt.clobber_count; i++) {
             if (i > 0) emit(e, ", ");
             AsmOperand *op = &a->asm_stmt.clobbers[i];
-            emit(e, "\"%.*s\"", (int)op->reg_name_len, op->reg_name);
+            emit_c_string_lit(e, op->reg_name, op->reg_name_len);
         }
     }
     emit(e, ");\n");
@@ -6586,8 +6641,11 @@ static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
 static void emit_isr_signature(Emitter *e, Node *isr) {
     emit(e, "void __attribute__((interrupt, used");
     if (isr->interrupt.section)
-        emit(e, ", section(\"%.*s\")", (int)isr->interrupt.section_len,
-             isr->interrupt.section);
+    {
+        emit(e, ", section(");
+        emit_c_string_lit(e, isr->interrupt.section, isr->interrupt.section_len);
+        emit(e, ")");
+    }
     emit(e, ")) ");
     if (isr->interrupt.as_name)
         emit(e, "%.*s(void)", (int)isr->interrupt.as_name_len, isr->interrupt.as_name);
@@ -6598,8 +6656,9 @@ static void emit_isr_signature(Emitter *e, Node *isr) {
 static void emit_func_attributes(Emitter *e, Node *fn) {
     if (!fn || fn->kind != NODE_FUNC_DECL) return;
     if (fn->func_decl.section) {
-        emit(e, "__attribute__((section(\"%.*s\"))) ",
-             (int)fn->func_decl.section_len, fn->func_decl.section);
+        emit(e, "__attribute__((section(");
+        emit_c_string_lit(e, fn->func_decl.section, fn->func_decl.section_len);
+        emit(e, "))) ");
     }
     /* naked: see comment above. Intentionally disabled. */
     if (fn->func_decl.is_static) {
@@ -7220,8 +7279,9 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
     }
     /* section attribute */
     if (node->var_decl.section) {
-        emit(e, "__attribute__((section(\"%.*s\"))) ",
-             (int)node->var_decl.section_len, node->var_decl.section);
+        emit(e, "__attribute__((section(");
+        emit_c_string_lit(e, node->var_decl.section, node->var_decl.section_len);
+        emit(e, "))) ");
     }
     /* propagate volatile flag from var-decl to pointer type */
     if (node->var_decl.is_volatile && type && type_unwrap_distinct(type)->kind == TYPE_POINTER) {
@@ -7377,27 +7437,6 @@ static void prescan_spawn_in_block(Emitter *e, Node *block) {
         prescan_spawn_in_node(e, block->block.stmts[i]);
 }
 
-static void register_condvar_type(Emitter *e, uint32_t type_id) {
-    /* Check if already registered */
-    for (int i = 0; i < e->condvar_type_count; i++)
-        if (e->condvar_type_ids[i] == type_id) return;
-    if (e->condvar_type_count >= e->condvar_type_capacity) {
-        int nc = e->condvar_type_capacity < 8 ? 8 : e->condvar_type_capacity * 2;
-        uint32_t *nids = (uint32_t *)arena_alloc(e->arena, nc * sizeof(uint32_t));
-        if (e->condvar_type_ids)
-            memcpy(nids, e->condvar_type_ids, e->condvar_type_count * sizeof(uint32_t));
-        e->condvar_type_ids = nids;
-        e->condvar_type_capacity = nc;
-    }
-    e->condvar_type_ids[e->condvar_type_count++] = type_id;
-}
-
-static bool is_condvar_type(Emitter *e, uint32_t type_id) {
-    for (int i = 0; i < e->condvar_type_count; i++)
-        if (e->condvar_type_ids[i] == type_id) return true;
-    return false;
-}
-
 static void prescan_spawn_in_node(Emitter *e, Node *node) {
     if (!node) return;
     switch (node->kind) {
@@ -7418,27 +7457,13 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
         sw->module_len = e->current_module_len;
         break;
     }
+    /* BUG-1661: which shared structs need a condition variable is no longer
+     * discovered here. This statement-level scan matched a `@cond_*` intrinsic
+     * only when it was the WHOLE of an expression statement, and
+     * @cond_timedwait is the one that returns a value — `?void r =
+     * @cond_timedwait(...)` was never seen, and the struct went out without
+     * its `_zer_cond` member. The checker records the fact on the type. */
     case NODE_EXPR_STMT:
-        /* Detect @cond_wait/@cond_signal/@cond_broadcast usage */
-        if (node->expr_stmt.expr && node->expr_stmt.expr->kind == NODE_INTRINSIC) {
-            Node *intr = node->expr_stmt.expr;
-            if (intr->intrinsic.name_len >= 5 &&
-                memcmp(intr->intrinsic.name, "cond_", 5) == 0 &&
-                intr->intrinsic.arg_count >= 1) {
-                /* First arg is the shared struct variable — get its type */
-                Type *stype = checker_get_type(e->checker, intr->intrinsic.args[0]);
-                if (stype) {
-                    Type *seff = type_unwrap_distinct(stype);
-                    if (seff->kind == TYPE_STRUCT && seff->struct_type.is_shared)
-                        register_condvar_type(e, seff->struct_type.type_id);
-                    if (seff->kind == TYPE_POINTER) {
-                        Type *inner = type_unwrap_distinct(seff->pointer.inner);
-                        if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                            register_condvar_type(e, inner->struct_type.type_id);
-                    }
-                }
-            }
-        }
         break;
     case NODE_BLOCK: prescan_spawn_in_block(e, node); break;
     case NODE_IF:
@@ -13461,8 +13486,7 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         if (s->asm_stmt.is_structured) {
             emit_structured_asm(e, s, func);
         } else {
-            emit(e, "__asm__ __volatile__(%.*s);\n",
-                 (int)s->asm_stmt.code_len, s->asm_stmt.code);
+            emit_inline_asm(e, s);
         }
         return;
     case NODE_IF:
@@ -14685,8 +14709,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit_structured_asm(e, a, func);
                 } else {
                     emit_indent(e);
-                    emit(e, "__asm__ __volatile__(%.*s);\n",
-                         (int)a->asm_stmt.code_len, a->asm_stmt.code);
+                    emit_inline_asm(e, a);
                 }
             } else if (inst->expr->kind == NODE_SPAWN) {
                 /* Spawn — emit pthread_create with wrapper struct.

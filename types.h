@@ -114,6 +114,15 @@ struct Type {
             bool is_packed;
             bool is_shared;
             bool is_shared_rw;      /* shared(rw) — reader-writer lock */
+            bool uses_condvar;      /* BUG-1661: some `@cond_*` intrinsic names a value
+                                     * of this type, so the emitted struct carries a
+                                     * `pthread_cond_t`. Written by the CHECKER at the
+                                     * one place every condvar intrinsic is checked —
+                                     * wherever it sits in an expression, in whichever
+                                     * module — and only ever set, never cleared. The
+                                     * emitter READS it; it used to rediscover the fact
+                                     * with a statement-level prescan that missed any
+                                     * `@cond_timedwait` whose result is used */
             bool is_move;           /* move struct — ownership transfer on pass/assign */
             bool is_async_state;    /* BUG-1177: `_zer_async_NAME` coroutine state — a
                                      * promoted local may be pointed at by another

@@ -11893,21 +11893,53 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
         r->handle.elem = subst_typenode(a, tn->handle.elem, param_name, param_len, replacement);
         return r;
     }
-    /* Pool/Ring/Slab DO carry an inner type (`.pool.elem` etc.) and are left
-     * unsubstituted DELIBERATELY: the emitter cannot stamp their inline storage
-     * for a monomorphized container, so substituting here would replace a clear
-     * type error with a broken emission. They therefore still report
-     * "undefined type 'T'" — accurate as far as it goes, though a dedicated
-     * "not supported as a container field" message would be kinder. Tracked in
-     * docs/limitations.md; do NOT add substitution here without the emitter
-     * work. Arena/Barrier/Semaphore carry no element type at all. */
+    /* BUG-1659: substitution is TOTAL — every kind that carries an inner type
+     * substitutes it. Pool / Ring / Slab used to be left alone on purpose ("the
+     * emitter cannot stamp their inline storage"), which did keep them out of
+     * the emitter but for the wrong stated reason: `Pool(T, 4)` was reported as
+     * "undefined type 'T'". They are refused as a container field by
+     * check_aggregate_member, the same rule a struct field obeys, and that
+     * rule needs the type to RESOLVE. A function-pointer field was left alone
+     * by oversight (it was listed with the leaves), so a callback over the
+     * template parameter — `*(T) -> void cb;` — could not be declared at all. */
+    case TYNODE_POOL: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->pool.elem = subst_typenode(a, tn->pool.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_RING: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->ring.elem = subst_typenode(a, tn->ring.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_SLAB: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->slab.elem = subst_typenode(a, tn->slab.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_FUNC_PTR: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->func_ptr.return_type = subst_typenode(a, tn->func_ptr.return_type,
+                                                 param_name, param_len, replacement);
+        if (tn->func_ptr.param_count > 0 && tn->func_ptr.param_types) {
+            r->func_ptr.param_types = (TypeNode **)arena_alloc(a,
+                (size_t)tn->func_ptr.param_count * sizeof(TypeNode *));
+            for (int pi = 0; pi < tn->func_ptr.param_count; pi++)
+                r->func_ptr.param_types[pi] = subst_typenode(a, tn->func_ptr.param_types[pi],
+                                                             param_name, param_len, replacement);
+        }
+        return r;
+    }
+    /* Leaves: no inner type. Arena / Barrier / Semaphore carry no element type. */
     case TYNODE_U8: case TYNODE_U16: case TYNODE_U32: case TYNODE_U64:
     case TYNODE_USIZE: case TYNODE_I8: case TYNODE_I16: case TYNODE_I32:
     case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
     case TYNODE_VOID: case TYNODE_OPAQUE: case TYNODE_NAMED:
-    case TYNODE_FUNC_PTR: case TYNODE_POOL: case TYNODE_RING:
-    case TYNODE_ARENA: case TYNODE_BARRIER:
-    case TYNODE_SLAB: case TYNODE_SEMAPHORE:
+    case TYNODE_ARENA: case TYNODE_BARRIER: case TYNODE_SEMAPHORE:
         return tn;
     }
     return tn;  /* defensive — unreachable with all cases enumerated */
@@ -11968,6 +12000,65 @@ static void reject_const_value_field(Checker *c, int line, TypeNode *tn, Type *f
         "a VARIABLE (declare the struct variable or parameter 'const') or a "
         "pointer's TARGET ('const *T', 'const [*]T'); a single field cannot be "
         "made read-only on its own", what, (int)name_len, name);
+}
+
+/* ---- the rules EVERY member of an aggregate obeys (BUG-1659) ----------------
+ *
+ * A struct field, a union variant and a field of a stamped container are the same
+ * thing to the emitter: one member of one C aggregate. Three rules hold for all of
+ * them, and each declaring site used to carry its own copy — the container stamp
+ * carried NONE:
+ *
+ *   - a `void` member has no size (BUG-224);
+ *   - Pool / Ring / Slab / Arena are storage with an identity — every method call
+ *     is resolved against a NAMED global, and their inline layout is emitted per
+ *     variable — so they cannot be a member (BUG-287 / 386 / 1112). The position
+ *     predicate is the VST-verified zer_container_position_valid;
+ *   - an async task's state struct is defined after every user aggregate, so one
+ *     held by value is an incomplete type (BUG-1238).
+ *
+ * `container C(T) { Ring(u8, 8) r; T x; }`, `{ void v; T x; }` and a by-value task
+ * field all passed the checker and reached GCC as C it refuses. The stamp site
+ * also substituted T into every field form EXCEPT a Pool / Ring / Slab element,
+ * so `Pool(T, 4)` was reported as "undefined type 'T'" — a message about a name
+ * the user had declared one line above. Substitution is now total and this one
+ * rule names the restriction.
+ *
+ * Aggregate-SPECIFIC rules stay at their site: by-value self-containment (each
+ * site knows its own in-progress type), shared / packed / move interactions
+ * (a struct has those attributes, a union and a container do not). */
+typedef enum { AGG_STRUCT, AGG_UNION, AGG_CONTAINER } AggKind;
+
+static void check_aggregate_member(Checker *c, AggKind k, int line,
+                                   const char *owner, size_t owner_len,
+                                   const char *name, size_t name_len, Type *mt) {
+    static const char *const member[]  = { "struct field", "union variant", "container field" };
+    static const char *const members[] = { "struct fields", "union variants", "container fields" };
+    static const char *const agg[]     = { "struct", "union", "container" };
+    static const char *const part[]    = { "field", "variant", "field" };
+    if (!mt) return;
+    TypeKind mk = type_dispatch_kind(mt);
+    if (mk == TYPE_VOID) {
+        checker_error(c, line, "%s '%.*s' cannot have type 'void'",
+                      member[k], (int)name_len, name);
+        return;
+    }
+    if ((mk == TYPE_POOL || mk == TYPE_RING || mk == TYPE_SLAB || mk == TYPE_ARENA) &&
+        zer_container_position_valid(k == AGG_UNION ? ZER_DP_VARIANT : ZER_DP_FIELD) == 0) {
+        checker_error(c, line,
+            "Pool/Ring/Slab/Arena cannot be %s — must be global or static variables "
+            "(%s '%.*s' of %s '%.*s'); declare the allocator as a global and keep a "
+            "Handle or an index in the aggregate",
+            members[k], part[k], (int)name_len, name, agg[k], (int)owner_len, owner);
+        return;
+    }
+    if (type_is_async_task(mt)) {
+        checker_error(c, line,
+            "%s '%.*s' of %s '%.*s' cannot hold an async task by value — an aggregate "
+            "is defined before the task's state is known; hold a '*_zer_async_...' "
+            "pointer to a task declared as a local or global",
+            part[k], (int)name_len, name, agg[k], (int)owner_len, owner);
+    }
 }
 
 /* BUG-1551: a `|*v|` capture is a pointer to the captured value. Over an ARRAY
@@ -12525,6 +12616,16 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 reject_const_value_field(c, fd->loc.line ? (int)fd->loc.line : (int)tn->loc.line,
                                          fd->type, sf->type, "container field",
                                          fd->name, fd->name_len);   /* BUG-1547 */
+                /* The rules of every aggregate member — this site had none of them
+                 * (BUG-1659). Recover with a sized type so the by-value walks that
+                 * follow an error have something finite to walk. */
+                {
+                    int errs_before = c->error_count;
+                    check_aggregate_member(c, AGG_CONTAINER,
+                                           fd->loc.line ? (int)fd->loc.line : (int)tn->loc.line,
+                                           cname, cnlen, fd->name, fd->name_len, sf->type);
+                    if (c->error_count != errs_before) sf->type = ty_u8;
+                }
                 /* J4: by-value self-containment guard (mirrors the
                  * NODE_STRUCT_DECL check). Now that the knot is tied, a field
                  * that IS the in-progress stamp by value — bare, or wrapped only
@@ -23775,6 +23876,11 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@%.*s first argument must be a shared struct variable",
                             (int)nlen, name);
+                    } else if (sst && type_dispatch_kind(sst) == TYPE_STRUCT) {
+                        /* BUG-1661: the struct needs its condition variable. Recorded
+                         * HERE, on the type, because this is the one place every
+                         * condvar intrinsic passes through (types.h, uses_condvar). */
+                        sst->struct_type.uses_condvar = true;
                     }
                 }
             }
@@ -28140,6 +28246,134 @@ static bool static_init_is_wide_int(Type *t) {
     return t && type_is_integer(t) && type_width(t) > 64;
 }
 
+/* ---- asm text: the ONE reading of what GCC will assemble (BUG-1658) ----------
+ *
+ * The structural asm rules (S2: at most 16 instructions in a block; S3: no label)
+ * are questions about the text THE ASSEMBLER SEES. They were asked of the text
+ * the user TYPED, and only for one of the two asm forms:
+ *
+ *   - they sat inside `if (is_structured)`, so the inline `asm("...")` form had
+ *     neither rule: `asm("spin: jmp spin")` and a 100-instruction string compiled;
+ *   - they looked for the byte 0x0A, but the string reaches GCC verbatim and GCC
+ *     decodes its escapes: `"nop\nspin: jmp spin"`, `\x0a` and `\012` are line
+ *     breaks to the assembler and were none to the rule;
+ *   - a label's name was matched as [A-Za-z0-9_], so `.L1:` and `$x:` (both legal
+ *     assembler symbols) were not labels.
+ *
+ * asm_text_decode returns the text as the assembler receives it: the string
+ * literals' contents (the inline form is a run of adjacent literals, which C
+ * concatenates), with their escapes decoded. ZER's escape rules — `\xHH` is
+ * exactly two hex digits, `\0` is one NUL — because the emitter writes every
+ * asm string through emit_c_string_text, which makes C read the same bytes ZER
+ * does (and keeps a trigraph from forming). The lexer guarantees those rules for
+ * the structured string; the inline form is captured raw by the parser, so the
+ * inline grammar check below refuses any escape outside the set. Both rules then
+ * run on that one decoded text.
+ *
+ * LIMIT, stated so nobody takes these for a control-flow guarantee: they are
+ * AUDIT rules over the block's shape. A jump to a symbol defined elsewhere, a
+ * computed jump, or a directive that defines a symbol without a colon is not
+ * seen — recognising those needs a per-instruction table, which Option E
+ * deliberately delegates to GCC (docs/asm_lang_zer_safe.md). The asm text is
+ * the floor; the Z-rules guard its typed operands. */
+static int asm_hex_val(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* `raw_literals`: src is the inline form's argument — string literals separated
+ * by whitespace, quotes included. Otherwise src is the inside of ONE literal.
+ * The result is never longer than the input. */
+static char *asm_text_decode(Checker *c, const char *src, size_t len,
+                             bool raw_literals, size_t *out_len) {
+    char *out = (char *)arena_alloc(c->arena, len + 1);
+    size_t n = 0;
+    if (!out) { *out_len = 0; return NULL; }
+    bool in_str = !raw_literals;
+    for (size_t i = 0; i < len; i++) {
+        char ch = src[i];
+        if (!in_str) {                      /* between the inline form's literals */
+            if (ch == '"') in_str = true;
+            continue;
+        }
+        if (ch == '"' && raw_literals) { in_str = false; continue; }
+        if (ch != '\\' || i + 1 >= len) { out[n++] = ch; continue; }
+        char e = src[++i];
+        if (e == 'x') {                                       /* \xHH: exactly two */
+            int hi = (i + 1 < len) ? asm_hex_val(src[i + 1]) : -1;
+            int lo = (i + 2 < len) ? asm_hex_val(src[i + 2]) : -1;
+            if (hi >= 0 && lo >= 0) { out[n++] = (char)((hi << 4) | lo); i += 2; }
+            else out[n++] = 'x';
+            continue;
+        }
+        if (e == 'n') out[n++] = '\n';
+        else if (e == 't') out[n++] = '\t';
+        else if (e == 'r') out[n++] = '\r';
+        else if (e == '0') out[n++] = '\0';   /* a NUL: a statement boundary below */
+        else out[n++] = e;                    /* \\ and \" */
+    }
+    out[n] = 0;
+    *out_len = n;
+    return out;
+}
+
+static bool asm_sym_char(char ch) {
+    return ch == '_' || ch == '.' || ch == '$' ||
+           (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9');
+}
+
+/* S2 + S3 over the decoded text. A statement ends at a line break or a `;` (a NUL
+ * is treated as one too: what follows it is judged, never trusted to be cut off);
+ * an empty one (a trailing separator, a blank line) is not an instruction. */
+static void check_asm_text_rules(Checker *c, Node *node, const char *src, size_t len,
+                                 bool raw_literals) {
+    size_t tl = 0;
+    const char *t = asm_text_decode(c, src, len, raw_literals, &tl);
+    if (!t) return;
+    int instr_count = 0;
+    bool label = false;
+    size_t i = 0;
+    while (i < tl) {
+        size_t st = i;                                  /* one statement: [st, en) */
+        while (i < tl && t[i] != '\n' && t[i] != ';' && t[i] != '\0') i++;
+        size_t en = i;
+        if (i < tl) i++;                                /* the separator */
+        while (st < en && (t[st] == ' ' || t[st] == '\t' || t[st] == '\r')) st++;
+        if (st == en) continue;                         /* empty statement */
+        instr_count++;
+        if (label) continue;
+        /* A label is the statement's FIRST token followed by ':' — a symbol, or a
+         * quoted name (the assembler accepts `"any text":`). */
+        size_t j = st;
+        if (t[j] == '"') {
+            j++;
+            while (j < en && t[j] != '"') j++;
+            if (j < en) j++;
+        } else {
+            while (j < en && asm_sym_char(t[j])) j++;
+        }
+        size_t k = j;
+        while (k < en && (t[k] == ' ' || t[k] == '\t')) k++;
+        if (j > st && k < en && t[k] == ':') label = true;
+    }
+    if (instr_count > 16) {
+        checker_error(c, node->loc.line,
+            "asm block has %d instructions; max is 16 (S2 rule). "
+            "Split into multiple asm blocks or use a helper function.",
+            instr_count);
+    }
+    if (label) {
+        checker_error(c, node->loc.line,
+            "asm block contains a label (S3 rule) — "
+            "labels enable jumps that escape ZER's control "
+            "flow analysis. Use multiple asm blocks if you "
+            "need branching, or restructure as ZER if/while.");
+    }
+}
+
 static void check_stmt_impl(Checker *c, Node *node) {
     if (!node) return;
 
@@ -31794,24 +32028,47 @@ static void check_stmt_impl(Checker *c, Node *node) {
         if (!node->asm_stmt.is_structured && node->asm_stmt.code) {
             const char *q = node->asm_stmt.code;
             const char *qe = q + node->asm_stmt.code_len;
-            bool ext = false;
+            bool ext = false, bad_esc = false;
             while (q < qe && !ext) {
                 if (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') { q++; continue; }
                 if (*q == '"') {
                     q++;
-                    while (q < qe && *q != '"' && *q != '\n') { if (*q == '\\' && q + 1 < qe) q++; q++; }
+                    while (q < qe && *q != '"' && *q != '\n') {
+                        if (*q == '\\' && q + 1 < qe) {
+                            /* BUG-1658: this text is captured raw by the parser —
+                             * only its first literal is ever a lexer token — so the
+                             * escape set is enforced here. Anything else would be
+                             * read by C's rules, not ZER's (`\12` is an octal line
+                             * break to C). */
+                            char ec = q[1];
+                            bool ok_esc = ec == 'n' || ec == 't' || ec == 'r' || ec == '\\' ||
+                                          ec == '"' || ec == '0' ||
+                                          (ec == 'x' && q + 3 < qe && asm_hex_val(q[2]) >= 0 &&
+                                           asm_hex_val(q[3]) >= 0);
+                            if (!ok_esc) bad_esc = true;
+                            q++;
+                        }
+                        q++;
+                    }
                     if (q >= qe || *q != '"') { ext = true; break; }
                     q++;
                     continue;
                 }
                 ext = true;   /* a colon, a comment, a name: not a string literal */
             }
+            if (bad_esc)
+                checker_error(c, node->loc.line,
+                    "invalid escape sequence in an asm string — use \\n, \\t, \\r, "
+                    "\\\\, \\\", \\0 or \\xHH (two hex digits)");
             if (ext)
                 checker_error(c, node->loc.line,
                     "asm operands in the inline asm(\"...\") form are raw text the compiler "
                     "cannot check (race, lock, lifetime and move tracking do not see them) — "
                     "use the structured asm { instructions: ... inputs: { ... } outputs: "
                     "{ ... } safety: ... } form, whose operands are typed ZER expressions");
+            else if (!bad_esc)   /* only literals: the rules read what they concatenate to */
+                check_asm_text_rules(c, node, node->asm_stmt.code,
+                                     node->asm_stmt.code_len, true);
         }
         /* D-Alpha-7.5 H1+H3: structured asm form requires `instructions:` and
          * `safety:` keys; safety string must be >= 30 chars (S4 rule preview).
@@ -31952,68 +32209,11 @@ static void check_stmt_impl(Checker *c, Node *node) {
              * Rules requiring per-arch instruction database (I1-4, E1-4, O3,
              * S5 enforcement) deferred to Sessions C/F. */
 
-            /* S2: Max 16 instructions per asm block. Counts newlines + ';'.
-             * Forces small auditable blocks (audit-trail + maintenance friendly). */
-            {
-                int instr_count = 1; /* at least 1 instruction if string non-empty */
-                if (node->asm_stmt.instructions_len == 0) {
-                    instr_count = 0;
-                } else {
-                    for (size_t i = 0; i < node->asm_stmt.instructions_len; i++) {
-                        char ch = node->asm_stmt.instructions[i];
-                        if (ch == '\n' || ch == ';') instr_count++;
-                    }
-                }
-                if (instr_count > 16) {
-                    checker_error(c, node->loc.line,
-                        "asm block has %d instructions; max is 16 (S2 rule). "
-                        "Split into multiple asm blocks or use a helper function.",
-                        instr_count);
-                }
-            }
-
-            /* S3 (universal): forbid labels in asm. Pattern: word followed by
-             * ':' at the start of line / after ';' / after newline. Labels
-             * enable jumps that escape the block — control flow must stay
-             * inside ZER's control flow analysis. Per-arch jump mnemonic
-             * detection (full S3) deferred to Session F (instruction db). */
-            {
-                const char *s = node->asm_stmt.instructions;
-                size_t len = node->asm_stmt.instructions_len;
-                bool at_line_start = true;
-                for (size_t i = 0; i < len; i++) {
-                    char ch = s[i];
-                    if (ch == '\n' || ch == ';') {
-                        at_line_start = true;
-                        continue;
-                    }
-                    if (ch == ' ' || ch == '\t') continue;
-                    if (at_line_start) {
-                        /* Scan word, then check next non-word for ':'. */
-                        size_t j = i;
-                        while (j < len && (s[j] == '_' ||
-                               (s[j] >= 'a' && s[j] <= 'z') ||
-                               (s[j] >= 'A' && s[j] <= 'Z') ||
-                               (s[j] >= '0' && s[j] <= '9'))) j++;
-                        /* skip whitespace between word and possible ':' */
-                        size_t k = j;
-                        while (k < len && (s[k] == ' ' || s[k] == '\t')) k++;
-                        if (j > i && k < len && s[k] == ':') {
-                            /* But '%0:', '%1:', etc. are NOT labels — they're
-                             * GCC operand references in some asm dialects. Skip
-                             * if word starts with '%' (impossible per scan above
-                             * since we only matched [a-zA-Z0-9_]) so we're safe. */
-                            checker_error(c, node->loc.line,
-                                "asm block contains a label (S3 rule) — "
-                                "labels enable jumps that escape ZER's control "
-                                "flow analysis. Use multiple asm blocks if you "
-                                "need branching, or restructure as ZER if/while.");
-                            break;
-                        }
-                        at_line_start = false;
-                    }
-                }
-            }
+            /* S2 (at most 16 instructions) and S3 (no label): ONE reading of the
+             * text for both asm forms — check_asm_text_rules, BUG-1658. */
+            if (node->asm_stmt.instructions && node->asm_stmt.instructions_len > 0)
+                check_asm_text_rules(c, node, node->asm_stmt.instructions,
+                                     node->asm_stmt.instructions_len, false);
 
             /* Operand reference consistency: %0, %1, ..., %N references in the
              * instructions string must be < (output_count + input_count).
@@ -33968,26 +34168,11 @@ static void register_decl(Checker *c, Node *node) {
                         (int)fd->name_len, fd->name,
                         (int)node->struct_decl.name_len, node->struct_decl.name);
                 }
-                /* BUG-224: reject void fields */
-                if (sf->type && sf->type->kind == TYPE_VOID) {
-                    checker_error(c, node->loc.line,
-                        "struct field '%.*s' cannot have type 'void'",
-                        (int)fd->name_len, fd->name);
-                }
-                /* BUG-287: Pool/Ring/Slab as struct fields not yet supported */
-                /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T02) */
-                /* BUG-1112: Arena too — it was accepted as a field, and then every
-                 * method call on it (`s.a.reset()`, `s.a.alloc(T)`) was emitted as a
-                 * raw C member call GCC refuses; the builtin-method interception
-                 * only recognises a NAMED arena. */
-                if (sf->type && (type_dispatch_kind(sf->type) == TYPE_POOL ||
-                                 type_dispatch_kind(sf->type) == TYPE_RING ||
-                                 type_dispatch_kind(sf->type) == TYPE_SLAB ||
-                                 type_dispatch_kind(sf->type) == TYPE_ARENA) &&
-                    zer_container_position_valid(ZER_DP_FIELD) == 0) {
-                    checker_error(c, node->loc.line,
-                        "Pool/Ring/Slab/Arena cannot be struct fields — must be global or static variables");
-                }
+                /* void / allocator / async-task-by-value: the rules of every
+                 * aggregate member, asked ONCE (check_aggregate_member, BUG-1659). */
+                check_aggregate_member(c, AGG_STRUCT, node->loc.line,
+                                       node->struct_decl.name, node->struct_decl.name_len,
+                                       fd->name, fd->name_len, sf->type);
                 /* BUG-498: synchronization primitives in packed struct → misaligned.
                  * pthread_mutex_t requires natural alignment. Packed structs can place
                  * fields at unaligned offsets → hard fault on ARM/RISC-V.
@@ -34020,14 +34205,6 @@ static void register_decl(Checker *c, Node *node) {
                  * Unwrap arrays AND distinct — S[1] or distinct S contains S by value too. */
                 {
                     Type *inner = byvalue_core_type(sf->type);   /* BUG-1389: peels ?T too */
-                    if (type_is_async_task(sf->type)) {                         /* BUG-1238 */
-                        checker_error(c, node->loc.line,
-                            "field '%.*s' of struct '%.*s' cannot hold an async task by value — "
-                            "a struct is defined before the task's state is known; hold a "
-                            "'*_zer_async_...' pointer to a task declared as a local or global",
-                            (int)sf->name_len, sf->name,
-                            (int)node->struct_decl.name_len, node->struct_decl.name);
-                    }
                     if (inner == t) {
                         checker_error(c, node->loc.line,
                             "struct '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
@@ -34210,31 +34387,13 @@ static void register_decl(Checker *c, Node *node) {
                 sv->type = resolve_type(c, uv->type);
                 reject_const_value_field(c, node->loc.line, uv->type, sv->type,
                                          "union variant", uv->name, uv->name_len);   /* BUG-1547 */
-                /* BUG-224: reject void union variants */
-                if (sv->type && sv->type->kind == TYPE_VOID) {
-                    checker_error(c, node->loc.line,
-                        "union variant '%.*s' cannot have type 'void'",
-                        (int)uv->name_len, uv->name);
-                }
-                /* BUG-386: Pool/Ring/Slab in union not supported (same as BUG-287 for structs) */
-                /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T03) */
-                if (sv->type && (type_dispatch_kind(sv->type) == TYPE_POOL ||
-                                 type_dispatch_kind(sv->type) == TYPE_RING ||
-                                 type_dispatch_kind(sv->type) == TYPE_SLAB ||
-                                 type_dispatch_kind(sv->type) == TYPE_ARENA) &&   /* BUG-1112 */
-                    zer_container_position_valid(ZER_DP_VARIANT) == 0) {
-                    checker_error(c, node->loc.line,
-                        "Pool/Ring/Slab/Arena cannot be union variants — must be global or static variables");
-                }
+                /* The rules of every aggregate member (check_aggregate_member). */
+                check_aggregate_member(c, AGG_UNION, node->loc.line,
+                                       node->union_decl.name, node->union_decl.name_len,
+                                       uv->name, uv->name_len, sv->type);
                 /* BUG-265/314: reject recursive union by value (incomplete type in C) */
                 {
                     Type *inner = byvalue_core_type(sv->type);   /* BUG-1389: peels ?T too */
-                    if (type_is_async_task(sv->type)) {                         /* BUG-1238 */
-                        checker_error(c, node->loc.line,
-                            "union '%.*s' cannot hold an async task by value — hold a "
-                            "'*_zer_async_...' pointer instead",
-                            (int)node->union_decl.name_len, node->union_decl.name);
-                    }
                     if (inner == t) {
                         checker_error(c, node->loc.line,
                             "union '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
@@ -34688,10 +34847,23 @@ static void register_decl(Checker *c, Node *node) {
         /* BUG-1553: a container's field names reach C in every stamped struct,
          * exactly like a struct's — the BUG-1446 reserved-name check never saw them
          * (`container B(T) { T __LINE__; }` reached GCC). */
-        for (int fi = 0; fi < node->container_decl.field_count; fi++)
-            check_c_reserved_ident(c, node->container_decl.fields[fi].name,
-                                   (uint32_t)node->container_decl.fields[fi].name_len,
+        for (int fi = 0; fi < node->container_decl.field_count; fi++) {
+            FieldDecl *cf = &node->container_decl.fields[fi];
+            check_c_reserved_ident(c, cf->name, (uint32_t)cf->name_len,
                                    node->loc.line, CRUSE_FIELD, "container field");
+            /* BUG-1659: a duplicate field name is a property of the TEMPLATE, so
+             * it is reported here, once, whether or not the template is ever
+             * stamped (the struct and union sites report theirs the same way). */
+            for (int fj = 0; fj < fi; fj++) {
+                FieldDecl *pf = &node->container_decl.fields[fj];
+                if (pf->name_len == cf->name_len &&
+                    memcmp(pf->name, cf->name, cf->name_len) == 0)
+                    checker_error(c, node->loc.line,
+                        "duplicate field '%.*s' in container '%.*s'",
+                        (int)cf->name_len, cf->name,
+                        (int)node->container_decl.name_len, node->container_decl.name);
+            }
+        }
         break;
     }
 

@@ -1,0 +1,11 @@
+// expect-error: max is 16
+// BUG-1658: seventeen instructions separated by the ESCAPE \n. The rule looked for
+// the byte 0x0A in the source text; GCC decodes the escape, so the assembler saw
+// seventeen lines where the rule saw one.
+naked void sled() {
+    asm {
+        instructions: "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop"
+        safety: "structural asm rule test: the text here is never meant to be assembled"
+    }
+}
+u32 main() { return 0; }

@@ -3422,7 +3422,7 @@ Analysis of 12 red team rounds identified 3 areas where code duplication was CAU
 **Impact:** 3 blocks (116 lines) → 1 helper (45 lines). Adding a new orelse context = one call.
 
 ### R3: `emit_shared_ensure_init(e, root, arrow)` (emitter.c)
-**What:** Unified shared struct mutex+condvar initialization. Checks `is_condvar_type` internally.
+**What:** Unified shared struct mutex+condvar initialization. Reads `struct_type.uses_condvar` (set by the checker at every `@cond_*`, BUG-1661 — the emitter's own `is_condvar_type` prescan registry is gone).
 **Why:** Auto-lock path used `_zer_mtx_ensure_init` (no condvar) for condvar-type shared structs. CAS winner set `inited=1` without condvar init → `@cond_wait` saw `inited=1` → skipped → uninitialized condvar.
 **Impact:** 5 sites (57 lines) → 1 helper (20 lines). Adding a new condvar intrinsic = one call.
 

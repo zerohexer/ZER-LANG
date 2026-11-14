@@ -1,0 +1,5 @@
+// expect-error: cannot have type 'void'
+// BUG-1659: a void field in a container template reached GCC.
+container Box(T) { void nothing; T v; }
+Box(u32) g;
+u32 main() { return 0; }

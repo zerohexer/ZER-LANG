@@ -1,0 +1,6 @@
+// expect-error: cannot be container fields
+// BUG-1659: the struct-field ban on Pool / Ring / Slab / Arena was never asked at
+// the container stamp, so this reached GCC ("field has incomplete type").
+container Chan(T) { Ring(u8, 8) rx; T tag; }
+Chan(u32) g;
+u32 main() { g.rx.push(7); return 0; }

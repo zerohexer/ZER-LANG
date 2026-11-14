@@ -1,0 +1,24 @@
+// BUG-1661 (multi-module half): a shared struct declared in one module and used
+// with a condition variable ONLY in another. "Does this struct need a condition
+// variable?" is a fact about the whole program; it is recorded on the type by the
+// checker, so the declaring module's struct carries the member no matter which
+// module waits on it.
+import cond_mod;
+
+Gate g_gate;
+
+void opener(*Gate g) {
+    g.open = 1;
+    @cond_signal(g_gate);
+}
+
+u32 main() {
+    gate_reset(&g_gate);
+    ThreadHandle th = spawn opener(&g_gate);
+    @cond_wait(g_gate, g_gate.open == 1);
+    g_gate.passed = 1;
+    th.join();
+    ?void again = @cond_timedwait(g_gate, g_gate.passed == 1, 5);
+    if (again) { return 0; }
+    return 1;
+}

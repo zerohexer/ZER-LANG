@@ -1,0 +1,7 @@
+// expect-error: cannot hold an async task by value
+// BUG-1659: the by-value async-task rule (BUG-1238) was asked of a struct field
+// and a union variant, never of a container field.
+async void tick() { yield; }
+container Slot(T) { _zer_async_tick t; T tag; }
+Slot(u32) g;
+u32 main() { return 0; }

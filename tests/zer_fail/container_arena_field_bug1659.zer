@@ -1,0 +1,6 @@
+// expect-error: cannot be container fields
+// BUG-1659: an Arena field was accepted in a container and every method call on
+// it was then emitted as a raw C member call.
+container Scratch(T) { Arena a; T last; }
+Scratch(u32) g;
+u32 main() { return 0; }

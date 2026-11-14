@@ -12,7 +12,6 @@
 > | Coq / Iris / VST | `docs/proof-internals.md` |
 > | What is open NOW (meant to be read whole; gated) | `docs/limitations.md` |
 > | A closed entry's discussion — grep by BUG number, never read whole | `docs/limitations-closed.md` |
-> | Old entries nobody re-measured — hypotheses, a triage queue | `docs/limitations-legacy.md` |
 > | Past bugs and root causes | `BUGS-FIXED.md` |
 > | The language as users see it | `docs/reference.md`, `ZER-LANG-LLM.md` (compact) |
 >
@@ -819,8 +818,7 @@ gate cell, a negative with `expect-error`, its row in `docs/multi-site-classes.m
   entries only (`audit_limitations.sh` fails the build otherwise): when a fix closes one,
   MOVE its text to the end of `docs/limitations-closed.md`, and write whatever the fix left
   open as its own entry tagged `[residual of: … — closed by BUG-n]`. Never strike an entry
-  through and leave it. An entry in `docs/limitations-legacy.md` is a hypothesis: measure
-  it, then promote it or archive it — that file only shrinks;
+  through and leave it;
 - durable architecture → `docs/compiler-internals.md`; a language change → `docs/reference.md`;
 - a class or gate → its row in `docs/multi-site-classes.md` + ONE index line here;
 - a process lesson → `docs/session-playbook.md` + at most two lines here.

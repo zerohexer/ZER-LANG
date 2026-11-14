@@ -1,0 +1,26 @@
+// BUG-1658: the 16-instruction rule counts INSTRUCTIONS in the text the assembler
+// sees. Sixteen are allowed in either form and with any separator spelling; a
+// trailing separator or a blank line is not a seventeenth instruction (it used to
+// be counted as one). Mnemonics containing a dot or a segment prefix are not labels.
+naked void structured_escapes() {
+    asm {
+        instructions: "nop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\nnop\n"
+        safety: "sixteen no-ops separated by escaped line breaks, one trailing"
+    }
+}
+naked void structured_semis() {
+    asm {
+        instructions: "nop;nop;nop;nop;nop;nop;nop;nop;;nop;nop;nop;nop;nop;nop;nop;nop;"
+        safety: "sixteen no-ops separated by semicolons with an empty statement"
+    }
+}
+naked void inline_literals() {
+    asm("nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n"
+        "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n");
+}
+u32 main() {
+    structured_escapes();
+    structured_semis();
+    inline_literals();
+    return 0;
+}

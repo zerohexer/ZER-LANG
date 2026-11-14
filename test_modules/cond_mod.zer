@@ -1,0 +1,4 @@
+// The shared struct is DECLARED here; no condvar intrinsic appears in this module.
+shared struct Gate { u32 open; u32 passed; }
+
+void gate_reset(*Gate g) { g.open = 0; g.passed = 0; }

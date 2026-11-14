@@ -4096,3 +4096,554 @@ there is a hand-off reported by `frees_param_field` at the call site — the ref
 caught the unrestricted first draft on `kv_table_free`). Return summaries and the join check
 no longer skip orelse-fallback blocks (BUG-1155). `IRLocal.snapshot_of_plus1` marks the
 return-value snapshot temp (BUG-1154) so diagnostics name the local it copies.
+
+---
+
+## Notes moved from the limitations ledger when its legacy file was retired (2026-11-14)
+
+Fourteen sections of `docs/limitations-legacy.md` were not limitations: eight are hand-off
+notes of the 2026-08 branch survey, five are oracle planning notes from 2026-06 (the plan
+of record is `docs/unified-oracle-proved-ZER.md`; the grids these notes plan — concurrency,
+hardware, async, asm — exist now, see CLAUDE.md "What a green `make check` covers"), one is
+a tracking stub. Moved verbatim; each heading carries `[MOVED 2026-11-14]`. Dated history:
+measure before relying on any of it.
+
+---
+
+## [MOVED 2026-11-14] Where main stands
+
+`make check` exit 0 — **1391 .zer**, modules 30/30, 200 fuzz, 139 convert, all ten matrices, all EIGHT
+audit gates (`audit_reference_examples.sh` joined with BUG-900), sink matrix **88 cells / 0 mismatch**.
+
+Landed this session, newest first:
+
+| sha | what |
+|---|---|
+| `7c873edd` | BUG-884..888 — the call-RESULT view class (4 parts) + my container fix REPLACED + BUG-869/870/871 |
+| `c0180e3f` | BUG-883 — float -> int is DEFINED as SATURATING |
+| `ae033cd0` | BUG-857/858 — container SEGFAULT (superseded, see below) + recycled-slot auto-zero |
+| earlier | the 45-row harvest 1, BUG-815..856 |
+---
+
+## [MOVED 2026-11-14] DECIDED — do not re-open
+
+**float -> int out of range SATURATES, NaN -> 0.** Owner's call, matching Rust's `as`.
+The reasoning is MEMORY vs ARITHMETIC: memory violations halt (slice OOB, misaligned
+`@inttoptr`, bad `@pun`); arithmetic gets a defined value, which is already why integer
+overflow WRAPS. Two sub-decisions came with it and are also settled:
+
+- the compile-time **literal** case is a WARNING, not an error — rejecting `(u32)(-1.5)`
+  while the same value through a variable is defined was "two spellings disagree";
+- **`@truncate` on a float STAYS REJECTED**, a deliberate divergence from `29fiao` and
+  `qa249l`. `@truncate` means "keep the low bits" and a float has none, and it is
+  redundant — verified: `(u32)x` saturates and `@saturate(u32,x)` is named for it, both
+  giving 4294967295 for 1e20 and 0 for -1.5. Their `float_to_int_saturates` /
+  `float_to_int_total` are therefore NOT taken verbatim;
+  `tests/zer/float_to_int_saturates.zer` covers the same semantics.
+---
+
+## [MOVED 2026-11-14] THE CHEAP PATH: cherry-pick, do not re-derive — this is how tracker 3 was closed
+
+`origin/claude/vigilant-tesla-as71kk` forked at `9f8cda08` (one behind main) and carried
+better implementations than the catalog entries described. **It cherry-picked.** Every
+commit is now TAKEN; the table is the record of what each cost.
+
+The lesson for the next branch: **read the fork point first.** A branch that forked at or
+near main is auditing the CURRENT compiler and its findings are live; one that forked
+earlier will overlap heavily with whatever landed since, and its BUG numbers will collide.
+Of the nine branches, only `r1piyr` and `as71kk` forked near main, and they produced
+almost everything that survived.
+
+| commit | rows | files | conflicts with main? |
+|---|---|---|---|
+| ~~`ccdd49ee`~~ TAKEN | **A2** @cstr, **A3** sign/`value_flows_to`, **A4** enum siblings (861 = already on main) | checker.c emitter.c | ONE conflict in checker.c, resolved to HEAD (purely additive on both sides). Its 861 `memset` had to be DELETED — main's BUG-858 already emits it, so the merge doubled it in both allocators. It also carried SEVEN tracked ELF binaries; dropped. |
+| ~~`dda5b33b`~~ TAKEN | **A5** `?T` compare, **A6** non-null drift, **A7** inline-array free | checker.c test_emit.c | ONE conflict in checker.c, resolved to HEAD. It is what finally USES `nonnull_zero_hole` / `is_null_sentinel_ck`, which had arrived dead with `a22de320`. |
+| ~~`6af2497e`~~ TAKEN | **A8** indirect-call keep carrier | checker.c | none |
+| ~~`1cb1f93e`~~ TAKEN | **A14** `lower_expr`, dead code, warnings 32 -> 0 | many | NONE. Measured on main: 28 warnings before, 0 after. |
+| ~~`a1919aa5`~~ TAKEN | **A9** six intrinsics storing through const | checker.c | none |
+| ~~`0a0ec95e`~~ TAKEN | **A15** short-circuit, **A16** const slice, **A17** const array size | checker.c checker.h | none. Also fixes `audit_walker_fields.sh` membership (prose -> structural), baseline 758 -> 684. |
+| ~~`e937a1d8`~~ TAKEN | **A18** funcptr arrays | checker.c emitter.c parser.c parser.h | none. Brings `audit_reference_examples.sh` and WIRES it into `make check` — verified non-vacuous (RED on the pre-fix compiler). |
+| ~~`0828d1f7`~~ TAKEN | **A19** bit extraction through a pointer | checker.c | none |
+| ~~`15b4fe49`~~ TAKEN | **A13** `@trap` arity + `ubsan_sweep.sh` | checker.c | none |
+| ~~`38c27c18` `0ff11690` `d2cd8394`~~ TAKEN | tooling: `ub_sweep.sh`, the rc_cond_004 flake, structural `.gitignore` | — | `d2cd8394` conflicts modify/delete on the binaries it exists to remove; resolved by deleting. The flake did NOT reproduce here (16/16 on a pre-fix build) — the race is real by construction, not by measurement on this box. |
+
+Recipe that worked twice today:
+
+```
+git cherry-pick --no-commit <sha>
+# resolve any conflict by taking THEIRS unless main's version is strictly better
+rm -f *.o src/safety/*.o && make zerc          # ALWAYS after a .h edit
+# run the branch's own tests, then make check
+```
+
+`f63bddcb` (the view class) applied with **zero** conflicts because it touches only
+`zercheck.h` / `zercheck_ir.c`. `a22de320` conflicted twice in `checker.c` and both
+resolved to "theirs".
+---
+
+## [MOVED 2026-11-14] Verification that must not be skipped
+
+1. **Reproduce on main FIRST.** Read the DIAGNOSTIC, never the exit code — `-o out.c`
+   isolates the checker's verdict from GCC's, and the echoed source line contains the
+   offending text, which defeats a loose grep.
+2. **Build a pre-fix compiler and prove the test flips**:
+   `git archive <prev-sha> | tar -x -C $S && (cd $S && rm -f *.o src/safety/*.o && make zerc)`
+3. **A new gate must be shown to FIRE**, not merely pass. `bash tools/sink_matrix.sh $S/zerc`
+   is the pattern — p18 reported 7 holes + 2 over-rejects pre-fix, 0 after.
+4. `MAKE_CHECK_EXIT` must be echoed. Make aborts at the first failing audit, so a later
+   gate silently never runs.
+---
+
+## [MOVED 2026-11-14] Corrections I made to MY OWN work — do not repeat these
+
+- **O3 / H14 (`&&` narrowing).** I closed it as "precision only" after probing an
+  UNPROVABLE index, which correctly guards. With a PROVABLE index the `&&` spelling is
+  HARD-REJECTED while the nested-if spelling compiles. My own tracker had predicted this
+  ("becomes required if the always-OOB verdict is ever promoted") and I never checked
+  that BUG-796 had already promoted it. Still open as **A15**.
+- **BUG-857 (container cycle).** My fix stopped the SEGFAULT and traded it for an
+  OVER-REJECTION of a pointer-broken cycle. Replaced by as71kk's BUG-868 in `7c873edd`.
+  The rule: a cycle is infinite only if EVERY edge is by-value.
+- **The view class, partial.** I wrote the arg-FORM half and reverted it. Correct call:
+  the ARITY part turns `returns_param_color` into a MASK precisely because the BLOCK-TAG
+  bug lets the int name the WRONG param, so widening the consumer alone makes the wrong
+  answer apply more often. Landed whole in `7c873edd`.
+- **I briefly blamed my own change** for three view-class boundary over-rejections that
+  predated it. Check before attributing.
+---
+
+## [MOVED 2026-11-14] Two gates that were themselves broken — the general lesson
+
+`audit_walker_fields.sh` (which I installed) decided membership on **prose**, counting
+the function's own name inside comments, so editing a comment moved a walker in or out of
+the audited set. as71kk fixes it; baseline 758 -> 684.
+
+as71kk's qualifier probe's **first oracle was vacuous** — `-Wdiscarded-qualifiers` is
+silenced by the explicit cast ZER's emitter writes, so it printed OK against a
+deliberately broken compiler. And its `ubsan_sweep.sh` needed `float-cast-overflow` named
+explicitly, because it is NOT in GCC's `-fsanitize=undefined` — found by breaking the
+BUG-845 guard and watching the sweep report CLEAN on the exact class it exists to find.
+
+**A gate that has only ever printed OK is a script, not a net.** Both of these were
+caught by deliberately breaking the compiler and checking the gate went red.
+---
+
+## [MOVED 2026-11-14] The two closure probes are MEASUREMENT SCRIPTS, not gates — do not count them as coverage
+
+`tools/grammar_closure_probe.sh` and `tools/qualifier_closure_probe.sh` landed with
+BUG-896 and are **not wired into `make check`** — neither on main nor on `as71kk`, which
+wires only `audit_reference_examples.sh`. They are slow full-intrinsic sweeps meant to be
+run by hand when the intrinsic set or a qualifier rule changes.
+
+Recording this because CLAUDE.md's own rule is that an un-executed test artifact decays to
+zero value and then to NEGATIVE value once someone believes it covers something. A future
+session seeing `qualifier_closure_probe.sh` in `tools/` must not conclude qualifier
+closure is gated. It is measured, once, by whoever runs it.
+
+`tools/qualifier_closure_baseline.txt` is the useful half: 25 justified strips, each
+established by READING the emitted C (the pointer's value goes to an `"r"` asm operand
+with a `"memory"` clobber, never a dereference), with the discriminating question written
+down for the next reader. The CONST half is not baselined — those six became BUG-896.
+---
+
+## [MOVED 2026-11-14] Recommended order — NOTHING REMAINS (kept as the record of what was done)
+
+1. ~~**A3**, **A2**, **A4**~~ — DONE 2026-08-26 (BUG-889..891, `ccdd49ee`). `value_flows_to`
+   is in; the eight negative-constant sinks each have their own test, which is the only way
+   to prove one query really replaced all eight.
+2. ~~**A5**, **A6**, **A7**, **A8**, **A9**~~ — ALL DONE 2026-08-26 (BUG-892..896,
+   `dda5b33b` / `6af2497e` / `a1919aa5`). **Every accept-unsafe row in tracker 3 is closed.**
+3. ~~**A15..A19**~~ — ALL DONE 2026-08-26 (BUG-897..901, `0a0ec95e` / `e937a1d8` /
+   `0828d1f7`, no conflicts). A15 was my mis-closed row.
+4. ~~**A13**, **A14**~~ — DONE 2026-08-26 (BUG-902/903, `15b4fe49` / `1cb1f93e`).
+5. ~~Tooling~~ — ALL DONE 2026-08-26. `ubsan_sweep.sh` + `ub_sweep.sh` (measurement
+   scripts, see the note above); the walker-field membership fix (758 -> 684, rode with
+   BUG-897); the structural `.gitignore` (1084 binaries untracked, all verified ELF); the
+   rc_cond_004 flake.
+
+**HARVEST TRACKER 3 IS CLOSED — all 20 rows.** `as71kk` is fully consumed; nothing
+remains to cherry-pick from it.
+
+Still parked, deliberately, with reasons recorded in their own entries below: the comptime
+array-element width, the extern `*opaque` type_id (both candidate fixes risk an
+under-rejection), and `29fiao`'s BUG-852 (measured at 34 correct corpus files, so the
+blanket rule was NOT shipped).
+---
+
+## [MOVED 2026-11-14] OPEN — MAX-ORACLE GAP AUDIT (2026-06-23) — the master map: which safety classes are not-sound / not-flexible / coarse-or-no-oracle
+
+> **THE PLAN THAT CONSUMES THIS AUDIT: `docs/unified-oracle-proved-ZER.md` (2026-08-10).**
+> This entry is the per-class GAP MAP; that document is what to DO about it — the unified
+> Level A product (provenance x liveness x ownership x bounds x capability, componentwise
+> join, conjunction at every use site), with Level B relaxations underneath. Priority order
+> there is driven by a measured finding: **every defect found 2026-08-08..10 was in a class
+> with NO oracle, zero exceptions**, while handle/concurrency/escape/move/opaque produced
+> none. Phase 0 is wiring the orphaned `vrp_ir.c` (349 lines, 0 Makefile refs, 0 symbols in
+> the built binary — the sound CFG bounds analysis is not compiled).
+
+
+Audit of EVERY safety class against the MAX-ORACLE STANDARD (CLAUDE.md): a class is
+"at maximum" iff it is (a) SOUND (zero under-rejection — never accepts unsafe), (b)
+FLEXIBLE (minimal over-rejection), AND (c) backed by a MAX oracle (a Coq/Iris Level-1
+spec whose finite-state set is COMPLETE and whose abstraction is the richest sound one,
+not a flat/coarse one). This is the INDEX; per-hole detail lives in the linked entries
+below. Verdict tally: ~14 live under-rejections (6 are CRITICAL memory-corruption), ~4 real
+over-rejections, and MOST classes are coarse-oracle or no-oracle — only 3 are genuinely
+AT-MAX. Two clusters (type/provenance fully audited 2026-06-23; the other five audited
+from this ledger after the parallel workflow rate-limited).
+
+### NOT-SOUND — under-rejects (accepts unsafe). The urgent tier (close before precision work).
+
+**Memory-corruption (CRITICAL UAF/OOB):**
+- **`@bitcast` int↔ptr forge** (#3) — **[FIXED 2026-06-23 — wired the verified
+  `zer_bitcast_operand_valid`; see the FIXED entry below]**. Was: `@bitcast(*T, intval)`
+  reinterprets an integer as a pointer with a clean compile: on 64-bit a ptr and u64 are
+  both 8 bytes so `zer_bitcast_width_valid` passes, and the handler (checker.c:7230-7270)
+  calls ONLY the width + const/volatile-strip checks — never an int-vs-ptr operand check.
+  A grammar-level breach of the "no in-language unsafe" closure (synthesizes the banned
+  `ptr+N`). The fix predicate ALREADY EXISTS and is VST-verified —
+  `zer_bitcast_operand_valid(is_primitive)` returns 0 for a pointer operand
+  (src/safety/cast_rules.c:31, proofs/vst/verif_cast_rules.v) — but is NEVER CALLED from
+  checker.c. Control: `(*T)int`→"use @inttoptr" (checker.c:6840), `(u32)ptr`→"use
+  @ptrtoint" (6848) — every other path gates int↔ptr; only `@bitcast` bypasses all three.
+  **Fix = one call site** (wire the proven predicate; reject when exactly one of {src,dst}
+  is a pointer) + tripwire. The cleanest fix in this whole audit.
+- **`@pun` `type_id==0` short-circuit** (#4) — **[FIXED 2026-06-23 — compile-time
+  widening reject; see the FIXED entry below]**. Was: the emitted guard is
+  `if (type_id != TGT && type_id != 0) trap` (emitter.c:2723/2870/2951/2972/6860/6921;
+  comment at 2908 admits "type_id == 0 sentinel matches anything"). An in-ZER pointer to
+  a PRIMITIVE (`*u32`/`*u8`/slice `.ptr`/`@inttoptr` result) packs `type_id==0`, so
+  `(0 != TGT && 0 != 0)` = false → trap SKIPPED even for a statically-known size mismatch
+  (`*u32 sp=&small; *Big bp=@pun(*Big,sp); bp.b` reads 8 past a 4-byte object). The opaque
+  oracle (lambda_zer_opaque J04) models TRACKED provenance and never sanctions extending
+  the unknown-tag(0) escape to a fully-typed in-program pointer. **Fix:** don't grant the
+  `!=0` escape to a fully-typed in-ZER primitive/slice pointer (the 0-escape is only for
+  genuinely-unknown cinclude `*opaque`), or add the compile-time size-widening check.
+- **move-struct alias** (#1, line ~1551) — an alias taken BEFORE the move-transfer isn't
+  registered in the source's state group, so TRANSFERRED doesn't propagate → free/move
+  tracking defeated.
+- **VRP scope-leak OOB** (#2, line ~1636) — a branch-local range narrowing leaks past a
+  control-flow join (flat AST `var_range_count` not saved/restored on the non-comparison
+  branch) → the compiler proves `buf[idx]` safe and emits NO bounds check on a path where
+  `idx` is OOB. ROOT: the sound CFG-VRP `vrp_ir.c` is orphaned (absent from the Makefile,
+  not even compiled); production runs the unsound flat pass. Oracle now exists
+  (lambda_zer_bounds/bounds_lattice.v `elide_on_join_sound`); fix = wire `vrp_ir.c`.
+- **fixed-array bare-call index** (#5, line ~1786) — `arr[f()]` on a fixed array drops the
+  bounds check on the bare-call single-eval emission path.
+- **`|*v|` capture escape** (#6, line ~1829) — the `if(opt)|*v|` capture binds `v=&m.value`
+  (into a local) but the desugaring doesn't inherit `is_local_derived`, so `g=v` is treated
+  as a normal global store → dangling global. The direct `g=&m.value` IS rejected; only the
+  capture-synthesized address slips through. Oracle now exists
+  (lambda_zer_capture/capture_lattice.v — `capture_preserves_escape` + `buggy_reset_unsound`
+  witness the bug); fix = capture inherits the matched value's region.
+- **defer-body UAF** (line ~1459) — a defer body uses a handle the function body then frees.
+- **P9 by-value struct field-launder** (#P9) — **[FIXED 2026-06-24 — see BUGS-FIXED.md]**.
+  Was: `void stash(Holder h){ g = h.p; }` + `stash({.p=&local})` COMPILED — a pointer field
+  of a by-value struct PARAM stored to a global laundered a local-derived pointer (the direct
+  `g = h.p` with a local `h` was already caught; only the through-a-param launder slipped).
+  Found by the empirical probe sweep. Fixed: the keep-2a sink (checker.c ~4209) now descends
+  the `param.field` projection to the root param and infers keep (theorem param_lattice.v T5
+  projection_preserves_escape / buggy_projection_unsound). This was a form→state coverage
+  gap, NOT a missing finite state — the per-sink-patchwork class the codebase warns about.
+
+**Data-race (HIGH concurrency):** shared-struct multi-access hidden in a cast/intrinsic/
+index/orelse SUBEXPRESSION evades the same-statement deadlock/lock check (#7, ~1881); the
+`spawn` data-race scan is blind to function-pointer indirection (#8, ~1925); shared access
+in an `await` CONDITION is not locked (D02 false-negative, #9, ~1963). The **cross-block
+scoped-borrow** hole (spawn + access in different CFG blocks) is **FIXED 2026-08-03** via
+`Checker.branch_depth` / `Symbol.th_spawn_branch_depth` — not the zercheck_ir borrow-set
+merge previously sketched here, which named the wrong subsystem.
+
+**Miscompile (MEDIUM — unsound OUTPUT, not a UAF):** value-returning `async` never finalizes
+its state machine (#10, ~2001); bit-query/byte-swap intrinsics emit `0` in global
+initializers (#11, ~2046); `defer` + backward `goto` fires the wrong defer count (#12,
+~2080 / the "defer fires twice" entry ~799); compound `/=`/`%=` lack the signed-overflow
+trap on the AST emit path (~938).
+
+### NOT-FLEXIBLE — over-rejects (rejects correct code). Coarse abstractions.
+
+- **Escape disjunctive return** — **NARROWER THAN PREVIOUSLY STATED (empirically corrected
+  2026-06-24).** The common disjunctive shapes COMPILE: `pick(c){if c return &g1; return &g2}`
+  (both static) and `either(p,c){if c return p; return &g}` called with a global arg both
+  compile (Stages 1-2 handle them). The flat `ret_param_mask`'s only real loss vs the JOIN is
+  using the surviving `ARParam` fact for DOWNSTREAM precision, not the escape verdict itself
+  — for the escape decision, "summary incomplete → UNKNOWN → reject" and "summary contains
+  ARLocal → reject" coincide, so a function with a genuinely-unclassifiable return path is
+  rejected either way (and is usually unsafe to escape anyway). The RICH oracle
+  (lambda_zer_escape/join_lattice.v) is still worth implementing for downstream precision +
+  the relational tail, but the "EVERY call maximally conservative" framing was an over-claim.
+- **Aliased mutation** — **DOES NOT REPRODUCE (empirically corrected 2026-06-24).** ZER has
+  NO aliasing-XOR-mutability rule, so two live interior pointers into one array mutated
+  through both (`*u32 p=&a[0]; *u32 q=&a[5]; *p=1; *q=2;`) COMPILES — ZER already accepts
+  what Rust rejects here; there is nothing to "unblock". The disjoint oracle
+  (lambda_zer_disjoint/disjoint_lattice.v) is NOT needed to accept aliased mutation. The
+  genuine residual is narrower: the `alloc_id` **fate-sharing** false-positive (freeing one
+  slice-half false-flags the other; mixing literal/variable index frees, BUG-741) — that is
+  the only real over-rejection in this area, and it needs the relational layer.
+- **Nested inline designated initializer** (#13) — **[FIXED 2026-06-24 — see BUGS-FIXED.md]**.
+  Was: `Outer o = { .inner = { .x = 1 }, .y = 2 };` rejected with "field '.inner' … got
+  'void'" (the inner `{ .x = 1 }` has no standalone type). Fixed: `validate_struct_init`
+  (checker.c ~1441) now recurses on a `NODE_STRUCT_INIT` field value, validating it against
+  the field type (which it inherits as context). 2/3-level nests compile+run; inner
+  field-name/type errors still rejected.
+- **MAYBE_FREED path-correlation — FIXED (2026-06-27): Level B guarded refinement SHIPPED.**
+  `if(c){free(h)} if(!c){use(h)}` — and the matching double-free under `!c` + the leak check
+  when freed under both `c` and `!c` — now COMPILE: freeing under one guard and using/freeing
+  under the DISJOINT complement is recovered, gated on PROVABLE guard disjointness (else the
+  Level-A MAYBE_FREED conservatism stands). Implementation (zercheck_ir.c): per-block
+  immutable-bool guard sets (`ir_compute_block_guards`) + per-handle `free_block` /
+  `freed_all_paths`; the use/double-free/leak sites relax via `ir_use_guard_disjoint` /
+  `ir_free_completes_coverage`. SOUNDNESS GATE: `ir_local_is_immutable_bool` via a no-default
+  exhaustive AST walk (`ast_name_mutated_or_addrd`) rejecting any reassigned/address-taken
+  condition — two accept-unsafe holes (reassigned param; `&c` in a call arg) were found+closed
+  during the build. Certified by handle_flow_lattice.v Level B. Tests:
+  `tests/zer/guarded_maybe_freed_disjoint.zer` + 6 `tests/zer_fail/guarded_*`. Full detail:
+  BUGS-FIXED.md 2026-06-27.
+  - **DEFERRED — full state-TRUTHFULNESS (2026-06-28).** The shipped design is
+    DECISION-layer (the `MAYBE_FREED` state stays coarse; the use/double-free/leak
+    sites consult guard side-channels to get the right OUTCOME). The truer
+    STATE-layer version (refine `MAYBE_FREED → ALIVE` in the lattice so every
+    consumer sees the truth) was attempted and reverted — it regressed the leak on
+    a nested `if` (the refinement bypasses the `freed_all_paths` set-path; the
+    leak's "freed on ALL paths" is a coverage fact that can't be per-block state).
+    Outcomes are already correct; state-truthfulness needs a per-handle
+    free-guard-SET + a more precise (dominator/per-edge) guard computation. See
+    `docs/compiler-internals.md` "Sound relaxation" (the reverted-attempt note).
+- Every flat-lattice class carries residual over-rejection by construction (see below).
+
+### ORACLE COVERAGE — the theorem layer, by class (the (c) criterion)
+
+- **AT-MAX (sound + MAX-oracle-backed):** **CORRECTED (2026-06-24, maximality workflow
+  overturned the original trio).** The verified at-max set is `move` (lambda_zer_move),
+  `qualifier` and `volatile` (the property admits no richer sound abstraction). `@ptrcast`/
+  `@container` provenance (lambda_zer_opaque) is SUFFICIENCY-only for the modeled fragment
+  (PtrNull / type_id=0 / structured `@container` provenance unmodeled). MMIO is COARSE (see
+  below). **Handle is NOT at-max:** its operational track leaves soundness obligations
+  unproved (excluded from the gate) and the gated Iris track is flat 2-state with placeholder
+  lemmas — BUT the abstract DOMAIN is now certified by
+  `lambda_zer_handle/handle_flow_lattice.v` (the 4-state flow lattice + JOIN merge, Level A;
+  the guarded MAYBE_FREED refinement, Level B). So handle's domain went uncertified → certified
+  (2026-06-24); the proof-track admits/placeholders remain a separate cleanup.
+- **COARSE oracle (exists but FLAT — precision left on the table):** escape (shipped
+  `param_lattice.v` is flat; the rich `join_lattice.v` is spec-only), bounds (interval, not
+  relational `i<j`), qualifier / capture / volatile (the 4 added 2026-06-23 are flat by
+  design), optional/null (typing.v Section N is flat — certifies only `?T`-vs-`*T`
+  type-discipline, NOT the flow-sensitive null-state lattice; rows N04/N06/N07/N08 unproven,
+  typing.v:1324).
+- **NO oracle (finite-state set UNCERTIFIED — discovered by red team):** distinct-typedef
+  unwrap invariant (the #1 historical bug class BUG-409/GAP-F, guarded only by the
+  line-frozen `tools/audit_type_dispatch.sh` linter, not an oracle), division-by-zero,
+  integer-overflow-wrap, shift safety, ISR safety, naked/asm (Z9/Z10/Z13 never shipped),
+  stack-overflow/recursion, `@critical` control-flow, and the intrinsic-miscompile classes
+  (#10/#11/#12). The "next frontier" oracle backlog (concurrency/ISR/atomics/async/MMIO
+  decision oracles) is line ~393.
+
+### NAMED FLOORS — NOT gaps (out of scope, do not chase)
+
+cinclude/FFI `type_id=0` (extern `*opaque`, C-domain), liveness/deadlock-livelock (out of
+scope for ZER *and* Rust), hardware-consequence (datasheet/silicon correctness — physics
+floor).
+
+### PRIORITY (fixed by the "never allow unsafe" hard constraint — sound before precision)
+
+1. **The two proof-backed near-free CRITICAL wins:** `@bitcast` #3 (wire the already-VST-verified
+   `zer_bitcast_operand_valid`, one call site + tripwire) and `@pun` #4 (the size guard).
+2. The stateful CRITICAL holes: #1 (decl-site alias), #2 (wire `vrp_ir.c`), #5 (emitter path),
+   #6 (capture inherits region — oracle ready).
+3. The HIGH races (#7/#8/#9) + the cross-block scoped-borrow.
+4. The MEDIUM miscompiles.
+5. THEN precision: implement `join_lattice.v` (disjunctive return) and `disjoint_lattice.v`
+   (aliased mutation), and write the missing/richer oracles (relational bounds, the null
+   flow-state lattice, distinct-unwrap, the no-oracle classes).
+---
+
+## [MOVED 2026-11-14] PLAN — asm Option E rework (Level C cleanup first)
+
+The asm-safety architecture is slated to move to Option E (three-layer, no-favored-
+ISA — `docs/asm_lang_zer_safe.md` §1.7). **Phase 1 = Level C cleanup**: delete the
+per-arch infrastructure (~7,000 lines: register/instruction tables, categories
+framework, probe scripts, `arch_data/*.zerdata`, stray `.v`), replace the
+checker.c F7-full table dispatch with a hardcoded ~12-entry UB-classics list, and
+delegate register/instruction/feature validation to GCC. **Intrinsics STAY in
+Phase 1** — they get re-layered (operation→Layer 1, x86 asm→Layer 2 lib) only in
+Phase 3. Verified file-by-file execution checklist (commit order, regression net,
+the `.v`/`check-vst` coupling asm_lang §10 underspecifies):
+**`docs/option_e_plan.md`** — fresh-session-executable. `tests/test_asm_matrix.c`
+is the regression net for the deletion.
+---
+
+## [MOVED 2026-11-14] STATUS — soundness oracle suite (read first, 2026-06-07)
+
+Four exhaustive `-Wswitch`-enforced oracles guard the compiler's safety analysis.
+A "hole" = a NEG cell that compiled clean (false negative = unsafe program
+accepted, the unacceptable class) or a POS cell that was rejected (over-rejection,
+acceptable but logged). Each is built + run by `make check`.
+
+| Oracle | File | Cells | Domain | Status |
+|---|---|---|---|---|
+| Shape | `tests/test_shape_matrix.c` | 25 | temporal (UAF/double-free/leak/move) × type × reach-shape | green |
+| Escape | `tests/test_escape_matrix.c` | 35 | local-pointer escape × launder × sink | green |
+| Keep | `tests/test_keep_matrix.c` | 21 | non-keep-param persistence × launder × sink (+ keep valve) | green |
+| Control-flow | `tests/test_cflow_matrix.c` | 38 | if/loop/switch/break/continue/defer merges × {pool,slab} | green |
+| Concurrency | `tests/test_conc_matrix.c` | 15 | data-race / spawn / deadlock / ThreadHandle join | green |
+| ISR/atomics/MMIO | `tests/test_hw_matrix.c` | 12 | MMIO range/align/decl, volatile-strip, ISR context + data-race (program-consequence only) | green |
+| Async | `tests/test_async_matrix.c` | 10 | yield/await in defer/@critical, spawn-in-async, valid yield/await/defer/state-promotion | green |
+| Asm | `tests/test_asm_matrix.c` | 11 | DURABLE asm surface: S1 naked-only, S2/S3/S4, empty-insn, Z8 const-output, Z11 non-keep-ptr+mem-clobber (NOT F4-F7 register tables) | green |
+
+**Pointer-lifetime axis ("universal pointer") is DONE** (2026-06-07): the
+compile-time `keep` model (PART 5 of `docs/universal_pointer.md`) — all 5 steps
+complete, boundary defaults audited. This session closed 24 real holes (16 escape
++ 6 keep + 1 defer-double + 1 struct-copy). Do NOT re-investigate the pointer
+axis for false negatives without a new launder/shape idea — the four oracles are
+the standing guard; add a cell if you have a new idea.
+
+**Next frontier = the non-memory domains** (concurrency / ISR / atomics / async /
+MMIO). See the dedicated OPEN entry below.
+---
+
+## [MOVED 2026-11-14] OPEN — next frontier: concurrency / ISR / atomics / async / MMIO oracles
+
+Domains 1 (concurrency) and 2 (ISR/atomics/MMIO) now HAVE oracles (both
+green, 0 holes — see the STATUS table). **Domain 3 (async) is the remaining
+gap.** The non-memory domains needed their own harness shapes (concurrency is
+timing/structural; ISR/privileged ops use the EMIT-ONLY + dead-branch pattern).
+Recommended approach for the remainder: **survey first** — write a handful of
+adversarial NEG programs, see which leak (compile clean when they should reject),
+then build/extend the oracle.
+
+Many rules here ARE accept/reject (oracle-able like the memory matrices); a few
+(shared-struct auto-lock *correctness*) are emission-correctness, not accept/
+reject, and need an emit-inspection check instead.
+
+**Domain 1 — data-race / spawn / deadlock — DONE (2026-06-07).**
+`tests/test_conc_matrix.c`, 15/15, **0 holes found** (regression lock-in — the
+spawn/deadlock/join checks are structural bans, built with extensive
+Rust-equivalent tests, and held up including the edge cases that found holes in
+other domains: transitive non-shared global at call depth, Slab-access from
+spawn, and ThreadHandle joined in only one branch). Covered NEG: spawn
+non-shared ptr, spawn non-shared global (direct + transitive), deadlock
+same-statement, spawn-in-@critical, ThreadHandle not joined (direct +
+one-branch). POS: shared auto-lock, scoped spawn+join (incl. join-both-branches),
+value args, separate-statement shared access, threadlocal. Residual (add when
+convenient): `shared(rw)` concurrent-reader same-statement, Ring/Pool-from-spawn
+(only Slab tested), condvar/@barrier/@once interactions, deeper deadlock cycles
+(A→B→C ordering).
+
+**Domain 2 — ISR / atomics / MMIO — DONE (2026-06-07).**
+`tests/test_hw_matrix.c`, 12/12, **0 holes** (regression lock-in — MMIO/volatile/
+ISR checks are mature). PROGRAM-CONSEQUENCE only, per
+docs/firmware_safety_extensions.md: tests wrong USES with a structural shadow,
+NOT the hardware floor. NEG: @inttoptr no-decl / out-of-range / misaligned,
+volatile-strip, slab-in-ISR, spawn-in-ISR, ISR non-volatile shared global, ISR
+volatile compound-RMW. POS: @inttoptr in-range+aligned (incl. writing 9601 — the
+floor value COMPILES, demonstrating the split), pool-in-ISR, atomic global, ISR
+volatile plain assign. EMIT-ONLY harness (interrupt attrs may not compile on
+hosted gcc). DELIBERATELY EXCLUDED (floor / Definition B / pending gaps — a NEG
+cell for these would be a WRONG expectation): 9601-vs-9600 baud value,
+read-clears / W1C / sticky side effects (§16), region-kind hardware correctness,
+`@section`/region-kinds/`@reset_handler`/linker-symbol features (not built).
+Residual (add when convenient): @atomic non-1/2/4/8 width reject, MMIO
+variable-index runtime-trap (belongs in tests/zer_trap, not emit-only).
+
+**Domain 3 — async (yield/await) — DONE (2026-06-07).**
+`tests/test_async_matrix.c`, 10/10, **0 holes** (regression lock-in — async bans
+are structural). NEG: yield/await in defer, yield/await in @critical,
+spawn-in-async. POS: yield, await, defer-without-suspend, local across yield
+(state promotion), await-on-shared. **Key finding (corrected a wrong
+expectation):** `await g.ready == 1` (await condition reads a shared struct) is
+SAFE and correctly COMPILES — each poll locks/reads/unlocks and the lock is
+released BETWEEN polls, never held across the suspension. `yield`/`await` are
+STATEMENT-ONLY (can't embed in an expression — `g.v + yield` is "undefined
+identifier 'yield'"), so a shared lock (held only for its own statement) can
+never bracket a separate suspend statement. The "shared access in a statement
+containing yield" rule (checker.c:5450) is therefore defensive/forward-compat and
+effectively unreachable today — no false negative, the unsafe construction isn't
+expressible. (The async analog of the 9601-floor lesson: don't assume a construct
+is unsafe; verify. await-on-shared is the floor-equivalent that must COMPILE.)
+Residual: if yield/await ever become expressions, revisit the 5450 reachability.
+
+**ALL THREE FRONTIER DOMAINS DONE (2026-06-07).** The seven-oracle suite (shape,
+escape, keep, cflow, conc, hw, async) covers the memory-safety axes AND the three
+non-memory domains. Net for the frontier: 0 holes found (all regression lock-in)
+— the concurrency/ISR/async checks are mature structural bans, in contrast to the
+pointer-axis data-flow analyses (24 holes this session). What remains is lower-
+value coverage debt (the per-domain "Residual" notes above + the shape-matrix
+roadmap items below), not known false negatives.
+
+**Breadth survey (2026-06-07):** direct-case guards CONFIRMED firing —
+`spawn worker(&local)` (non-shared ptr → "data race"), `@inttoptr(const)` with no
+`mmio` range (→ "requires mmio range"), `yield` in `defer` (→ "corrupts coroutine
+state") all reject correctly. So the frontier is NOT wide-open; the oracle work is
+finding LAUNDERED / merge / cross-context edge cases (as the memory oracles found
+24), not plugging direct holes. Start each domain oracle from its accept/reject
+rules above and add launder/merge variants.
+
+**Harness notes:** privileged/hardware ops (ISR bodies, `@cpu_*`, MMIO) can't
+`--run` in a hosted container — use EMIT-ONLY (`zerc f.zer -o /tmp/x.c`, exit 0 =
+zercheck accepted) for POS, and the dead-branch pattern (`volatile u32 nt = 0;
+if (nt == 42) { ...privileged... }`) to compile without executing. Integrity
+guard: a NEG rejection must name the relevant safety reason (data race / deadlock
+/ ISR / not joined / atomic width), not a parse error. Model the oracle on
+`tests/test_cflow_matrix.c` (closest structure: NEG+POS, find_zerc, -Wswitch).
+
+When a domain oracle lands: add it to the STATUS table above, wire into
+`make check` (Makefile `check:` deps + run line), document in
+`docs/compiler-internals.md`, and trim this entry's covered domain.
+---
+
+## [MOVED 2026-11-14] OPEN — shape-matrix oracle: remaining coverage roadmap
+
+`tests/test_shape_matrix.c` is the exhaustive memory-safety oracle (option A,
+the replacement for the retired dual-run). It currently covers 25 cells:
+3 types {pool/Handle, slab/`*T`, move-struct} × 7 reach-shapes {bare, field,
+array, fnarg, field-xfn (GAP-A), spawn (GAP-C), deref (BUG-463)} × 4 violations
+{uaf, double-free, leak, use-after-move}. Found+fixed BUG-702 (compound leak)
+and BUG-703 (move-field over-rejection). These remaining axes are NOT coverage
+yet. Ranked by likelihood of finding NEW under-rejections (vs regression
+lock-in). NONE are bugs — they're coverage debt: surface where a silent
+under-rejection could still hide.
+
+**1. Control-flow / path-sensitivity axis — DONE (core), 2026-06-07.**
+`tests/test_cflow_matrix.c` now covers `{pool, slab}` × 19 control-flow
+scenarios (if-then/if-both/loop/next-iter/switch-one/switch-all/double-if/
+leak-if/leak-loop/nested-if/break/continue/defer-double + the safe POS
+counterparts), 38/38. Found+fixed BUG-727 (defer + explicit double-free was a
+false negative). Residual control-flow shapes NOT yet enumerated (lower
+likelihood, add when convenient): `orelse`-unwrap/fallback paths crossed with
+free state; `goto` (forward past a use; backward re-use); deeply-nested (3+)
+control flow; move-struct and `*opaque` types under control flow (the cflow
+matrix uses pool Handle + slab `*T` only). None are known bugs — coverage debt.
+
+**2. `*opaque`/extern type row — LOW value (lock-in).** A 4th type
+(`TY_OPAQUE`: bodyless `?*opaque make()` extern-alloc + `void destroy(*opaque)`
+extern-free). Codegen catch: positives can't `--run` (bodyless externs won't
+link). Solution worked out: add a per-type `compile_only` flag and assert the
+positive with EMIT-ONLY (`zerc f.zer -o /tmp/x.c`, no GCC/link) = exit 0 means
+zercheck accepted; negative = `-o /dev/null` still fails at zercheck before
+link. Locks in GAP-B (extern-alloc+orelse) and GAP-D (destructor heuristic).
+Just audited 2026-06-06, so mostly regression lock-in.
+
+**3. Smaller lock-in cells — LOW value.** wrong-pool (`pool_a` handle freed via
+`pool_b` — BUG-471 class); move-array (`consume(arr[0])` move element —
+BUG-476 class); alias chains (`h2=h1; free(h1); use(h2)`); return-escape
+(`return h` — escape-vs-leak distinction); slab field/array storage (currently
+pruned for the `*T`-in-struct non-null concern — verify whether it works).
+
+**4. Different domain → SEPARATE harness.** Concurrency / ISR / atomics / async /
+MMIO — promoted to its own actionable entry: see "OPEN — next frontier:
+concurrency / ISR / atomics / async / MMIO oracles" above (per-domain
+accept/reject rules + survey-first plan + harness notes).
+
+When any axis is added: add the cells, update the "Extending the grid" coverage
+list in `docs/compiler-internals.md`, and trim this entry.
+---
+
+## [MOVED 2026-11-14] Tracking notes
+
+All entries in `KNOWN_FAIL` skip lists (tests/test_zer.sh,
+rust_tests/run_tests.sh, zig_tests/run_tests.sh) are back-referenced here.
+When fixing an entry, remove it from the relevant list to prevent
+regression-hiding.
+
+When a `tests/zer_gaps/` reproducer is fixed, move it to
+`tests/zer_fail/` so it becomes a permanent regression guard.

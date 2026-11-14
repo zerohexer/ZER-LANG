@@ -1,0 +1,10 @@
+// expect-error: contains a label
+// BUG-1658: `.L1` is a legal assembler symbol; the rule matched a label name as
+// letters, digits and underscore only.
+naked void spin() {
+    asm {
+        instructions: ".L1: jmp .L1"
+        safety: "structural asm rule test: the text here is never meant to be assembled"
+    }
+}
+u32 main() { return 0; }

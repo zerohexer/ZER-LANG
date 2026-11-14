@@ -15,7 +15,7 @@
 #   docs/compiler-internals.md   move a section that became history to the END of
 #                                docs/compiler-internals-history.md, or tighten one in place
 #
-# The archives (limitations-closed, limitations-legacy, compiler-internals-history,
+# The archives (limitations-closed, compiler-internals-history,
 # session-playbook) are grep-only and have no budget.
 #
 # Usage: bash tools/audit_docs_budget.sh

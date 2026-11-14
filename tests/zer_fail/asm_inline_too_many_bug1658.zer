@@ -1,0 +1,7 @@
+// expect-error: max is 16
+// BUG-1658: the 16-instruction rule was asked only of the structured form.
+naked void sled() {
+    asm("nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n"
+        "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop\n" "nop");
+}
+u32 main() { return 0; }

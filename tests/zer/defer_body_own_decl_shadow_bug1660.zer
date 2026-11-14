@@ -1,0 +1,93 @@
+// BUG-1660: a name a `defer` body DECLARES ITSELF must resolve to that
+// declaration. A leftover pass renamed every identifier in the body, at the
+// `defer` statement, to the same-named local visible OUTSIDE the body whenever
+// that outer local carried a suffixed C name (i.e. it shadowed another) — before
+// any of the body's own declarations existed. Every cell below read or wrote the
+// outer `z` instead of the body's: a silent wrong value, and in `ptr_other_type`
+// a write through a pointer of a different struct type (the wrong object).
+//
+// One cell per way a body can declare a name; each lives in its own function so
+// one wrong answer cannot hide another.
+struct A { u32 x; }
+struct B { u32 pad0; u32 pad1; u32 pad2; u32 x; }
+A ga;
+B gb;
+u32 g;
+?u32 five() { return 5; }
+enum Kind { small, big }
+union Val { u32 n; u8 b; }
+
+u32 var_decl() {
+    u32 z = 9;
+    { u32 z = 1; defer { u32 z = 5; g = z; } z += 1; }
+    return z;
+}
+u32 nested_block() {
+    u32 z = 9;
+    { u32 z = 1; defer { { u32 z = 5; g = z; } } z += 1; }
+    return z;
+}
+// A use BEFORE the body's declaration still means the outer one (2 at fire time).
+u32 use_before_decl() {
+    u32 z = 9;
+    { u32 z = 1; defer { u32 w = z; u32 z = 5; g = z + w; } z += 1; }
+    return z;
+}
+u32 for_init() {
+    u32 z = 9;
+    { u32 z = 1; defer { for (u32 z = 0; z < 3; z += 1) { g += z; } } z += 1; }
+    return z;
+}
+u32 outer_is_param(u32 z) {
+    { u32 z = 1; defer { u32 z = 5; g = z; } z += 1; }
+    return z;
+}
+u32 if_capture() {
+    u32 z = 9;
+    { u32 z = 1; defer { if (five()) |z| { g = z; } } z += 1; }
+    return z;
+}
+u32 switch_capture() {
+    u32 z = 9;
+    {
+        u32 z = 1;
+        defer {
+            Val v;
+            v.n = 6;
+            switch (v) {
+                .n => |z| { g = z; }
+                .b => |z| { g = 100; }
+            }
+        }
+        z += 1;
+    }
+    return z;
+}
+u32 ptr_other_type() {
+    *A z = &ga;
+    { *A z = &ga; defer { *B z = &gb; z.x = 77; } z.x = 1; }
+    return z.x;
+}
+// The outer name is still reachable from the body when the body does not
+// declare it — the shadowing local, not the function-level one.
+u32 outer_still_visible() {
+    u32 z = 9;
+    { u32 z = 1; defer { g = z; } z += 1; }
+    return z;
+}
+
+u32 main() {
+    g = 0; if (var_decl() != 9) { return 1; }          if (g != 5) { return 2; }
+    g = 0; if (nested_block() != 9) { return 3; }      if (g != 5) { return 4; }
+    g = 0; if (use_before_decl() != 9) { return 5; }   if (g != 7) { return 6; }
+    g = 0; if (for_init() != 9) { return 7; }          if (g != 3) { return 8; }
+    g = 0; if (outer_is_param(9) != 9) { return 9; }   if (g != 5) { return 10; }
+    g = 0; if (if_capture() != 9) { return 11; }       if (g != 5) { return 12; }
+    g = 0; if (switch_capture() != 9) { return 13; }   if (g != 6) { return 14; }
+    ga.x = 0; gb.x = 0;
+    if (ptr_other_type() != 1) { return 15; }
+    if (gb.x != 77) { return 16; }
+    if (ga.x != 1) { return 17; }
+    g = 0; if (outer_still_visible() != 9) { return 18; } if (g != 2) { return 19; }
+    return 0;
+}

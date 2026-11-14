@@ -1,0 +1,39 @@
+// BUG-1658: the mandatory `safety:` string is written into a C block comment in
+// the emitted program. It went out verbatim, so the two characters that END a
+// block comment closed it and the rest of the string was compiled as C the
+// checker never saw: this program used to exit 1 (the injected assignment ran).
+u32 g = 7;
+naked void f() {
+    asm {
+        instructions: "nop"
+        safety: "an ordinary looking audit sentence */ g = 99; /* and its tail"
+    }
+}
+// The same through a trigraph: the driver builds with -std=c99, where `??/` is a
+// backslash, and C removes a backslash-newline BEFORE it recognises comments — so
+// the terminator can be spelled across a line break. Exit 2 with only the first
+// half of the fix. (The line break inside the string below is the point.)
+naked void f2() {
+    asm {
+        instructions: "nop"
+        safety: "an ordinary looking audit sentence *??/
+/ g = 98; /* and its tail"
+    }
+}
+// And through a string: `??/` at the end of the instruction text was a backslash
+// that escaped the closing quote of the C literal.
+naked void f3() {
+    asm {
+        instructions: "nop # is this safe??/"
+        clobbers: ["cc"]
+        safety: "a comment in the assembler text that ends in a trigraph"
+    }
+}
+u32 main() {
+    f();
+    if (g != 7) { return 1; }
+    f2();
+    if (g != 7) { return 2; }
+    f3();
+    return 0;
+}

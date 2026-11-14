@@ -473,6 +473,99 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   2000 increments through the helper, none lost; refused before), negatives
   `shared_opaque_helper_{keeps,returns}_bug1657`; ten conc-matrix cells.
 
+**Found by re-measuring the legacy ledger (2026-11-14)**
+- **BUG-1658 — asm text reached the generated C verbatim, and its rules read one of the two
+  asm forms as typed.** One root (user text copied into C unescaped, and judged as source
+  bytes), three defects. **(1) Unchecked C in the emitted program.** The mandatory
+  `safety:` string is written into a C block comment and went out verbatim: a string
+  containing the comment terminator closed it, and the rest of the string was compiled as C
+  no analysis saw (`safety: "... (close) g = 99; (open) ..."` ran the assignment). Breaking
+  the terminator was not enough: the driver builds with `-std=c99`, where the trigraph
+  `??/` is a backslash and a backslash-newline is removed BEFORE comments are recognised,
+  so `*??/` + line break + `/` spelled it again (measured: the statement still ran). And
+  the asm strings had the same disease in a different construct — `instructions:`, a
+  clobber name, a `section("...")` name and the inline `asm("...")` literals were copied
+  between C quotes verbatim, so `"nop # safe??/"` ended in a backslash that escaped the
+  closing quote and the C string ran on into the next user string (BUG-1350 fixed this for
+  ordinary string literals only). The class of BUG-1297 / BUG-1580. Fix: comment text goes
+  through `emit_comment_text` (terminator broken, no line break emitted); every string
+  goes through the existing escaper via `emit_c_string_lit` / `emit_inline_asm`. **(2)**
+  The structural rules S2 (at most 16 instructions) and S3 (no label) sat inside
+  `if (is_structured)`: the inline form had neither. **(3)** Both looked at source bytes:
+  an escaped line break (`\n`, `\x0a`) was invisible to them, and a label name was
+  matched as `[A-Za-z0-9_]`, so `.L1:` and `$x:` were not labels. Fix: `asm_text_decode`
+  returns the text as the assembler receives it — the literals' contents concatenated,
+  escapes decoded by ZER's rules, which the escaper now makes C's reading too — and
+  `check_asm_text_rules` asks S2 and S3 of that text for BOTH forms. The inline form,
+  captured raw by the parser, refuses an escape outside ZER's set (`\1` would be C's
+  octal); a NUL is a statement boundary, so what follows one is judged. An empty statement
+  (trailing separator, blank line) is no longer counted as an instruction. LIMIT, unchanged
+  and now written at the rule: audit rules over a block's shape, not a control-flow
+  guarantee. Tests: `asm_safety_text_cannot_close_comment_bug1658` (three cells: the
+  terminator, the trigraph line splice, the string; `zerc --run` exit 1 before),
+  `asm_sixteen_instructions_ok_bug1658` (refused before: a trailing separator counted),
+  seven negatives `asm_*_bug1658`. Gate: `test_asm_matrix` grew from 11 to 59 cells — form
+  x separator spelling x rule, label spellings, non-labels, five emitted-C assertions,
+  three text negatives — and every NEG cell now states its reason (the grid used to accept
+  any stderr containing "naked", which every naked function's warning does). 30 cells are
+  red on the previous compiler.
+- **BUG-1659 — a container template's fields were checked by none of the rules a struct's
+  are.** A struct field, a union variant and a field of a stamped container are one thing
+  to the emitter; the three declaring sites each carried their own copy of the member rules
+  and the container stamp carried none. `container C(T) { Ring(u8, 8) r; T x; }`, an
+  `Arena` field, a `void` field, a duplicate field name and an async task held by value all
+  passed the checker and reached GCC as C it refuses (loud, never silent). And template
+  substitution skipped two kinds that DO carry an inner type: `Pool(T, 4)` / `Ring(T, n)` /
+  `Slab(T)` were therefore reported as "undefined type 'T'" (the legacy ledger's entry),
+  and a function-pointer field over the parameter — `*(T) -> u32 cb;` — could not be
+  declared at all (an over-rejection nobody had recorded). Fix: ONE rule,
+  `check_aggregate_member` (void, allocator position through the VST-verified
+  `zer_container_position_valid`, async task by value), called from the struct, union and
+  container-stamp sites; duplicate names reported at the container DECLARATION;
+  `subst_typenode` is total (Pool / Ring / Slab element, function-pointer return and
+  parameters). The void rule now asks `type_dispatch_kind`, so a `distinct typedef void`
+  member is refused too. Tests: positive `container_funcptr_field_over_param_bug1659`
+  ("undefined type 'T'" before; runs, exit 0), seven negatives `container_*_bug1659` /
+  `union_void_variant_distinct_bug1659` (six ACCEPTED before, one refused for the wrong
+  reason). Corpus: 0 verdict changes over 4009 files.
+- **BUG-1660 — a name a `defer` body declares itself was read as a same-named OUTER local
+  (silent miscompile).** `u32 z = 9; { u32 z = 1; defer { u32 z = 5; g = z; } z += 1; }` set
+  `g` to 2. Whenever a function held two locals of one name (so one carries a suffixed C
+  name) and a defer body inside the inner one's scope declared a third — by a var-decl, a
+  for-init, an if-unwrap or switch capture — every use of the body's own name was bound to
+  the enclosing local: a wrong value; with two pointer types, `*B z = &gb; z.x = 77;`
+  wrote through the enclosing `*A z` (the wrong object); with handles, a valid program was
+  refused with "use after free: 'h_3'" about a variable the body never touches. Root cause:
+  `rewrite_defer_body_idents`, a leftover from when a defer body was replayed as raw AST. It
+  renamed every identifier in the WHOLE body, at the `defer` statement, to the local visible
+  there — before any of the body's own declarations had a local. Since BUG-959 the body is
+  lowered at registration, and lowering renames each statement's identifiers as it reaches
+  them, in the body's own scopes, into the same AST nodes the later consumers read: the
+  pre-pass was redundant where it was right and wrong where it differed. Fix: the pre-pass
+  is DELETED (function, forward declaration, 28 walker-baseline rows). Name resolution has
+  one owner. Found by running `loving-davinci-ii7a90`'s own test file, which that branch
+  had fixed and main never adopted. Tests: `defer_body_own_decl_shadow_bug1660` (nine
+  cells, one per way a body can declare a name; exit 2 before),
+  `defer_body_own_handle_shadow_bug1660` (refused before), regression pin
+  `zer_fail/defer_body_own_handle_leak_bug1660`. Measured: 0 verdict changes over the
+  corpus, and 0 run-time differences over the 237 tests that use `defer`.
+- **BUG-1661 — a shared struct was emitted without its condition variable** (loud: GCC,
+  "has no member named '_zer_cond'"). Which shared structs need a `pthread_cond_t` was
+  rediscovered by an emitter prescan that matched a `@cond_*` intrinsic only as the WHOLE of
+  an expression statement, one module at a time. So (a) `@cond_timedwait` — the one condvar
+  intrinsic that returns a value — was invisible in every natural position (`?void r = …`,
+  `if (…)`, `orelse`, `return`, an argument, an assignment) unless the same type also had a
+  statement-level `@cond_wait` / `@cond_signal` to mask it; and (b) a struct declared in
+  one module and waited on only in another never got the member, even for the statement
+  forms. Fix: the fact is recorded where it is true — the checker sets
+  `struct_type.uses_condvar` at the one place every condvar intrinsic is checked, on the
+  type itself (monotone, so the escape fixpoint's re-walk cannot lose it) — and the emitter
+  reads it; the prescan arm, `register_condvar_type` / `is_condvar_type` and the Emitter's
+  registry are deleted. Tests: `cond_timedwait_every_position_bug1661` (seven shared
+  struct types, one per position, so no position can mask another — all seven lacked the
+  member before), `test_modules/cond_user` + `cond_mod` (GCC error before; wired into
+  `run_tests.sh`). `vigilant-tesla-ef9cao` had fixed half of (a).
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

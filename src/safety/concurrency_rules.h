@@ -67,4 +67,19 @@ int zer_window_stmt_leaves(int is_return_or_goto, int is_loop_jump, int loop_dep
  * latched walk (a function with a goto / label) was counted at the entry. */
 int zer_window_counts_at_spawn(int closed, int latched);
 
+/* ---- spin-lock REGION decisions (BUG-1663) — oracle: lock_region.v ----
+ * A lock word may be written only by its acquire test and by the one release
+ * that closes that acquire's region; a read-modify-write is covered by a held
+ * lock only when its read and its write-back are inside one critical section. */
+int zer_lock_release_in_role(int closes_own_region, int already_released);
+int zer_lock_write_in_role(int sanctioned, int whole_word);
+int zer_rmw_copy_fresh(int by_own_declaration, int is_static, int sources_in_section);
+int zer_rmw_copy_in_section(int fresh, int same_region);
+int zer_rmw_one_section(int one_statement, int copies_in_section);
+int zer_rmw_lock_covers(int lock_held, int one_section);
+int zer_rmw_locked_exempt(int seen, int lock_held, int mixed, int store_outside);
+int zer_lock_word_ok(int whole_word, int thread_local, int shadowed);
+int zer_lock_acquire_agrees(int first, int same_free);
+int zer_lock_covers_defer(int opened_here, int release_deferred);
+
 #endif

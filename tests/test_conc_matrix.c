@@ -1571,6 +1571,156 @@ int main(void) {
         }
     }
 
+    /* ---- BUG-1663: the SPIN-LOCK REGION grid ------------------------------------
+     * "The code between a spin acquire and its release runs with the lock held"
+     * was read off one statement list. It is a claim about the whole program:
+     * every write of the lock word must be its own acquire test or the ONE release
+     * that closes that acquire's region, and (for a volatile flag) the read and
+     * the write-back of an update must sit in ONE region instance. Crossed over
+     * the DATA the lock guards — a volatile flag (the read-modify-write rule) and
+     * a plain global (the two-accessor rule) — because the two are judged by
+     * different sinks reading the same lock context. Model:
+     * proofs/operational/lambda_zer_concurrency/lock_region.v. Every negative
+     * cell compiles clean on the pre-fix compiler (run it with ZER_MATRIX_ZERC). */
+    {
+        typedef enum { LD_VOLATILE, LD_PLAIN, LD_COUNT } LockData;
+        typedef enum {
+            LS_OK_DIRECT,             /* POS  LOCK; g += 1; UNLOCK;                       */
+            LS_OK_DEFER_RELEASE,      /* POS  LOCK; defer UNLOCK; g += 1;                 */
+            LS_OK_DECL_SPLIT,         /* POS  LOCK; u32 t = g; g = t + 1; UNLOCK;         */
+            LS_OK_CALLEE_SPLIT,       /* POS  LOCK; bump(); UNLOCK;  (bump splits)        */
+            LS_OK_PLAIN_INIT,         /* POS  lk = 0; before the first spawn              */
+            LS_OK_DEFER_BODY_LATER,   /* POS  LOCK; defer UNLOCK; defer { g += 1; }       */
+            LS_OK_INVERTED_FREE,      /* POS  free value 1, every acquire agreeing        */
+            LS_NESTED_RELEASE,        /* NEG  a release inside an `if` in the region      */
+            LS_CALLEE_RELEASE,        /* NEG  a callee releases the lock                  */
+            LS_POINTER_RELEASE,       /* NEG  released through a pointer to the word      */
+            LS_NONHOLDER_RELEASE,     /* NEG  another thread stores 0 into the word       */
+            LS_LABEL_IN_REGION,       /* NEG  a goto enters past the acquire              */
+            LS_TWO_FIELDS_ONE_LOCK,   /* NEG  &s.a in one thread, &s.b in the other       */
+            LS_RELEASE_AFTER_DEFER,   /* NEG  a second release of a defer-released region */
+            LS_SPLIT_TWO_REGIONS,     /* NEG  read in one region, write-back in the next  */
+            LS_SPLIT_STALE_CARRIER,   /* NEG  the copy survives from an earlier iteration */
+            LS_SPLIT_GLOBAL_CARRIER,  /* NEG  the copy sits in a global between regions   */
+            LS_THREAD_SPLIT,          /* NEG  the THREAD splits across two regions        */
+            LS_DEFER_BODY_EARLIER,    /* NEG  LOCK; defer { g += 1; } defer UNLOCK;       */
+            LS_DEFER_BODY_DIRECT_REL, /* NEG  LOCK; defer { g += 1; } UNLOCK;             */
+            LS_SPIN_BODY_ACCESS,      /* NEG  the data touched in the spin body           */
+            LS_MIXED_FREE_VALUE,      /* NEG  cas(0->1) in one thread, cas(1->2) in other */
+            LS_THREADLOCAL_WORD,      /* NEG  the lock word is threadlocal                */
+            LS_STATIC_SHADOW,         /* NEG  a `static` local shadows the global lock    */
+            LS_SHADOWED_COPY,         /* NEG  an inner local of the copy's name           */
+            LS_COUNT
+        } LockShape;
+        static const char *const ld_name[LD_COUNT] = { "volatile-flag", "plain-global" };
+        #define LK  "while (!@atomic_cas(&lk, 0, 1)) { }"
+        #define ULK "@atomic_store(&lk, 0);"
+        for (LockData d = 0; d < LD_COUNT; d++) {
+            for (LockShape sh = 0; sh < LS_COUNT; sh++) {
+                const char *nm = "?", *extra = "", *body = NULL, *pre = "", *tail = "";
+                const char *wbody = LK " g += 1; " ULK;
+                const char *locks = "u32 lk;\n";
+                int neg = 1, vol_only = 0;
+                switch (sh) {
+                case LS_OK_DIRECT: nm = "ok-direct"; neg = 0;
+                    body = LK " g += 1; " ULK; break;
+                case LS_OK_DEFER_RELEASE: nm = "ok-defer-release"; neg = 0;
+                    body = LK " defer " ULK " g += 1;"; break;
+                case LS_OK_DECL_SPLIT: nm = "ok-declared-in-region"; neg = 0;
+                    body = LK " u32 t = g; u32 t2 = t + 1; g = t2; " ULK; break;
+                case LS_OK_CALLEE_SPLIT: nm = "ok-callee-split"; neg = 0;
+                    extra = "void bump() { u32 t = g; g = t + 1; }\n";
+                    body = LK " bump(); " ULK; break;
+                case LS_OK_PLAIN_INIT: nm = "ok-plain-init-before-spawn"; neg = 0;
+                    pre = "    lk = 0;\n";
+                    body = LK " g += 1; " ULK; break;
+                case LS_OK_DEFER_BODY_LATER: nm = "ok-defer-body-after-deferred-release"; neg = 0;
+                    body = LK " defer " ULK " defer { g += 1; }"; break;
+                case LS_OK_INVERTED_FREE: nm = "ok-inverted-free-value"; neg = 0;
+                    locks = "u32 lk = 1;\n";
+                    wbody = "while (!@atomic_cas(&lk, 1, 0)) { } g += 1; @atomic_store(&lk, 1);";
+                    body  = "while (!@atomic_cas(&lk, 1, 0)) { } g += 1; @atomic_store(&lk, 1);";
+                    break;
+                case LS_NESTED_RELEASE: nm = "nested-release";
+                    extra = "volatile u32 one = 1;\n";
+                    body = LK " if (one == 1) { " ULK " } g += 1; " ULK; break;
+                case LS_CALLEE_RELEASE: nm = "callee-release";
+                    extra = "void unl() { " ULK " }\n";
+                    body = LK " unl(); g += 1; " ULK; break;
+                case LS_POINTER_RELEASE: nm = "pointer-release";
+                    extra = "void rel(*u32 p) { @atomic_store(p, 0); }\n";
+                    body = LK " rel(&lk); g += 1; " ULK; break;
+                case LS_NONHOLDER_RELEASE: nm = "non-holder-release";
+                    extra = "void breaker() { for (u32 i = 0; i < 100; i += 1) { " ULK " } }\n";
+                    pre = "    ThreadHandle b = spawn breaker();\n";
+                    tail = "    b.join();\n";
+                    body = LK " g += 1; " ULK; break;
+                case LS_LABEL_IN_REGION: nm = "label-in-region";
+                    extra = "volatile u32 one = 1;\n";
+                    body = "if (one == 0) { goto inside; } " LK "\ninside:\n g += 1; " ULK; break;
+                case LS_TWO_FIELDS_ONE_LOCK: nm = "two-fields-one-lock";
+                    locks = "struct L { u32 a; u32 b; }\nL s;\n";
+                    wbody = "while (!@atomic_cas(&s.a, 0, 1)) { } g += 1; @atomic_store(&s.a, 0);";
+                    body  = "while (!@atomic_cas(&s.b, 0, 1)) { } g += 1; @atomic_store(&s.b, 0);";
+                    break;
+                case LS_RELEASE_AFTER_DEFER: nm = "release-after-defer";
+                    body = LK " defer " ULK " g += 1; " ULK; break;
+                case LS_SPLIT_TWO_REGIONS: nm = "split-two-regions"; vol_only = 1;
+                    body = LK " u32 t = g; " ULK " " LK " g = t + 1; " ULK; break;
+                case LS_SPLIT_STALE_CARRIER: nm = "split-stale-carrier"; vol_only = 1;
+                    extra = "volatile u32 one = 1;\n";
+                    pre = "    u32 t = 0;\n";
+                    body = LK " if (one == 0) { t = g; } g = t + 1; " ULK; break;
+                case LS_SPLIT_GLOBAL_CARRIER: nm = "split-global-carrier"; vol_only = 1;
+                    extra = "u32 mem;\n";
+                    body = LK " mem = g; " ULK " " LK " g = mem + 1; " ULK; break;
+                case LS_THREAD_SPLIT: nm = "thread-split-two-regions"; vol_only = 1;
+                    wbody = LK " u32 t = g; " ULK " " LK " g = t + 1; " ULK;
+                    body = LK " g += 1; " ULK; break;
+                case LS_DEFER_BODY_EARLIER: nm = "defer-body-before-deferred-release";
+                    body = LK " defer { g += 1; } defer " ULK; break;
+                case LS_DEFER_BODY_DIRECT_REL: nm = "defer-body-with-direct-release";
+                    body = LK " defer { g += 1; } " ULK; break;
+                case LS_SPIN_BODY_ACCESS: nm = "spin-body-access";
+                    body = "while (!@atomic_cas(&lk, 0, 1)) { g += 1; } " ULK; break;
+                case LS_MIXED_FREE_VALUE: nm = "mixed-free-value";
+                    wbody = "while (!@atomic_cas(&lk, 1, 2)) { } g += 1; @atomic_store(&lk, 1);";
+                    body = LK " g += 1; " ULK; break;
+                case LS_THREADLOCAL_WORD: nm = "threadlocal-word";
+                    locks = "threadlocal u32 lk;\n";
+                    body = LK " g += 1; " ULK; break;
+                case LS_STATIC_SHADOW: nm = "static-local-shadows-lock";
+                    wbody = "static u32 lk; " LK " g += 1; " ULK;
+                    body = LK " g += 1; " ULK; break;
+                case LS_SHADOWED_COPY: nm = "shadowed-copy"; vol_only = 1;
+                    body = "u32 t = g; " LK " { u32 t = g; if (t == 7) { return 1; } } g = t + 1; " ULK;
+                    break;
+                case LS_COUNT: break;
+                }
+                /* a split update of a PLAIN global is a logic matter (each access
+                 * holds the lock: no race); the exactness rule is the volatile one */
+                if (vol_only && d == LD_PLAIN) continue;
+                valid_cells++;
+                char lb[2400], cn[160];
+                snprintf(lb, sizeof(lb),
+                    "%su32 g;\n%s%s"
+                    "void w() {\n    for (u32 i = 0; i < 100; i += 1) {\n        %s\n    }\n}\n"
+                    "u32 main() {\n%s"
+                    "    ThreadHandle a = spawn w();\n"
+                    "    for (u32 i = 0; i < 100; i += 1) {\n        %s\n    }\n"
+                    "    a.join();\n%s    return 0;\n}\n",
+                    d == LD_VOLATILE ? "volatile " : "", locks, extra, wbody, pre, body, tail);
+                snprintf(cn, sizeof(cn), "lock-region/%s/%s", ld_name[d], nm);
+                int ok = neg ? run_neg(cn, lb) : run_pos(cn, lb);
+                fprintf(stderr, "  [%-13s][%-36s][%s] %s\n", ld_name[d], nm, neg ? "neg" : "pos",
+                        ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
+        }
+        #undef LK
+        #undef ULK
+    }
+
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);
     fprintf(stderr, "    false negatives: %d | invalid probes: %d | over-rejections: %d\n",
             false_neg, invalid_probe, over_reject);

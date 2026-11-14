@@ -7030,6 +7030,11 @@ static struct VolRmwFact {
     bool win_only;   /* a CALL whose callee read-modify-writes through a parameter:
                       * a thread walk judges that at the statement inside the callee
                       * (it may sit in an @once the call does not) */
+    bool noted;      /* BUG-1663: the "lock does not cover it" note was printed */
+    bool cont;       /* BUG-1663: the read and the write-back are provably inside ONE
+                      * lock region instance — one statement, or through locals that
+                      * are fresh in the region the statement is in. Only such a
+                      * fact can be exempted by a held lock. */
 } *_vol_rmw_facts = NULL;
 /* A statement that read-modify-writes THROUGH A PARAMETER (`*p += 1`), recorded by
  * the param-mask scan; which global that is depends on the caller's argument. */
@@ -7055,11 +7060,14 @@ static bool global_is_threadlocal(Symbol *g) {
            g->func_node->var_decl.is_threadlocal;
 }
 static void vol_rmw_fact_add_ex(Node *node, Symbol *g, Node *once, int line,
-                                const char *file, const char *src, bool win_only) {
+                                const char *file, const char *src, bool win_only, bool cont) {
     if (!node || !g || g->is_function || !g->is_volatile || g->is_const) return;
     if (global_is_threadlocal(g)) return;
     for (int i = 0; i < _vol_rmw_fact_n; i++)
-        if (_vol_rmw_facts[i].node == node && _vol_rmw_facts[i].g == g) return;
+        if (_vol_rmw_facts[i].node == node && _vol_rmw_facts[i].g == g) {
+            if (!cont) _vol_rmw_facts[i].cont = false;   /* two findings: the weaker one */
+            return;
+        }
     if (_vol_rmw_fact_n >= _vol_rmw_fact_cap) {
         int nc = _vol_rmw_fact_cap ? _vol_rmw_fact_cap * 2 : 16;
         struct VolRmwFact *nb = (struct VolRmwFact *)realloc(_vol_rmw_facts,
@@ -7070,16 +7078,28 @@ static void vol_rmw_fact_add_ex(Node *node, Symbol *g, Node *once, int line,
     struct VolRmwFact *f = &_vol_rmw_facts[_vol_rmw_fact_n++];
     f->node = node; f->g = g; f->once = once; f->line = line; f->file = file; f->src = src;
     f->win_only = win_only;
+    f->cont = cont; f->noted = false;
 }
-static void vol_rmw_fact_add(Checker *c, Node *node, Symbol *g, bool win_only) {
+static bool rmw_value_fresh(Checker *c, RmwTaintEnt *tab, int n, Node *e, Symbol *g);
+static void vol_rmw_fact_add(Checker *c, Node *node, Symbol *g, bool win_only, bool cont) {
     if (!node) return;
     vol_rmw_fact_add_ex(node, g, c->cur_once_node, (int)node->loc.line,
-                        c->file_name, c->source, win_only);
+                        c->file_name, c->source, win_only, cont);
+}
+/* BUG-1663: a CALL that read-modify-writes `g` — is every local copy of `g` it is
+ * handed fresh in this lock region? (The callee's own statements run inside the
+ * call; its locals are new on every call.) */
+static bool call_rmw_cont(Checker *c, Node *call, Symbol *g) {
+    if (!call || call->kind != NODE_CALL) return false;
+    for (int i = 0; i < call->call.arg_count; i++)
+        if (!rmw_value_fresh(c, c->rmw_taints, c->rmw_taint_count, call->call.args[i], g))
+            return false;
+    return true;
 }
 /* `ud` is the NODE_CALL whose argument reaches g. */
 static void track_rmw_arg_visit(Checker *c, Symbol *g, void *ud) {
     track_isr_global(c, g->name, g->name_len, true);
-    vol_rmw_fact_add(c, (Node *)ud, g, true);   /* BUG-1652 */
+    vol_rmw_fact_add(c, (Node *)ud, g, true, call_rmw_cont(c, (Node *)ud, g));   /* BUG-1652 */
 }
 static void track_opaque_arg_visit(Checker *c, Symbol *g, void *ud) {
     (void)ud;
@@ -7366,6 +7386,7 @@ static void rmw_tab_add(RmwTaintEnt **tab, int *n, int *cap, const char *nm, uin
     for (int i = 0; i < *n; i++)   /* reuse a cleared row of the same name */
         if (!(*tab)[i].global && (*tab)[i].name_len == nl && memcmp((*tab)[i].name, nm, nl) == 0) {
             (*tab)[i].global = g;
+            (*tab)[i].fresh = false; (*tab)[i].region = 0;   /* BUG-1663 */
             return;
         }
     if (*n >= *cap) {
@@ -7378,13 +7399,51 @@ static void rmw_tab_add(RmwTaintEnt **tab, int *n, int *cap, const char *nm, uin
     (*tab)[*n].name = nm;
     (*tab)[*n].name_len = nl;
     (*tab)[*n].global = g;
+    (*tab)[*n].fresh = false; (*tab)[*n].region = 0;   /* BUG-1663: set by the declaring site only */
     (*n)++;
 }
 /* A plain `t = <value>` (or a declaration): t now carries exactly these. */
+/* BUG-1663: is every LOCAL copy of `g` this expression mentions one that was read
+ * in the lock region the checker is in NOW? (A direct read of `g`, or a call that
+ * reads it, happens in the statement itself and needs no row.) False for a copy
+ * taken in another critical section, outside any, or by anything but the local's
+ * own declaration initializer — the write-back then does not sit in the critical
+ * section its read did. One complete walker (expr_mentions_name) per row. */
+static bool rmw_value_fresh(Checker *c, RmwTaintEnt *tab, int n, Node *e, Symbol *g) {
+    if (!e) return true;
+    for (int i = 0; i < n; i++) {
+        if (tab[i].global != g) continue;
+        if (zer_rmw_copy_in_section(tab[i].fresh ? 1 : 0,
+                                    tab[i].region == c->lock_region ? 1 : 0)) continue;
+        if (expr_mentions_name(e, tab[i].name, tab[i].name_len, 0)) return false;
+    }
+    return true;
+}
+/* BUG-1663: the taint tables are keyed by NAME, and a name is the variable only
+ * when the function binds it exactly once (a parameter, or one declaration /
+ * capture). For any other name the CLEAR below is wrong:
+ *
+ *     u32 t = g;  { u32 t = 5; g = t; }  g = t + 1;
+ *
+ * the inner declaration is another variable, and clearing at it dropped what the
+ * outer `t` still carries — the split read-modify-write compiled (predates the
+ * lock rules; ThreadSanitizer-confirmed). `once` false: the name only
+ * accumulates, which can only add a rejection. The same question decides
+ * whether a row may be FRESH (the declaring site, below). */
+static bool checker_name_bound_once(Checker *c, const char *name, uint32_t len) {
+    int params = 0;
+    Node *fn = c->current_func_node;
+    if (fn && fn->kind == NODE_FUNC_DECL)
+        for (int i = 0; i < fn->func_decl.param_count; i++)
+            if (fn->func_decl.params[i].name_len == len &&
+                memcmp(fn->func_decl.params[i].name, name, len) == 0) params++;
+    if (!c->current_body) return false;
+    return params + ast_name_bind_count(c->current_body, name, len) == 1;
+}
 static void rmw_tab_rebind(RmwTaintEnt **tab, int *n, int *cap, const char *nm, uint32_t nl,
-                           const VfSet *srcs) {
+                           const VfSet *srcs, bool once) {
     if (!nm || nl == 0) return;
-    for (int i = 0; i < *n; i++)
+    for (int i = 0; once && i < *n; i++)
         if ((*tab)[i].name_len == nl && memcmp((*tab)[i].name, nm, nl) == 0)
             (*tab)[i].global = NULL;
     for (int i = 0; i < srcs->n; i++) rmw_tab_add(tab, n, cap, nm, nl, srcs->v[i]);
@@ -7467,13 +7526,16 @@ static void rmw_value_sources(Checker *c, RmwTaintEnt *tab, int n, Node *e, int 
  * write into a PROJECTION of a local (`t += g`, `t.v = g`, `t[0] = g`) ADDS
  * the value's globals to the root local and never clears. */
 static void rmw_taint_maintain(Checker *c, RmwTaintEnt **tab, int *n, int *cap,
-                               Node *node) {
+                               Node *node, bool main_sink) {
     Node *tg = node->assign.target;
     if (!tg) return;
     VfSet srcs = {0};
     rmw_value_sources(c, *tab, *n, node->assign.value, 0, &srcs);
     if (node->assign.op == TOK_EQ && tg->kind == NODE_IDENT) {
-        rmw_tab_rebind(tab, n, cap, tg->ident.name, (uint32_t)tg->ident.name_len, &srcs);
+        /* the spawn sink walks callee bodies out of order: no current body */
+        rmw_tab_rebind(tab, n, cap, tg->ident.name, (uint32_t)tg->ident.name_len, &srcs,
+                       !main_sink || checker_name_bound_once(c, tg->ident.name,
+                                                             (uint32_t)tg->ident.name_len));
         return;
     }
     Node *rt = tg;
@@ -8258,7 +8320,8 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
 static void main_call_rmw_hit(Checker *c, Symbol *g, bool may, void *ud) {
     if (may) track_isr_global_opaque(c, g->name, g->name_len);
     else track_isr_global(c, g->name, g->name_len, true);
-    vol_rmw_fact_add(c, (Node *)ud, g, false);   /* BUG-1652: `ud` is the NODE_CALL */
+    vol_rmw_fact_add(c, (Node *)ud, g, false,
+                     call_rmw_cont(c, (Node *)ud, g));   /* BUG-1652: `ud` is the NODE_CALL */
 }
 static bool once_single_owner(Symbol *g, Node *once);
 static Node *_scan_once_node;
@@ -9257,7 +9320,9 @@ static void check_mem_split_rmw(Checker *c) {
         struct MemCand *k = &_mem_cands[i];
         int ns = 0;
         if (seen && !mem_reaches(k->m, k->g, seen, &ns, cap)) continue;
-        vol_rmw_fact_add_ex(k->node, k->g, k->once, k->line, k->file, k->source, false);   /* BUG-1652 */
+        /* BUG-1663: a copy held in MEMORY has no place it was read at — never
+         * provably inside one critical section */
+        vol_rmw_fact_add_ex(k->node, k->g, k->once, k->line, k->file, k->source, false, false);   /* BUG-1652 */
         if (k->crit) continue;
         c->in_interrupt = k->isr; c->current_body = k->body; c->critical_depth = 0;
         c->file_name = k->file; c->source = k->source;
@@ -9326,7 +9391,15 @@ static void main_rmw_visit(Checker *c, Symbol *g, void *ud) {
                                           node->assign.value, g, 0);  /* BUG-1010 */
     if (is_rmw) {
         track_isr_global(c, g->name, g->name_len, true);
-        vol_rmw_fact_add(c, node, g, false);   /* BUG-1652 */
+        /* BUG-1663: one statement reads and writes back (compound, bit range,
+         * `g = g + 1`) — or every local copy it writes back is fresh here. */
+        bool one_stmt = (node->assign.op != TOK_EQ) ||
+                        target_is_bit_range(c, node->assign.target) ||
+                        assign_reads_own_target(c, node->assign.value, g);
+        vol_rmw_fact_add(c, node, g, false,
+                         zer_rmw_one_section(one_stmt ? 1 : 0,
+                             rmw_value_fresh(c, c->rmw_taints, c->rmw_taint_count,
+                                             node->assign.value, g) ? 1 : 0) != 0);   /* BUG-1652 */
     }
     /* BUG-1650: what this store leaves in `g`, and whose copies it read */
     VfSet srcs = {0};
@@ -15942,7 +16015,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
              * target: a write through a projection is not a rebinding. */
             if (!gs)
                 rmw_taint_maintain(c, &c->rmw_taints, &c->rmw_taint_count,
-                                   &c->rmw_taint_capacity, node);
+                                   &c->rmw_taint_capacity, node, true);
             /* BUG-1046: `h.p = &g` / `q = &g` — the local now designates g. */
             if (node->assign.op == TOK_EQ && node->assign.target)
                 rmw_bind_carrier_main(c, node->assign.target, node->assign.value);
@@ -25788,12 +25861,14 @@ static bool vol_win_rmw_locked_ok(Symbol *g, int line, const char *file) {
     for (int i = 0; i < _vol_win_rmw_n && !k; i++)
         if (_vol_win_rmws[i].g == g && _vol_win_rmws[i].line == line &&
             _vol_win_rmws[i].file == file) k = &_vol_win_rmws[i];
-    /* not seen by the context walk, unlocked, or under two locks: the strict rule */
-    if (!k || !k->lock || k->mixed) return false;
-    for (int j = 0; j < _vol_store_n; j++)
-        if (_vol_stores[j].thread && _vol_stores[j].g == g && _vol_stores[j].lock != k->lock)
-            return false;   /* a thread stores it outside that lock */
-    return true;
+    /* not seen by the context walk, unlocked, under two locks, or a thread
+     * stores it outside that lock: the strict rule */
+    bool outside = false;
+    for (int j = 0; k && j < _vol_store_n && !outside; j++)
+        outside = _vol_stores[j].thread && _vol_stores[j].g == g &&
+                  _vol_stores[j].lock != k->lock;
+    return zer_rmw_locked_exempt(k ? 1 : 0, (k && k->lock) ? 1 : 0,
+                                 (k && k->mixed) ? 1 : 0, outside ? 1 : 0) != 0;
 }
 static struct VolLockedRmw { Symbol *g, *lock; struct SyncSpawnSite *site; } *_vol_locked = NULL;
 static int _vol_locked_n = 0, _vol_locked_cap = 0;
@@ -25819,9 +25894,12 @@ static void check_volatile_locked_rmw(Checker *c) {
     const char *sv_fn = c->file_name, *sv_src = c->source;
     for (int i = 0; i < _vol_locked_n; i++) {
         struct VolLockedRmw *k = &_vol_locked[i];
-        bool bad = _vol_locked_lost;
-        for (int j = 0; j < _vol_store_n && !bad; j++)
-            bad = _vol_stores[j].g == k->g && _vol_stores[j].lock != k->lock;
+        bool outside = false;
+        for (int j = 0; j < _vol_store_n && !outside; j++)
+            outside = _vol_stores[j].g == k->g && _vol_stores[j].lock != k->lock;
+        /* seen: the entry was kept; one lock by construction of the entry */
+        bool bad = !zer_rmw_locked_exempt(_vol_locked_lost ? 0 : 1, k->lock ? 1 : 0, 0,
+                                          outside ? 1 : 0);
         if (!bad || !k->site || !k->site->target) continue;
         c->file_name = k->site->file; c->source = k->site->source;
         checker_error(c, k->site->line,
@@ -25906,16 +25984,58 @@ static bool spawn_global_needs_sync(Checker *c, Symbol *sym) {
  * are guarded too. */
 /* The lock word an `@atomic_NAME(&L, ...)` intrinsic names, when NAME is one
  * of `names` (a NULL-terminated list). */
-static Symbol *sync_intrinsic_lock(Checker *c, Node *e, const char *const *names) {
-    if (!e || e->kind != NODE_INTRINSIC || e->intrinsic.arg_count < 1) return NULL;
-    bool hit = false;
+static bool sync_intrinsic_named(Node *e, const char *const *names) {
+    if (!e || e->kind != NODE_INTRINSIC) return false;
     for (int i = 0; names[i]; i++)
         if (e->intrinsic.name_len == strlen(names[i]) &&
-            memcmp(e->intrinsic.name, names[i], e->intrinsic.name_len) == 0) hit = true;
-    if (!hit) return NULL;
+            memcmp(e->intrinsic.name, names[i], e->intrinsic.name_len) == 0) return true;
+    return false;
+}
+/* BUG-1663: the cell operand of this atomic intrinsic when it is `&NAME` — a
+ * whole variable, not a field or an element of one — and the ROOT name of any
+ * cell operand (`&s.a[i]` -> `s`). */
+static Node *sync_cell_ident(Node *i) {
+    if (!i || i->kind != NODE_INTRINSIC || i->intrinsic.arg_count < 1) return NULL;
+    Node *a = i->intrinsic.args[0];
+    if (!a || a->kind != NODE_UNARY || a->unary.op != TOK_AMP || !a->unary.operand) return NULL;
+    return a->unary.operand->kind == NODE_IDENT ? a->unary.operand : NULL;
+}
+static Node *sync_cell_root(Node *i) {
+    if (!i || i->kind != NODE_INTRINSIC || i->intrinsic.arg_count < 1) return NULL;
+    Node *r = i->intrinsic.args[0];
+    if (!r || r->kind != NODE_UNARY || r->unary.op != TOK_AMP) return NULL;
+    r = r->unary.operand;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE ||
+                 (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+        if (r->kind == NODE_FIELD) r = r->field.object;
+        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else if (r->kind == NODE_SLICE) r = r->slice.object;
+        else r = r->unary.operand;
+    }
+    return (r && r->kind == NODE_IDENT) ? r : NULL;
+}
+/* The global the cell operand NAMES. The walks that ask run after the bodies
+ * were checked, with only the global scope live, so a name the function binds
+ * itself is answered with the global of that name — use sync_intrinsic_lock. */
+static Symbol *sync_cell_global(Checker *c, Node *e, const char *const *names) {
+    if (!sync_intrinsic_named(e, names) || e->intrinsic.arg_count < 1) return NULL;
     Node *a = e->intrinsic.args[0];
     if (!a || a->kind != NODE_UNARY || a->unary.op != TOK_AMP) return NULL;
     return resolve_write_target_global(c, a->unary.operand, 0);
+}
+/* BUG-1663: ... unless `fn`, the function being walked, binds the cell's root
+ * name: `static u32 lk;` in a function shadows the global `lk`, and an atomic on
+ * it is an atomic on another word. Two threads spinning on what the recognisers
+ * took for one lock, and a "wait" on a flag nobody else can set, came from this.
+ * (A local POINTER aimed at the global needed `&G` somewhere: the lock rule
+ * refuses such a word, and the binding-aware resolver sync_value_globals is what
+ * records the flag writes.) */
+static Symbol *sync_intrinsic_lock(Checker *c, Node *e, const char *const *names, Node *fn) {
+    Symbol *g = sync_cell_global(c, e, names);
+    Node *root = g ? sync_cell_root(e) : NULL;
+    if (root && fn && fn_binds_name(fn, root->ident.name, (uint32_t)root->ident.name_len))
+        return NULL;
+    return g;
 }
 static bool contains_break(Node *node);   /* BUG-1644: defined with the function-body pass */
 /* BUG-1644: is this loop REALLY a spin ACQUIRE — i.e. does it exit only when the
@@ -25932,25 +26052,28 @@ static bool sync_lit_value(Node *n, uint64_t *out) {
     *out = n->int_lit.value;
     return true;
 }
-static Symbol *sync_spin_cond_lock(Checker *c, Node *cond) {
+/* The atomic a spin-acquire condition tests, by SHAPE alone — nothing is
+ * resolved here (see sync_stmt_is_lock_boundary). `*free_v` is the value the
+ * word must hold for the test to win: E for a CAS, 0 for the exchange form. */
+static Node *sync_spin_cond_atomic(Node *cond, uint64_t *free_v) {
     static const char *const cas_n[] = { "atomic_cas", NULL };
     static const char *const xch_n[] = { "atomic_xchg", NULL };
     if (!cond) return NULL;
     if (cond->kind == NODE_UNARY && cond->unary.op == TOK_BANG && cond->unary.operand) {
         Node *i = cond->unary.operand;
-        Symbol *l = sync_intrinsic_lock(c, i, cas_n);
         uint64_t e, d;
-        if (l && i->intrinsic.arg_count >= 3 && sync_lit_value(i->intrinsic.args[1], &e) &&
-            sync_lit_value(i->intrinsic.args[2], &d) && e != d) return l;
+        if (sync_intrinsic_named(i, cas_n) && i->intrinsic.arg_count >= 3 &&
+            sync_lit_value(i->intrinsic.args[1], &e) &&
+            sync_lit_value(i->intrinsic.args[2], &d) && e != d) { *free_v = e; return i; }
         return NULL;
     }
     if (cond->kind == NODE_BINARY && cond->binary.op == TOK_BANGEQ) {
         Node *i = cond->binary.left, *z = cond->binary.right;
         uint64_t zv, v;
         if (i && i->kind == NODE_INT_LIT) { Node *t = i; i = z; z = t; }
-        Symbol *l = sync_intrinsic_lock(c, i, xch_n);
-        if (l && i->intrinsic.arg_count >= 2 && sync_lit_value(z, &zv) && zv == 0 &&
-            sync_lit_value(i->intrinsic.args[1], &v) && v != 0) return l;
+        if (sync_intrinsic_named(i, xch_n) && i->intrinsic.arg_count >= 2 &&
+            sync_lit_value(z, &zv) && zv == 0 &&
+            sync_lit_value(i->intrinsic.args[1], &v) && v != 0) { *free_v = 0; return i; }
     }
     return NULL;
 }
@@ -25964,23 +26087,159 @@ static bool sync_spin_body_plain(Node *b) {
     }
     return true;
 }
-static Symbol *sync_stmt_acquires(Checker *c, Node *s) {
-    if (!s) return NULL;
-    if (s->kind == NODE_WHILE || s->kind == NODE_DO_WHILE) {
-        if (!sync_spin_body_plain(s->while_stmt.body)) return NULL;
-        return sync_spin_cond_lock(c, s->while_stmt.cond);
+/* ---- BUG-1663: is this word really a LOCK? ------------------------------------
+ *
+ * "The statements between `while (!@atomic_cas(&L, 0, 1)) {}` and
+ * `@atomic_store(&L, 0)` run with L held" is a claim about the WHOLE PROGRAM, and
+ * it was read off one statement list. Mutual exclusion needs every write of the
+ * lock word, anywhere, to be one of exactly two things:
+ *
+ *   - the test of a spin ACQUIRE (it changes the word only when it wins), or
+ *   - the RELEASE that closes the region its own acquire opened: a direct
+ *     statement of the same block after that acquire, or a `defer` of it there
+ *     (released at the block's exit) — one release per region.
+ *
+ * Any other write lets a thread that does not hold the lock open it. Each of
+ * these compiled and lost updates on every run (measured, 6 of 6):
+ *
+ *     LOCK; if (c) { @atomic_store(&L, 0); } g += 1; UNLOCK;    a release nested in the region
+ *     LOCK; unl(); g += 1; UNLOCK;                              a release in a callee
+ *     void t2() { @atomic_store(&L, 0); }                       a release by a non-holder
+ *     goto in; LOCK; in: g += 1; UNLOCK;                        entering past the acquire
+ *
+ * So the census — the one walk that sees every body of the program — records
+ * every lock word that is written ATOMICALLY out of role, whose address is taken
+ * (it can then be written through a pointer no rule names), or whose region
+ * contains a label. (A plain store is the atomic-cell rule's: an error in a
+ * concurrent context, harmless before the first spawn.) Such a word is not a lock ANYWHERE: the acquire
+ * recogniser below stops answering for it, and the accesses it was meant to
+ * guard are judged as the unlocked accesses they may be.
+ *
+ * A lock word is ONE word every thread shares (sync_lock_word): a WHOLE global
+ * scalar — `&s.a` and `&s.b` resolve to the same global, so two threads spinning
+ * on two different fields of one struct both "held `s`"; not `threadlocal` — each
+ * thread would spin on its own copy; and not a name the function binds locally —
+ * a `static u32 lk;` local shadowing the global `lk` is a different word, and the
+ * resolver answers with the global of that name.
+ *
+ * Every acquire of one word must test the same FREE value. `!@atomic_cas(&L, 0,
+ * 1)` in one thread and `!@atomic_cas(&L, 1, 2)` in another both "acquire L": the
+ * second wins exactly when the first holds it.
+ *
+ * And "between" is lexical, while two things inside a region do not run there:
+ * the acquire's own spin body (it runs while the lock is NOT held), and a
+ * `defer` body registered in the region's own block before the release was
+ * deferred (it fires at the block's exit — after a direct release, and after a
+ * release deferred later than it). sync_walk judges both without the lock.
+ *
+ * The proof that these conditions give mutual exclusion, and that each is
+ * necessary: proofs/operational/lambda_zer_concurrency/lock_region.v. */
+struct LockSite { Symbol *g; int line; const char *file, *src, *why; uint64_t free_v; };
+static struct LockSite *_lock_broken = NULL, *_lock_acq = NULL;
+static int _lock_broken_n = 0, _lock_broken_cap = 0, _lock_acq_n = 0, _lock_acq_cap = 0;
+static bool _lock_broken_lost = false;   /* could not be recorded: no word is a lock */
+static const char *_lock_scan_file = NULL, *_lock_scan_src = NULL;   /* the file the census is in */
+static void lock_site_add(struct LockSite **tab, int *n, int *cap, Symbol *g, Node *at,
+                          const char *why, bool *lost) {
+    if (!g) return;
+    for (int i = 0; i < *n; i++) if ((*tab)[i].g == g) return;   /* the first one explains */
+    if (*n >= *cap) {
+        int nc = *cap ? *cap * 2 : 32;
+        struct LockSite *nb = (struct LockSite *)realloc(*tab, (size_t)nc * sizeof(*nb));
+        if (!nb) { if (lost) *lost = true; return; }
+        *tab = nb; *cap = nc;
     }
-    return NULL;
+    struct LockSite *e = &(*tab)[(*n)++];
+    e->g = g; e->line = at ? (int)at->loc.line : 0;
+    e->file = _lock_scan_file; e->src = _lock_scan_src; e->why = why; e->free_v = 0;
 }
-static Symbol *sync_stmt_releases(Checker *c, Node *s) {
+static void lock_word_break(Symbol *g, Node *at, const char *why) {
+    lock_site_add(&_lock_broken, &_lock_broken_n, &_lock_broken_cap, g, at, why,
+                  &_lock_broken_lost);
+}
+static bool lock_word_broken(Symbol *g) {
+    if (_lock_broken_lost) return true;
+    for (int i = 0; i < _lock_broken_n; i++) if (_lock_broken[i].g == g) return true;
+    return false;
+}
+/* An acquire of `g` testing `free_v`: the first one fixes the word's free value,
+ * a later one that tests another breaks the word. (A row that cannot be recorded
+ * could not be compared against later: no word is a lock then.) */
+static void lock_acquire_note(Symbol *g, Node *at, uint64_t free_v) {
+    int first = 1, same = 0;
+    for (int i = 0; i < _lock_acq_n; i++)
+        if (_lock_acq[i].g == g) { first = 0; same = _lock_acq[i].free_v == free_v; break; }
+    if (first) {
+        int n0 = _lock_acq_n;
+        lock_site_add(&_lock_acq, &_lock_acq_n, &_lock_acq_cap, g, at, NULL, &_lock_broken_lost);
+        if (_lock_acq_n > n0) _lock_acq[n0].free_v = free_v;
+    }
+    if (!zer_lock_acquire_agrees(first, same))
+        lock_word_break(g, at, "it is acquired with two different 'free' values, so one "
+                        "acquire wins exactly while the other holds it");
+}
+/* THE lock word an atomic's cell operand names, or NULL (see the block above). */
+static Symbol *sync_lock_word(Checker *c, Node *i, const char *const *names, Node *fn) {
+    Symbol *g = sync_cell_global(c, i, names);
+    if (!g) return NULL;
+    Node *id = sync_cell_ident(i);
+    bool shadowed = id && fn && fn_binds_name(fn, id->ident.name, (uint32_t)id->ident.name_len);
+    return zer_lock_word_ok(id ? 1 : 0, global_is_threadlocal(g) ? 1 : 0,
+                            shadowed ? 1 : 0) ? g : NULL;
+}
+/* The acquire / the release a statement makes, by SHAPE alone: a `while` /
+ * `do-while` whose condition is a spin test and whose body cannot leave the loop;
+ * `@atomic_store(...)` / `@atomic_xchg(...)` as a statement, or a `defer` of
+ * exactly that (`*by_defer`: the lock then stays held to the block's exit). */
+static Node *sync_stmt_acquire_atomic(Node *s, uint64_t *free_v) {
+    if (!s || (s->kind != NODE_WHILE && s->kind != NODE_DO_WHILE)) return NULL;
+    if (!sync_spin_body_plain(s->while_stmt.body)) return NULL;
+    return sync_spin_cond_atomic(s->while_stmt.cond, free_v);
+}
+static Node *sync_stmt_release_atomic(Node *s, bool *by_defer) {
     static const char *const rel[] = { "atomic_store", "atomic_xchg", NULL };
+    *by_defer = false;
+    if (s && s->kind == NODE_DEFER) {
+        s = s->defer.body;
+        if (s && s->kind == NODE_BLOCK && s->block.stmt_count == 1) s = s->block.stmts[0];
+        *by_defer = true;
+    }
     if (!s || s->kind != NODE_EXPR_STMT) return NULL;
-    return sync_intrinsic_lock(c, s->expr_stmt.expr, rel);
+    return sync_intrinsic_named(s->expr_stmt.expr, rel) ? s->expr_stmt.expr : NULL;
+}
+/* Could this statement begin or end a critical section? The main checker's
+ * lexical counter (Checker.lock_region) steps at every statement this accepts.
+ * It must see AT LEAST every boundary the resolved recognisers below honour —
+ * a missed one would let a copy read in one critical section pass as "read in
+ * this one" — and it does by construction: they are built on these two shapes
+ * and only ever answer less. */
+static bool sync_stmt_is_lock_boundary(Node *s) {
+    uint64_t fv; bool bd;
+    return sync_stmt_acquire_atomic(s, &fv) != NULL || sync_stmt_release_atomic(s, &bd) != NULL;
+}
+/* The word a statement acquires (what the census pairs up). */
+static Symbol *sync_stmt_acquires_raw(Checker *c, Node *s, Node *fn, uint64_t *free_v) {
+    static const char *const acq[] = { "atomic_cas", "atomic_xchg", NULL };
+    uint64_t fv = 0;
+    Node *i = sync_stmt_acquire_atomic(s, &fv);
+    if (free_v) *free_v = fv;
+    return i ? sync_lock_word(c, i, acq, fn) : NULL;
+}
+/* Does this statement make the release for the region of `held`? */
+static bool sync_stmt_closes(Checker *c, Node *s, Symbol *held, bool *by_defer, Node *fn) {
+    static const char *const rel[] = { "atomic_store", "atomic_xchg", NULL };
+    Node *i = sync_stmt_release_atomic(s, by_defer);
+    return held && i && sync_lock_word(c, i, rel, fn) == held;
+}
+/* What the context walk asks: an acquire of a word that IS a lock. */
+static Symbol *sync_stmt_acquires(Checker *c, Node *s, Node *fn) {
+    Symbol *l = sync_stmt_acquires_raw(c, s, fn, NULL);
+    return (l && !lock_word_broken(l)) ? l : NULL;
 }
 
 /* A flag word an `@atomic_*` intrinsic other than a load PUBLISHES through
  * (store, exchange, read-modify-write): the statement is a release on it. */
-static Symbol *sync_stmt_release_flag(Checker *c, Node *s) {
+static Symbol *sync_stmt_release_flag(Checker *c, Node *s, Node *fn) {
     static const char *const rel[] = {
         "atomic_store", "atomic_xchg", "atomic_cas", "atomic_add", "atomic_sub",
         "atomic_or", "atomic_and", "atomic_xor", "atomic_nand", "atomic_add_fetch",
@@ -25989,30 +26248,30 @@ static Symbol *sync_stmt_release_flag(Checker *c, Node *s) {
     Node *e = s->kind == NODE_EXPR_STMT ? s->expr_stmt.expr :
               s->kind == NODE_VAR_DECL ? s->var_decl.init : NULL;
     if (e && e->kind == NODE_ASSIGN) e = e->assign.value;
-    return sync_intrinsic_lock(c, e, rel);
+    return sync_intrinsic_lock(c, e, rel, fn);
 }
 /* The flag an expression READS atomically (any `@atomic_*(&F, ...)` in it). */
-static Symbol *sync_expr_atomic_flag(Checker *c, Node *e, int depth) {
+static Symbol *sync_expr_atomic_flag(Checker *c, Node *e, Node *fn, int depth) {
     static const char *const any[] = {
         "atomic_load", "atomic_cas", "atomic_xchg", "atomic_add", "atomic_sub",
         "atomic_or", "atomic_and", "atomic_xor", "atomic_nand", "atomic_add_fetch",
         "atomic_sub_fetch", "atomic_or_fetch", "atomic_and_fetch", "atomic_xor_fetch", NULL };
     if (!e || depth > ZER_EXPR_WALK_MAX) return NULL;
-    Symbol *f = sync_intrinsic_lock(c, e, any);
+    Symbol *f = sync_intrinsic_lock(c, e, any, fn);
     if (f) return f;
     switch (e->kind) {
-    case NODE_UNARY:    return sync_expr_atomic_flag(c, e->unary.operand, depth + 1);
-    case NODE_TYPECAST: return sync_expr_atomic_flag(c, e->typecast.expr, depth + 1);
-    case NODE_ASSIGN:   return sync_expr_atomic_flag(c, e->assign.value, depth + 1);
+    case NODE_UNARY:    return sync_expr_atomic_flag(c, e->unary.operand, fn, depth + 1);
+    case NODE_TYPECAST: return sync_expr_atomic_flag(c, e->typecast.expr, fn, depth + 1);
+    case NODE_ASSIGN:   return sync_expr_atomic_flag(c, e->assign.value, fn, depth + 1);
     case NODE_BINARY: {
-        f = sync_expr_atomic_flag(c, e->binary.left, depth + 1);
-        return f ? f : sync_expr_atomic_flag(c, e->binary.right, depth + 1);
+        f = sync_expr_atomic_flag(c, e->binary.left, fn, depth + 1);
+        return f ? f : sync_expr_atomic_flag(c, e->binary.right, fn, depth + 1);
     }
-    case NODE_EXPR_STMT: return sync_expr_atomic_flag(c, e->expr_stmt.expr, depth + 1);
-    case NODE_VAR_DECL:  return sync_expr_atomic_flag(c, e->var_decl.init, depth + 1);
+    case NODE_EXPR_STMT: return sync_expr_atomic_flag(c, e->expr_stmt.expr, fn, depth + 1);
+    case NODE_VAR_DECL:  return sync_expr_atomic_flag(c, e->var_decl.init, fn, depth + 1);
     case NODE_BLOCK:
         for (int i = 0; i < e->block.stmt_count; i++) {
-            f = sync_expr_atomic_flag(c, e->block.stmts[i], depth + 1);
+            f = sync_expr_atomic_flag(c, e->block.stmts[i], fn, depth + 1);
             if (f) return f;
         }
         return NULL;
@@ -26036,11 +26295,11 @@ static Symbol *sync_expr_atomic_flag(Checker *c, Node *e, int depth) {
 /* A WAIT on a flag: a loop whose condition or body reads it atomically
  * (`while (@atomic_load(&F) == 0) {}`, `while (b == 0) { b = @atomic_load(&F); }`).
  * Code after it runs after the flag was seen set. */
-static Symbol *sync_stmt_flag_acquire(Checker *c, Node *s) {
+static Symbol *sync_stmt_flag_acquire(Checker *c, Node *s, Node *fn) {
     if (!s) return NULL;
     if (s->kind == NODE_WHILE || s->kind == NODE_DO_WHILE) {
-        Symbol *f = sync_expr_atomic_flag(c, s->while_stmt.cond, 0);
-        return f ? f : sync_expr_atomic_flag(c, s->while_stmt.body, 0);
+        Symbol *f = sync_expr_atomic_flag(c, s->while_stmt.cond, fn, 0);
+        return f ? f : sync_expr_atomic_flag(c, s->while_stmt.body, fn, 0);
     }
     return NULL;
 }
@@ -26276,16 +26535,39 @@ static void sync_vol_rmw_facts(SyncWalk *w, Node *n, SyncCtx ctx) {
     for (int i = 0; i < _vol_rmw_fact_n; i++) {
         struct VolRmwFact *f = &_vol_rmw_facts[i];
         if (f->node != n) continue;
+        /* BUG-1663: a held lock covers the read-modify-write only if its read
+         * and its write-back are inside ONE critical section. Otherwise it is an
+         * unlocked one, whatever is held at the write-back. */
+        SyncCtx fc = ctx;
+        if (!zer_rmw_lock_covers(ctx.lock ? 1 : 0, f->cont ? 1 : 0)) {
+            if (ctx.lock && !f->noted) {
+                f->noted = true;
+                const char *nf = c->file_name, *ns = c->source;
+                c->file_name = f->file; c->source = f->src;
+                checker_warning(c, f->line,
+                    "this write-back of volatile '%.*s' holds lock '%.*s', but the value "
+                    "it writes was read outside this critical section (in another one, "
+                    "or before the lock was taken) — the lock does not make the "
+                    "read-modify-write exact. Read it inside the same critical section, "
+                    "in the declaration of the local that carries it ('u32 t = %.*s;'), "
+                    "or write the update as one statement",
+                    (int)f->g->name_len, f->g->name,
+                    (int)ctx.lock->name_len, ctx.lock->name,
+                    (int)f->g->name_len, f->g->name);
+                c->file_name = nf; c->source = ns;
+            }
+            fc.lock = NULL;
+        }
         if (w->rmw_mode == 1) {
             if (f->win_only) continue;
             if (f->once && once_single_owner(f->g, f->once)) continue;
-            sync_vol_rmw_thread_hit(w, f->g, ctx);
+            sync_vol_rmw_thread_hit(w, f->g, fc);
         } else {
             /* the spawner's window: an error only if a thread stores it */
             const char *sf = c->file_name, *ss = c->source;
             c->file_name = f->file; c->source = f->src;
             record_parent_volatile_rmw(c, f->g, f->line);
-            vol_win_rmw_note(f->g, f->line, f->file, ctx.lock);   /* BUG-1656 */
+            vol_win_rmw_note(f->g, f->line, f->file, fc.lock);   /* BUG-1656 */
             c->file_name = sf; c->source = ss;
         }
     }
@@ -26522,21 +26804,39 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_BLOCK: {
         SyncCtx cur = ctx;
         Symbol *held = NULL;
+        bool deferred = false;   /* BUG-1663: the release of `held` is already deferred */
         for (int i = 0; i < n->block.stmt_count; i++) {
             Node *st = n->block.stmts[i];
             if (held) {
-                if (sync_stmt_releases(c, st) == held) { held = NULL; cur.lock = ctx.lock; continue; }
+                bool by_defer = false;
+                if (sync_stmt_closes(c, st, held, &by_defer, w->fnode)) {
+                    if (by_defer) deferred = true;        /* held to the block's exit */
+                    else { held = NULL; cur.lock = ctx.lock; }
+                    continue;
+                }
             } else if (!cur.lock) {
-                Symbol *l = sync_stmt_acquires(c, st);
-                if (l) { held = l; cur.lock = l; continue; }
+                Symbol *l = sync_stmt_acquires(c, st, w->fnode);
+                if (l) {
+                    /* BUG-1663: the spin body runs while the lock is NOT held */
+                    sync_walk(w, st->while_stmt.body, cur, depth + 1);
+                    held = l; cur.lock = l; deferred = false;
+                    continue;
+                }
             }
             SyncCtx sc = cur;
+            /* BUG-1663: a `defer` of the block that opened the region fires at
+             * this block's exit — after a direct release, and after a release
+             * deferred later than it. Its body runs without the lock unless the
+             * release was deferred first. (A `defer` in a block NESTED in the
+             * region fires inside it: `held` is this block's own.) */
+            if (st && st->kind == NODE_DEFER &&
+                !zer_lock_covers_defer(held ? 1 : 0, deferred ? 1 : 0)) sc.lock = ctx.lock;
             for (int j = i + 1; j < n->block.stmt_count; j++) {
-                Symbol *f = sync_stmt_release_flag(c, n->block.stmts[j]);
+                Symbol *f = sync_stmt_release_flag(c, n->block.stmts[j], w->fnode);
                 if (f) { sc.pub = f; break; }
             }
             sync_walk(w, st, sc, depth + 1);
-            Symbol *af = sync_stmt_flag_acquire(c, st);
+            Symbol *af = sync_stmt_flag_acquire(c, st, w->fnode);
             if (af) cur.acq = af;
         }
         return;
@@ -26544,7 +26844,7 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_IF: {
         SW(n->if_stmt.cond);
         SyncCtx tc = ctx;
-        Symbol *f = sync_expr_atomic_flag(c, n->if_stmt.cond, 0);
+        Symbol *f = sync_expr_atomic_flag(c, n->if_stmt.cond, w->fnode, 0);
         if (f) tc.acq = f;
         int p0 = w->phase;
         sync_walk(w, n->if_stmt.then_body, tc, depth + 1);
@@ -26654,6 +26954,11 @@ typedef struct { Symbol *caller, *callee; bool in_loop; Node *call; } SyncCallSi
 typedef struct {
     SyncCallSite *v; int n, cap;
     Symbol **taken; int nt, ct;          /* functions used as VALUES */
+    /* BUG-1663, the lock discipline (see lock_word_break): the lock whose
+     * acquire test / closing release is being walked right now — the one write
+     * of it that is in role — and the lock whose region the walk is inside. */
+    Symbol *lock_ok, *in_region;
+    Node *fn;                            /* the function / handler being walked */
 } SyncCensus;
 static void census_add(SyncCensus *k, Symbol *caller, Symbol *callee, bool in_loop,
                        Node *call) {
@@ -26685,7 +26990,9 @@ static bool census_indirect_visit(Checker *c, Symbol *fn, void *ud) {
     return false;
 }
 static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool loop, int depth) {
-    if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
+    if (!n) return;
+    /* BUG-1663: past the cap the discipline scan saw nothing — no word is a lock */
+    if (depth > 4 * ZER_STMT_NEST_MAX) { _lock_broken_lost = true; return; }
     #define CW(y) census_walk(c, k, (y), caller, loop, depth + 1)
     #define CWL(y) census_walk(c, k, (y), caller, true, depth + 1)
     switch (n->kind) {
@@ -26724,8 +27031,45 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
     case NODE_FOR:
         CW(n->for_stmt.init); CWL(n->for_stmt.cond); CWL(n->for_stmt.step); CWL(n->for_stmt.body);
         return;
-    case NODE_BLOCK:
-        for (int i = 0; i < n->block.stmt_count; i++) CW(n->block.stmts[i]);
+    case NODE_BLOCK: {
+        /* BUG-1663: pair each spin acquire with the ONE release that closes its
+         * region; every other write of a lock word reaches the NODE_INTRINSIC arm
+         * with `lock_ok` unset and breaks the word. A second lock acquired inside
+         * an open region is not paired (it is walked out of role, so it is no
+         * lock anywhere): nesting two spin locks in one block is refused rather
+         * than half-modelled. */
+        Symbol *held = NULL, *sv_reg = k->in_region;
+        bool deferred = false;
+        for (int i = 0; i < n->block.stmt_count; i++) {
+            Node *st = n->block.stmts[i];
+            bool by_defer = false;
+            if (held && zer_lock_release_in_role(
+                            sync_stmt_closes(c, st, held, &by_defer, k->fn) ? 1 : 0,
+                            deferred ? 1 : 0)) {
+                k->lock_ok = held; CW(st); k->lock_ok = NULL;
+                if (by_defer) deferred = true;            /* held to the block's exit */
+                else { held = NULL; k->in_region = sv_reg; }
+                continue;
+            }
+            uint64_t fv = 0;
+            Symbol *al = held ? NULL : sync_stmt_acquires_raw(c, st, k->fn, &fv);
+            if (al) {
+                lock_acquire_note(al, st, fv);
+                k->lock_ok = al; CWL(st->while_stmt.cond); k->lock_ok = NULL;
+                CWL(st->while_stmt.body);
+                held = al; k->in_region = al; deferred = false;
+                continue;
+            }
+            CW(st);
+        }
+        k->in_region = sv_reg;
+        return;
+    }
+    case NODE_LABEL:
+        /* a label inside a region: a `goto` can enter past the acquire */
+        if (k->in_region)
+            lock_word_break(k->in_region, n, "a label sits inside its region, so a "
+                            "'goto' can enter past the acquire");
         return;
     case NODE_IF: CW(n->if_stmt.cond); CW(n->if_stmt.then_body); CW(n->if_stmt.else_body); return;
     case NODE_SWITCH:
@@ -26739,17 +27083,52 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
     case NODE_DEFER:     CW(n->defer.body);      return;
     case NODE_ONCE:      CW(n->once.body);       return;
     case NODE_AWAIT:     CW(n->await_stmt.cond); return;
+    /* (BUG-1663: a PLAIN store into a lock word is not recorded here. In a
+     * concurrent context it is already an error — the word is an atomic cell,
+     * "plain access to 'L' in a concurrent context" — and outside one, the
+     * `lock = 0;` before the first spawn, it cannot open a lock anyone holds.
+     * Recording it refused that initialisation: measured on the corpus.) */
     case NODE_ASSIGN:    CW(n->assign.target); CW(n->assign.value); return;
     case NODE_BINARY:    CW(n->binary.left); CW(n->binary.right); return;
-    case NODE_UNARY:     CW(n->unary.operand); return;
+    case NODE_UNARY:
+        /* BUG-1663: `&L` anywhere but as the cell operand of an atomic (that
+         * operand is skipped in the NODE_INTRINSIC arm) — the word can then be
+         * written through a pointer */
+        if (n->unary.op == TOK_AMP) {
+            Node *r = n->unary.operand;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE))
+                r = r->kind == NODE_FIELD ? r->field.object :
+                    r->kind == NODE_INDEX ? r->index_expr.object : r->slice.object;
+            /* a name the function binds itself is its local, not the global */
+            bool local = r && r->kind == NODE_IDENT && k->fn &&
+                fn_binds_name(k->fn, r->ident.name, (uint32_t)r->ident.name_len);
+            if (!local)
+                lock_word_break(resolve_write_target_global(c, n->unary.operand, 0), n,
+                                "its address is taken, so it can be written through a pointer");
+        }
+        CW(n->unary.operand); return;
     case NODE_FIELD:     CW(n->field.object); return;
     case NODE_INDEX:     CW(n->index_expr.object); CW(n->index_expr.index); return;
     case NODE_SLICE:     CW(n->slice.object); CW(n->slice.start); CW(n->slice.end); return;
     case NODE_ORELSE:    CW(n->orelse.expr); CW(n->orelse.fallback); return;
     case NODE_TYPECAST:  CW(n->typecast.expr); return;
-    case NODE_INTRINSIC:
-        for (int i = 0; i < n->intrinsic.arg_count; i++) CW(n->intrinsic.args[i]);
+    case NODE_INTRINSIC: {
+        /* BUG-1663: an atomic WRITE of a global word, in role only when it is the
+         * acquire test / closing release the block arm is walking */
+        static const char *const wr[] = {
+            "atomic_store", "atomic_xchg", "atomic_cas", "atomic_add", "atomic_sub",
+            "atomic_or", "atomic_and", "atomic_xor", "atomic_nand", "atomic_add_fetch",
+            "atomic_sub_fetch", "atomic_or_fetch", "atomic_and_fetch", "atomic_xor_fetch", NULL };
+        static const char *const ld[] = { "atomic_load", NULL };
+        Symbol *aw = sync_intrinsic_lock(c, n, wr, k->fn);
+        if (aw && !zer_lock_write_in_role(aw == k->lock_ok ? 1 : 0,
+                                          sync_cell_ident(n) ? 1 : 0))
+            lock_word_break(aw, n, "it is written atomically outside its acquire test and "
+                            "the one release that closes that acquire's region");
+        int first = (sync_cell_global(c, n, wr) || sync_cell_global(c, n, ld)) ? 1 : 0;   /* the cell operand */
+        for (int i = first; i < n->intrinsic.arg_count; i++) CW(n->intrinsic.args[i]);
         return;
+    }
     case NODE_STRUCT_INIT:
         for (int i = 0; i < n->struct_init.field_count; i++) CW(n->struct_init.fields[i].value);
         return;
@@ -26758,7 +27137,7 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
     case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
@@ -26928,24 +27307,48 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     uint32_t sv_ml = c->current_module_len;
     SyncCensus k;
     memset(&k, 0, sizeof(k));
+    _lock_broken_n = 0; _lock_acq_n = 0; _lock_broken_lost = false;   /* BUG-1663: one program per run */
     for (int fi = 0; fi < count; fi++) {
         Node *fn = files[fi].ast;
         if (!fn || fn->kind != NODE_FILE) continue;
         c->current_module = files[fi].module; c->current_module_len = files[fi].module_len;
+        _lock_scan_file = files[fi].file_name; _lock_scan_src = files[fi].source;
         for (int i = 0; i < fn->file.decl_count; i++) {
             Node *d = fn->file.decls[i];
             if (d->kind == NODE_FUNC_DECL && d->func_decl.body) {
                 Symbol *self = global_decl_lookup(c, d->func_decl.name,
                                                   (uint32_t)d->func_decl.name_len);
+                k.fn = d;
                 census_walk(c, &k, d->func_decl.body, self, false, 0);
             } else if (d->kind == NODE_INTERRUPT) {
+                k.fn = d;
                 census_walk(c, &k, d->interrupt.body, NULL, false, 0);
             } else if (d->kind == NODE_GLOBAL_VAR) {
+                k.fn = NULL;
                 census_walk(c, &k, d, NULL, false, 0);
             }
         }
     }
     c->current_module = sv_mod; c->current_module_len = sv_ml;
+    /* BUG-1663: a word that is acquired like a spin lock and is NOT one — say so
+     * at the acquire, or the user sees only a race report on data they believe
+     * they locked. */
+    for (int i = 0; i < _lock_acq_n; i++)
+        for (int j = 0; j < _lock_broken_n; j++) {
+            if (_lock_broken[j].g != _lock_acq[i].g) continue;
+            c->file_name = _lock_acq[i].file; c->source = _lock_acq[i].src;
+            checker_warning(c, _lock_acq[i].line,
+                "'%.*s' is acquired here like a spin lock but is not treated as a lock: "
+                "%s (line %d). A lock word may be written only by its own acquire test "
+                "and by the ONE release that closes that acquire's region (a direct "
+                "statement of the same block, or a 'defer' of it there); otherwise a "
+                "thread that does not hold it can open it. Nothing between this acquire "
+                "and its release counts as protected",
+                (int)_lock_acq[i].g->name_len, _lock_acq[i].g->name,
+                _lock_broken[j].why, _lock_broken[j].line);
+            break;
+        }
+    c->file_name = sv_fn; c->source = sv_src;
 
     SyncAccSet *thr = (SyncAccSet *)calloc((size_t)n, sizeof(SyncAccSet));
     SyncAccSet *win = (SyncAccSet *)calloc((size_t)n, sizeof(SyncAccSet));
@@ -27213,7 +27616,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             VfSet srcs = {0};
             rmw_value_sources(c, _rmw_vtaint, _rmw_vtaint_count, node->var_decl.init, 0, &srcs);
             rmw_tab_rebind(&_rmw_vtaint, &_rmw_vtaint_count, &_rmw_vtaint_cap,
-                           node->var_decl.name, (uint32_t)node->var_decl.name_len, &srcs);
+                           node->var_decl.name, (uint32_t)node->var_decl.name_len, &srcs, true);
         }
         return scan_unsafe_global_access(c, node->var_decl.init, out_name, out_len);
     case NODE_ASSIGN:
@@ -27250,7 +27653,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
              * value from no global CLEARS it. */
             if (!ts)
                 rmw_taint_maintain(c, &_rmw_vtaint, &_rmw_vtaint_count,
-                                   &_rmw_vtaint_cap, node);   /* BUG-1526 */
+                                   &_rmw_vtaint_cap, node, false);   /* BUG-1526 */
             (void)_is_rmw;
             /* BUG-1124: every global the target may land on (a retargeted
              * pointer), each classified against its own name. */
@@ -28391,10 +28794,18 @@ static void check_stmt_impl(Checker *c, Node *node) {
     }
 
     switch (node->kind) {
-    case NODE_BLOCK:
+    case NODE_BLOCK: {
         push_scope(c);
+        /* BUG-1663: the lexical critical-section counter. It steps at every
+         * statement that could begin or end one (sync_stmt_is_lock_boundary — a
+         * superset of what the context walk honours) and never steps back, so two
+         * statements carry the same number exactly when no such statement lies
+         * between them in the text. Read by the read-modify-write facts: a local
+         * copy is "fresh" only at the number its declaration was checked at. */
         for (int i = 0; i < node->block.stmt_count; i++) {
-            check_stmt(c, node->block.stmts[i]);
+            Node *bs = node->block.stmts[i];
+            if (sync_stmt_is_lock_boundary(bs)) c->lock_region = ++c->lock_region_seq;
+            check_stmt(c, bs);
         }
         /* BUG-1431: the defers this block registered FIRE HERE, at its exit —
          * after the last statement, before the code that follows the block. The
@@ -28420,6 +28831,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
         }
         pop_scope(c);
         break;
+    }
 
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
@@ -28466,8 +28878,25 @@ static void check_stmt_impl(Checker *c, Node *node) {
         {
             VfSet srcs = {0};
             rmw_value_sources(c, c->rmw_taints, c->rmw_taint_count, node->var_decl.init, 0, &srcs);
+            bool once = checker_name_bound_once(c, node->var_decl.name,
+                                                (uint32_t)node->var_decl.name_len);
             rmw_tab_rebind(&c->rmw_taints, &c->rmw_taint_count, &c->rmw_taint_capacity,
-                           node->var_decl.name, (uint32_t)node->var_decl.name_len, &srcs);
+                           node->var_decl.name, (uint32_t)node->var_decl.name_len, &srcs, once);
+            /* BUG-1663: these rows are copies read BY THIS DECLARATION, at the
+             * critical-section number being checked — when the name is this one
+             * variable (`once`), and unless the initializer itself goes through a
+             * copy that is not fresh here (rmw_value_fresh; a row of this very
+             * name is still unstamped, so a self-mention rounds to "not fresh").
+             * A static local outlives the call, so it is never fresh. */
+            for (int ti = 0; ti < c->rmw_taint_count; ti++) {
+                RmwTaintEnt *te = &c->rmw_taints[ti];
+                if (!te->global || te->name_len != (uint32_t)node->var_decl.name_len ||
+                    memcmp(te->name, node->var_decl.name, te->name_len) != 0) continue;
+                te->fresh = zer_rmw_copy_fresh(once ? 1 : 0, node->var_decl.is_static ? 1 : 0,
+                    rmw_value_fresh(c, c->rmw_taints, c->rmw_taint_count,
+                                    node->var_decl.init, te->global) ? 1 : 0) != 0;
+                te->region = c->lock_region;
+            }
         }
         /* BUG-1046: `H h = { .p = &g };` / `volatile *u32 q = &g;` — a carrier.
          * Name-keyed like the taint above; the declaring name rebinds (or clears,

@@ -1,0 +1,13 @@
+// GAP (2026-11-14, docs/limitations.md section B): the same republication, through a callee
+// called in a loop (ThreadSanitizer: data race). Compile-clean IS the gap.
+u32 data;
+u32 ready;
+u32 sink;
+void again() { data = 7; @atomic_store(&ready, 1); }
+void writer() { data = 41; @atomic_store(&ready, 1); for (u32 i = 0; i < 100000; i += 1) { again(); } }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    for (u32 i = 0; i < 100000; i += 1) { if (@atomic_load(&ready) == 1) { sink = data; } }
+    a.join();
+    return 0;
+}

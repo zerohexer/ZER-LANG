@@ -858,6 +858,22 @@ three while the soundness floor never moves. Writing the oracle is pure spec wor
 no re-architecture, doesn't worsen soundness) so it goes FIRST; the implementation against
 it is mechanical afterward.
 
+**The oracle's hypothesis list is a PROBE list — use it twice (BUG-1663, 2026-11-14).** The
+spin-lock relaxations (BUG-1652, BUG-1656) shipped with tests and no model. Writing the
+model afterwards found nine accepted lost-update programs in an afternoon: each hypothesis
+of the theorem ("a release is made by a thread that is inside", "no release between the
+read and the write-back") is a sentence that names what to break, and each broke. Then the
+FIX was read against the same list and five more families fell out (two acquires testing
+different free values, a lock word that is one word per thread, a `defer` body that runs
+after the release it is written before, the spin body, an inner local of the copy's name) —
+because the first model had quietly assumed them (`word : bool`, one `word` field, a trace
+with no syntax). So: (1) write the oracle BEFORE a relaxation or an idiom recogniser ships;
+(2) for every field and every event of the model ask "what in the language could make this
+two things, or happen at another time?"; (3) when the model's own types answered a question
+by construction, that is a hypothesis too — say it and probe it. The neighbouring flag
+hand-off idiom, which has no model, was holed in four shapes the same day
+(`docs/limitations.md` B.9).
+
 **THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
 precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by
 Rice: the true set "memory-safe on every execution" is undecidable, so no sound,

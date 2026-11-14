@@ -34,6 +34,17 @@ typedef struct {
     const char *name;
     uint32_t name_len;
     Symbol *global;      /* the global this local's value came from */
+    /* BUG-1663: WHERE the copy was taken, for the lock exemption. `fresh` — the
+     * row was made by the local's OWN declaration initializer, from a read made
+     * in that statement (or from copies that are themselves fresh in the same
+     * region); `region` — the lexical lock region the checker was in. A
+     * read-modify-write through this local is "inside one critical section"
+     * only if the write-back sits in that same region. Any other way a row
+     * comes to exist (an assignment, a callee's out-parameter, a pointer
+     * store) leaves fresh == false: the local may have been filled in an
+     * earlier critical section, or outside one. */
+    uint32_t region;
+    bool fresh;
 } RmwTaintEnt;
 
 /* typemap entry — maps AST Node* to resolved Type* */
@@ -283,6 +294,11 @@ typedef struct {
      * elide a check; here the consequence is only that a shadowing local of the
      * same name can inherit a taint it did not earn, which over-rejects and
      * cannot under-reject). */
+    /* BUG-1663: the lexical critical-section counter — the number the statement
+     * being checked carries, and the last number handed out. It steps at every
+     * statement that could begin or end a spin-lock region
+     * (sync_stmt_is_lock_boundary) and never steps back. */
+    uint32_t lock_region, lock_region_seq;
     RmwTaintEnt *rmw_taints;
     int rmw_taint_count;
     int rmw_taint_capacity;

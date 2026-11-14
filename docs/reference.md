@@ -6942,6 +6942,29 @@ u32 main() {
 - A scoped-spawn argument that is an address INTO a pool slot (`&pool.get(h).v`)
   lends `h` exactly as `&h.v` does: freeing or using `h` before `.join()` is refused
 
+**What counts as a spin lock (BUG-1663).** The statements between
+`while (!@atomic_cas(&L, 0, 1)) { }` and `@atomic_store(&L, 0);` in ONE statement list
+are a critical section only if `L` really is a lock, program-wide:
+- `L` is ONE word every thread shares: a whole global scalar — not a struct field or an
+  array element, not `threadlocal`, and not a name the function also declares locally;
+- every acquire of `L` tests the same "free" value (`0` above; `@atomic_cas(&L, 1, 0)`
+  everywhere is as good);
+- every atomic write of `L` anywhere is either an acquire test or the ONE release that
+  closes that acquire's region — a direct statement of the same block, or
+  `defer @atomic_store(&L, 0);` there (released at the block's exit). A release nested
+  in an `if`, in a callee, in another thread, or a second release, means `L` is not a
+  lock anywhere, and the compiler says so at the acquire;
+- `&L` is not taken anywhere else, and no label sits inside the region.
+Two things written inside a region do not run inside it: the body of the spin loop (the
+test has just failed) and a `defer` body registered before the release was deferred
+(defers fire last-in first-out at the block's exit). Write `LOCK; defer UNLOCK;` first.
+A plain `L = 0;` before the first `spawn` is fine. Under such a lock, an update of a
+`volatile` flag is exact when it is ONE statement (`g += 1;`, `g = g + 1;`) or goes
+through a local that is DECLARED inside the critical section with the read as its
+initializer (`u32 t = g; ... g = t + 1;`), under a name the function uses once. A read
+in one critical section and a write-back in the next is refused: another thread's store
+lands between them.
+
 Two writers under ONE lock, and a flag hand-off — warnings, not errors (BUG-1562/1563):
 ```zer
 u32 lock;

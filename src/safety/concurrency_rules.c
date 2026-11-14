@@ -185,3 +185,138 @@ int zer_window_counts_at_spawn(int closed, int latched) {
     }
     return 1;
 }
+
+/* ---- spin-lock REGION decisions (BUG-1663) ----
+ * Oracle: lambda_zer_concurrency/lock_region.v (definitions shared through
+ * concurrency_decisions.v). Flat cascades, VST style. */
+
+/* A release is in role iff it closes the region its own acquire opened, once. */
+int zer_lock_release_in_role(int closes_own_region, int already_released) {
+    if (closes_own_region == 0) {
+        return 0;
+    }
+    if (already_released != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* An atomic write of a lock word is in role iff it is the sanctioned one
+ * (the acquire test / the in-role release) and the word is a whole global. */
+int zer_lock_write_in_role(int sanctioned, int whole_word) {
+    if (sanctioned == 0) {
+        return 0;
+    }
+    if (whole_word == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* A local copy of the flag is fresh iff its own non-static declaration read it
+ * from sources that are themselves in this section. */
+int zer_rmw_copy_fresh(int by_own_declaration, int is_static, int sources_in_section) {
+    if (by_own_declaration == 0) {
+        return 0;
+    }
+    if (is_static != 0) {
+        return 0;
+    }
+    if (sources_in_section == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* ... and may be written back only in the region it was taken in. */
+int zer_rmw_copy_in_section(int fresh, int same_region) {
+    if (fresh == 0) {
+        return 0;
+    }
+    if (same_region == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* A read-modify-write is inside one critical section iff it is one statement
+ * or writes back only copies taken in this section. */
+int zer_rmw_one_section(int one_statement, int copies_in_section) {
+    if (one_statement != 0) {
+        return 1;
+    }
+    if (copies_in_section == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* A held lock covers a read-modify-write only if it is inside one section. */
+int zer_rmw_lock_covers(int lock_held, int one_section) {
+    if (lock_held == 0) {
+        return 0;
+    }
+    if (one_section == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* The covered read-modify-write is exempt iff it was seen under exactly one
+ * lock and no other thread stores the flag outside that lock. */
+int zer_rmw_locked_exempt(int seen, int lock_held, int mixed, int store_outside) {
+    if (seen == 0) {
+        return 0;
+    }
+    if (lock_held == 0) {
+        return 0;
+    }
+    if (mixed != 0) {
+        return 0;
+    }
+    if (store_outside != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* A cell is a lock word iff it is a whole global that every thread shares and
+ * the function does not bind the name locally (a `static` local of that name is
+ * another word; a `threadlocal` one is a word per thread). */
+int zer_lock_word_ok(int whole_word, int thread_local, int shadowed) {
+    if (whole_word == 0) {
+        return 0;
+    }
+    if (thread_local != 0) {
+        return 0;
+    }
+    if (shadowed != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Every acquire of one word must test the same FREE value: the first acquire
+ * fixes it, a later one must agree. */
+int zer_lock_acquire_agrees(int first, int same_free) {
+    if (first != 0) {
+        return 1;
+    }
+    if (same_free == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* A `defer` body registered in the block that opened a region fires at that
+ * block's exit: with the lock only if the release was deferred BEFORE it. One
+ * registered in a block nested in the region fires inside the region. */
+int zer_lock_covers_defer(int opened_here, int release_deferred) {
+    if (opened_here == 0) {
+        return 1;
+    }
+    if (release_deferred == 0) {
+        return 0;
+    }
+    return 1;
+}

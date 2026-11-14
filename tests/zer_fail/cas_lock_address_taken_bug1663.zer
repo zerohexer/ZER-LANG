@@ -1,0 +1,23 @@
+// expect-error: its address is taken
+// BUG-1663: the lock word is released through a pointer to it.
+u32 g;
+u32 lk;
+void w() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        g += 1;
+        @atomic_store(&lk, 0);
+    }
+}
+void rel(*u32 p) { @atomic_store(p, 0); }
+u32 main() {
+    ThreadHandle a = spawn w();
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        rel(&lk);
+        g += 1;
+        @atomic_store(&lk, 0);
+    }
+    a.join();
+    return 0;
+}

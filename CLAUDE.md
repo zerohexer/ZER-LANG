@@ -859,7 +859,8 @@ questions (see "Confirmed NOT bugs"). Full text: playbook, same title.
 - **The max-oracle standard.** Every distinguishable state AND every operational
   PRECONDITION the decision relies on is a variable of the model — a soundness hole found by
   red team rather than by a failing proof means the model lacked that variable (Level B's
-  guard stability; BUG-1651's edges leaving the window). Merge = JOIN with the unsafe class
+  guard stability; BUG-1651's edges leaving the window; BUG-1663's lock relaxations, shipped
+  with NO model — write the oracle BEFORE a relaxation, its hypotheses are the probe list). Merge = JOIN with the unsafe class
   as the default. Per oracle: T1 soundness, T3 a precision witness, T4 no-under-rejection.
   Zero admits, listed in `_CoqProject` AND in the `make check-proofs` admit gate. Name the
   honest LIMIT.

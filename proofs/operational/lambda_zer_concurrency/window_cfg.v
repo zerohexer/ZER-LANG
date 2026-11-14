@@ -312,34 +312,16 @@ End break_exit.
 
 (* ================================================================
    THE DECISION FUNCTIONS the compiler runs (src/safety/concurrency_rules.c,
-   VST-verified against these same definitions in
-   proofs/vst/verif_window_rules.v), and what each one MEANS in terms of the
-   hypotheses above.  0 = false, anything else = true (C `int`).
+   VST-verified in proofs/vst/verif_window_rules.v against the SAME definitions,
+   imported from concurrency_decisions.v), and what each one MEANS in terms of
+   the hypotheses above.  0 = false, anything else = true (C `int`).
    ================================================================ *)
 From Coq Require Import ZArith Lia.
+(* The definitions themselves live in concurrency_decisions.v — the ONE source
+   both this file and the VST proof import (they used to be written out in both
+   places, and nothing kept the copies equal). *)
+From zer_conc Require Import concurrency_decisions.
 Open Scope Z_scope.
-
-Definition zer_window_join_releases_coq
-    (closed branch_depth in_once after_last_jump : Z) : Z :=
-  if Z.eq_dec closed 0 then
-    (if Z.eq_dec branch_depth 0 then
-      (if Z.eq_dec in_once 0 then
-        (if Z.eq_dec after_last_jump 0 then 0 else 1)
-      else 0)
-    else 0)
-  else 1.
-
-Definition zer_window_stmt_leaves_coq
-    (is_return_or_goto is_loop_jump loop_depth : Z) : Z :=
-  if Z.eq_dec is_return_or_goto 0 then
-    (if Z.eq_dec is_loop_jump 0 then 0
-     else (if Z.eq_dec loop_depth 0 then 1 else 0))
-  else 1.
-
-Definition zer_window_counts_at_spawn_coq (closed latched : Z) : Z :=
-  if Z.eq_dec closed 0 then
-    (if Z.eq_dec latched 0 then 1 else 0)
-  else 1.
 
 (* A join releases iff the window is closed (closed_window_ok), or the join is
    a tail join: no conditional nesting, not in @once, after the last jump

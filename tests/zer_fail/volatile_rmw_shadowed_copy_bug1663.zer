@@ -1,0 +1,16 @@
+// expect-error: non-atomic read-modify-write
+// BUG-1663: (no lock involved; found beside it) an inner declaration of the same name CLEARED what the outer copy carried, so the split read-modify-write `g = t + 1` compiled. A name the function binds twice only accumulates.
+volatile u32 g;
+void w() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        u32 t = g;
+        { u32 t = 5; if (t == 7) { return; } }
+        g = t + 1;
+    }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

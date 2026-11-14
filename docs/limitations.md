@@ -211,7 +211,48 @@ each a missing SUMMARY fact, not a missing key:
    **Residual (precision, loud):** that late check does not apply the `@once`
    single-owner exemption — declare the spawn target above its spawn site.
 
-**B2. Proof status of the data-race class (2026-11-13 — read before claiming "proven").**
+9. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; predates this
+   session): the flag HAND-OFF idiom has no model, and trusts more than it checks.**
+   `data = v; @atomic_store(&ready, 1);` is accepted as "published through `ready`" and a
+   reader that "waited on `ready`" as ordered after it (`SyncCtx.pub` / `.acq`,
+   `sync_ordered`). Neither half is checked to be what it is taken for:
+   - *the publication may run again.* A writer that does it in a loop, or through a callee
+     called twice, writes `data` while the reader reads it
+     (`tests/zer_gaps/publish_flag_republished_in_loop.zer`, `…_by_callee.zer`);
+   - *the "wait" may not wait.* ANY loop that reads the flag atomically counts: one that
+     spins while the flag is NON-zero and so exits at once
+     (`…/publish_flag_wait_wrong_polarity.zer`), or one that reads it in its body and
+     leaves for another reason (`…/publish_flag_loop_is_not_a_wait.zer`). Nothing relates
+     the value waited for to the value published, or either to the flag's initial value.
+   What IS checked: a write after the store in the same statement list, and a flag another
+   instance sets without having waited on it (`sync_flag_forged`). The single publication
+   with a `== 0` wait is TSan-clean. Not fixed with BUG-1663: "no loop" is the wrong rule —
+   a ping-pong hand-off (each side waits for its own value, then stores the other's) is
+   correct and loops. The idiom needs its own oracle, ownership of the data by the flag's
+   VALUE, exactly as the spin lock got one; its hypotheses will be the probe list. Until
+   then guard such data with a spin lock or a `shared struct`. Reproducers are executed
+   with the expectation inverted (compile-clean IS the gap).
+
+10. [residual of: the spin-lock region was read off one statement list — closed by BUG-1663]
+   **Residuals (over-rejections, loud — each has a warning or an error naming it):**
+   two spin locks nested in ONE block (the inner one is no longer a lock anywhere; nest
+   the inner one in its own block); a release on an early-exit path (`LOCK; if (e) {
+   UNLOCK; return; } …; UNLOCK;` — use `defer @atomic_store(&L, 0);` after the acquire);
+   a lock word that is a struct field or an array element; an atomic write of the lock
+   word outside its acquire/release pair, an atomic initialisation included (a plain
+   `L = 0;` before the first spawn is accepted); `&L` anywhere but as an atomic's cell
+   operand; a copy of the flag that is ASSIGNED inside the critical section instead of
+   declared there (`t = g; g = t + 1;` with `t` declared earlier — declare it at the
+   read), or declared between the acquire and a `defer`red release (declare it after the
+   `defer`); a copy whose NAME the function binds twice (two sibling blocks each with
+   their own `t`) — it is never fresh under a lock, and without one it keeps what any
+   binding of that name carried (give the copies distinct names); a `defer` body that
+   touches the guarded data, registered before the release was deferred (register it
+   after `defer @atomic_store(&L, 0);`).
+   **Not derived:** that the list of statements which sit lexically in a region and do
+   not run in it (a `defer` body, the spin body) is complete — it was found by probing.
+
+**B2. Proof status of the data-race class (2026-11-14 — read before claiming "proven").**
 What is machine-checked, and where the chain stops:
 - `window_cfg.v` (Coq 8.18 + stdpp, zero admits, compiled in the session): the spawn-window
   RULE is sound for every control-flow graph (`window_sound`), with the closed, tail and
@@ -222,29 +263,41 @@ What is machine-checked, and where the chain stops:
   `zer_window_counts_at_spawn`) that is linked into zerc returns the value of its `_coq`
   definition. Each lemma was also seen to FAIL on a broken C (a flipped return in each
   function, one inverted test).
-- [residual of: `verif_window_rules.v` written but not machine-checked — closed 2026-11-14]
-  **The `_coq` definitions exist TWICE** — in `window_cfg.v`, where the meaning lemmas
-  (`join_releases_meaning`, `stmt_leaves_meaning`, `counts_at_spawn_meaning`) are proved,
-  and again in `verif_window_rules.v`, where VST proves the C equal to them. The two copies
-  are byte-identical today (diffed 2026-11-14) and NOTHING checks that they stay so:
-  the two files are built by different targets in different images. An edit to one copy
-  alone leaves both gates green while "the C satisfies the proven rule" stops being what
-  was proved. Fix sketch: `Require` the oracle file from the VST file (stdpp is in the
-  `zer-vst` image; qualify the names, `window_cfg.v` exports `step` / `init` / `exec`),
-  compile it in `make check-vst`, and delete the copies.
+- `lock_region.v` (plain Coq, zero admits, no axioms; in `make check-proofs`): the
+  spin-lock RULE — if every acquire tests the same free value and every release is made
+  by a thread inside its own region, at most one thread is inside (`mutual_exclusion`); if
+  in addition every access of the guarded cell is made inside and an update's thread makes
+  no release between its read and its write-back, no other thread writes in between
+  (`rmw_exact`). One counterexample trace per hypothesis dropped — mixed free values, two
+  words, a rogue release, an unguarded store, a `defer` body run after the release, a
+  spinning thread — including the trace that satisfies everything the compiler checked
+  before BUG-1663 and still loses an update (`split_sections_lose`).
+- `proofs/vst/verif_lock_rules.v` (in `make check-vst`): the C of the ten extracted
+  lock decisions returns the value of its `_coq` definition for every input.
+- The `_coq` definitions of the window AND lock decisions exist ONCE, in
+  `concurrency_decisions.v`; the oracle files prove their meaning lemmas about that file
+  and the VST files prove the C equal to that file (the "written twice" residual of
+  2026-11-14 is closed).
 - NOT proven: that `checker.c` discharges each hypothesis of the instances (the syntactic
-  walk `win_exits_live`, the branch-depth / jump census at the join) — by inspection and the
-  conc-matrix "jump x spawn-window" cells only. NOT modelled at all: the spawn-target race
-  scan, the atomic-cell and atomic-downgrade rules, shared-struct locking, the ISR rules.
+  walk `win_exits_live`, the branch-depth / jump census at the join; for the lock, that a
+  lexical region with no label, no nested release and no out-of-role write IS a dynamic
+  critical section for every statement judged inside it, and that a local declared in it
+  carries nothing from an earlier one) — by inspection and the conc-matrix "jump x
+  spawn-window" and "lock-region" cells only. NOT modelled at all: the spawn-target race
+  scan, the atomic-cell and atomic-downgrade rules, shared-struct locking, the ISR rules,
+  and the flag HAND-OFF idiom (item 9 above is what the absence of that model looks like).
   The Iris subset proves the four-condition closure sufficient; nothing proves the checker
   enforces it on every program form. "100% data-race-free, proven" is therefore NOT a claim
   this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
   proven" is.
-- Accept-unsafe items still recorded as OPEN in this class: none as of 2026-11-14 — the last
-  three (a thread's split read-modify-write through memory, the `*opaque` handle handed on,
-  one object passed under two names to a lending function) were closed by BUG-1652..1654.
-  That is a statement about this ledger — what was probed and measured — and not a proof:
-  each of those three was found by probing, not by a failing proof. Recorded and NOT a race
+- Accept-unsafe items still recorded as OPEN in this class: ONE as of 2026-11-14 — the
+  flag hand-off idiom (item 9; four reproducers). The lock-region holes (BUG-1663) and the
+  three before them (BUG-1652..1654) are closed. That is a statement about this ledger —
+  what was probed and measured — and not a proof: BUG-1663 was found by writing an
+  oracle's hypotheses down and probing each, HALF of it only when the finished fix was
+  reviewed against the same list, and item 9 by probing the neighbouring idiom the same
+  day. A relaxation without a model has no variable to fail on; an idiom recogniser
+  without one has none either. Recorded and NOT a race
   as far as measured: the handler-side split RMW done in helpers (a handler is not preempted
   by main code). `cinclude` code is a floor.
 

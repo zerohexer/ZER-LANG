@@ -589,6 +589,65 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   CRLF are brought back under budget by the Dockerfile's own `find … sed` line. NOT measured:
   a real Windows checkout (the CRLF path was simulated inside the Linux image).
 
+**Found by writing the model the lock relaxations never had (2026-11-14)**
+- **BUG-1663 — "the code between a spin acquire and its release holds the lock" was read
+  off one statement list.** It is a claim about the whole program, and its operational
+  preconditions were never written down. Writing them as the hypotheses of an oracle
+  (`lock_region.v`), and then reviewing the fix against the same list, found accepted
+  programs that lose updates on EVERY run (6 of 6, measured; ThreadSanitizer-confirmed) —
+  29 cells of the new grid compile clean on the previous compiler:
+  - *Who may write the lock word.* A release nested in an `if` inside the region, in a
+    callee, through a pointer (`rel(&lk)`), by another thread, a second release after a
+    `defer`red one, a `goto` to a label inside the region.
+  - *Whether it is ONE word.* Two threads spinning on two FIELDS of one struct (both
+    resolve to the same global); a `threadlocal` lock word (one per thread); a `static`
+    local shadowing the global lock (the resolver answers with the global of that name).
+  - *Which value means "free".* `!@atomic_cas(&L, 0, 1)` in one thread and
+    `!@atomic_cas(&L, 1, 2)` in another both "acquired L".
+  - *When a statement runs.* A `defer` body registered in the region's own block fires at
+    the block's exit — after a direct release, and after a release deferred later than it;
+    the spin loop's own body runs while the lock is NOT held, and was not walked at all.
+  - *Whether an update's read and write-back are in the same critical section.* The lock
+    was looked up at the write-back alone: `LOCK; u32 t = g; UNLOCK; LOCK; g = t + 1;
+    UNLOCK;` passed in the spawner and in a thread, as did a copy kept in a global, carried
+    over from an earlier iteration, or hidden behind an inner local of the same name.
+  History: the plain-global forms predate this session (the recogniser dates from
+  BUG-1562 / 1565 / 1644); the volatile-flag forms in the SPAWNER were opened by this
+  session's own BUG-1656 relaxation, which made that rule rely on the same recogniser.
+  Fix. (1) ONE definition of a lock word (`sync_lock_word`: a whole global, not
+  threadlocal, not a name the function binds), and the atomic-cell resolver every
+  recogniser uses is shadow-aware (`sync_intrinsic_lock(…, fn)` — the flag hand-off
+  accepted the shadowed lock as a "wait"). (2) The census — the one walk over every body
+  of the program — pairs each spin acquire with the one release that closes its region
+  and records every other atomic write of the word, every `&L`, every label inside a
+  region, every acquire that tests a different free value; such a word is a lock NOWHERE
+  (`lock_word_broken`), and a warning at the acquire says why. (3) The context walk
+  judges the spin body and a too-early `defer` body without the lock. (4) A
+  read-modify-write fact carries `cont`: one statement, or only local copies read by the
+  copy's own declaration with no statement that could begin or end a critical section
+  between it and the write-back (`Checker.lock_region`, a counter that steps at a
+  shape-only superset of the recognisers and never steps back), the name being bound
+  once in the function. A held lock covers only a `cont` fact. Ten decisions are
+  extracted to `src/safety/concurrency_rules.c` and VST-verified (`verif_lock_rules.v`)
+  against the oracle's own definitions. Kept: a `defer`red release, a `defer` body
+  registered after it, an update split inside one section or inside a callee, a lock whose
+  free value is not 0, a statement in the spin body that does not touch the guarded data,
+  a plain `lk = 0;` before the first spawn. Tests: positive
+  `cas_lock_regions_ok_bug1663` (exact counts, TSan clean), sixteen negatives
+  `cas_lock_*_bug1663` (each ACCEPTED before), the conc-matrix "lock-region" grid (data
+  kind x region shape, 45 cells; 29 false negatives on the previous compiler). Corpus: no
+  verdict change (one during development — a plain `lock = 0;` initialisation — removed
+  by not counting plain stores: the atomic-cell rule already refuses them in a concurrent
+  context).
+- **BUG-1663 (found beside it) — an inner declaration of the same name cleared the outer
+  copy's taint.** `u32 t = g; { u32 t = 5; … } g = t + 1;` compiled in a thread: the
+  split-update tables are keyed by NAME and a declaration rebinds (clears) the name.
+  Predates the lock rules; ThreadSanitizer-confirmed. Fix: a name the function binds more
+  than once only accumulates (`checker_name_bound_once`); the same test decides whether a
+  copy may be fresh. Test `volatile_rmw_shadowed_copy_bug1663`.
+  NOT fixed, found by the same probing and recorded as OPEN: the flag HAND-OFF idiom
+  (`docs/limitations.md` section B, four `tests/zer_gaps/publish_flag_*`).
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

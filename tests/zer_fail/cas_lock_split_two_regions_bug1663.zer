@@ -1,0 +1,25 @@
+// expect-error: was read outside this critical section
+// BUG-1663: the read and the write-back each hold the lock, in two SEPARATE critical sections — the thread's store lands between them (lost on every run, measured).
+volatile u32 g;
+u32 lk;
+void w() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        g += 1;
+        @atomic_store(&lk, 0);
+    }
+}
+u32 main() {
+    ThreadHandle a = spawn w();
+    for (u32 i = 0; i < 200000; i += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        u32 t = g;
+        @atomic_store(&lk, 0);
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        g = t + 1;
+        @atomic_store(&lk, 0);
+    }
+    a.join();
+    if (g != 400000) { return 1; }
+    return 0;
+}

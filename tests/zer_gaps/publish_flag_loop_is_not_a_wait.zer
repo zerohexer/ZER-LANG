@@ -1,0 +1,20 @@
+// GAP (2026-11-14, docs/limitations.md section B): the flag hand-off trusts ANY loop that
+// reads the flag as a wait for the publication. This one reads it in its body and leaves
+// after ten turns whatever it read, so `sink = data` runs beside the writer's `data = 42`
+// (ThreadSanitizer: data race when the writer is slow to start).
+// Compile-clean IS the gap.
+u32 ready;
+u32 data;
+u32 sink;
+void writer() { data = 42; @atomic_store(&ready, 1); }
+void reader() {
+    u32 n = 0;
+    while (n < 10) { n += 1; u32 b = @atomic_load(&ready); }
+    sink = data;
+}
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

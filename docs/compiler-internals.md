@@ -8799,6 +8799,21 @@ walk to the THREAD phase for callees, so "phase == THREAD" does not mean "a thre
 this" (use the walk's mode); and a finding downgraded to a warning because "the function
 has an @atomic somewhere" was a hole for every rule that no atomic elsewhere can repair.
 
+**11n. An idiom recogniser is a relaxation: its hypotheses are the probe list (BUG-1663).**
+"Between this acquire and that release the lock is held" was a pattern match on one
+statement list; five families of counterexample (who writes the word, is it one word,
+which value is free, when does a statement run, is the update in one section) fell out of
+writing `lock_region.v`'s hypotheses — half of them only when the FINISHED fix was read
+against that list again. Shape that held: the three walks that must agree on a region
+(census, `sync_walk`, the main checker's `lock_region` counter) share two SHAPE-only
+functions, and the one that must not miss a boundary uses the shape alone, so it is a
+superset by construction instead of by a matching `if`. For anything judged by lexical
+position, list the constructs that run at another time (`defer`, a loop's own condition
+and body) before trusting "inside". The same name-resolution trap twice in one fix: a
+post-pass resolves a NAME in the global scope, so a function-local of that name (a
+`static`, an inner shadow) is answered with the global — pass the function node and ask
+`fn_binds_name`.
+
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key
 built from `&tbl[i]` names a different slot per evaluation and re-broke the valid teardown

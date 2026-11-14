@@ -8184,3 +8184,24 @@ axioms VST and the Coq standard library already rest on (`Classical_Prop.classic
 **What it left open** is its own entry in B2, tagged `[residual of: …]`: the `_coq`
 definitions are written twice (oracle file and VST file) and nothing keeps the two copies
 equal.
+
+---
+
+## CLOSED 2026-11-14 (with BUG-1663) — the window decisions' `_coq` definitions existed twice
+
+Closed by moving the definitions into ONE file,
+`proofs/operational/lambda_zer_concurrency/concurrency_decisions.v` (plain Coq), imported by
+`window_cfg.v` / `lock_region.v` (the meaning lemmas) and by `proofs/vst/verif_window_rules.v`
+/ `verif_lock_rules.v` (the C equals them); `make check-vst` compiles the shared file under
+the same logical path. The entry as it stood in `docs/limitations.md` B2:
+
+- [residual of: `verif_window_rules.v` written but not machine-checked — closed 2026-11-14]
+  **The `_coq` definitions exist TWICE** — in `window_cfg.v`, where the meaning lemmas
+  (`join_releases_meaning`, `stmt_leaves_meaning`, `counts_at_spawn_meaning`) are proved,
+  and again in `verif_window_rules.v`, where VST proves the C equal to them. The two copies
+  are byte-identical today (diffed 2026-11-14) and NOTHING checks that they stay so:
+  the two files are built by different targets in different images. An edit to one copy
+  alone leaves both gates green while "the C satisfies the proven rule" stops being what
+  was proved. Fix sketch: `Require` the oracle file from the VST file (stdpp is in the
+  `zer-vst` image; qualify the names, `window_cfg.v` exports `step` / `init` / `exec`),
+  compile it in `make check-vst`, and delete the copies.

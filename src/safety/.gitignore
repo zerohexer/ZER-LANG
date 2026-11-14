@@ -20,6 +20,15 @@ stack_rules.v
 comptime_rules.v
 cast_rules.v
 concurrency_rules.v
+asm_categories.v
+asm_register_lookup.v
+asm_register_tables_x86_64.v
+asm_register_tables_x86_64_avx512f.v
+asm_register_tables_aarch64.v
+asm_register_tables_riscv64.v
+asm_instruction_table_x86_64.v
+asm_instruction_table_aarch64.v
+asm_instruction_table_riscv64.v
 
 # Coq build artifacts (if check-vst outputs vo here, which it does)
 *.vo

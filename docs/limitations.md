@@ -77,7 +77,7 @@ behind the measurement record "LEGACY LEDGER RETIRED 2026-11-14".
   jump, or a directive that defines a symbol without a colon is not seen: recognising those
   needs the per-instruction tables Option E delegates to GCC.
 - **Proof coverage** — what is and is not machine-checked for the data-race class is entry
-  B2 below; `proofs/vst/verif_window_rules.v` is written and has never been compiled.
+  B2 below.
 
 
 
@@ -216,13 +216,22 @@ What is machine-checked, and where the chain stops:
 - `window_cfg.v` (Coq 8.18 + stdpp, zero admits, compiled in the session): the spawn-window
   RULE is sound for every control-flow graph (`window_sound`), with the closed, tail and
   latched windows as instances, and the old textual window refuted on the break-out graph.
-- `proofs/vst/verif_window_rules.v`: VST specs + proofs for the three extracted decisions
-  (`zer_window_join_releases`, `zer_window_stmt_leaves`, `zer_window_counts_at_spawn`).
-  **WRITTEN BUT NOT YET MACHINE-CHECKED** — neither VST nor RefinedC could be installed in
-  the session that wrote it (no opam mirror reachable). It follows the cascade pattern of
-  `verif_concurrency_rules.v` and is wired into `make check-vst`; the first run of that
-  target is its verification. A brute-force comparison of the C against the proven
-  characterization (1548 argument tuples, 0 mismatches) was run instead.
+- `proofs/vst/verif_window_rules.v` (Coq 8.18 + VST 3.0beta2 + CompCert 3.13.1, zero
+  admits, in `make check-vst`; machine-checked since 2026-11-14): for every input, the C of
+  the three extracted decisions (`zer_window_join_releases`, `zer_window_stmt_leaves`,
+  `zer_window_counts_at_spawn`) that is linked into zerc returns the value of its `_coq`
+  definition. Each lemma was also seen to FAIL on a broken C (a flipped return in each
+  function, one inverted test).
+- [residual of: `verif_window_rules.v` written but not machine-checked — closed 2026-11-14]
+  **The `_coq` definitions exist TWICE** — in `window_cfg.v`, where the meaning lemmas
+  (`join_releases_meaning`, `stmt_leaves_meaning`, `counts_at_spawn_meaning`) are proved,
+  and again in `verif_window_rules.v`, where VST proves the C equal to them. The two copies
+  are byte-identical today (diffed 2026-11-14) and NOTHING checks that they stay so:
+  the two files are built by different targets in different images. An edit to one copy
+  alone leaves both gates green while "the C satisfies the proven rule" stops being what
+  was proved. Fix sketch: `Require` the oracle file from the VST file (stdpp is in the
+  `zer-vst` image; qualify the names, `window_cfg.v` exports `step` / `init` / `exec`),
+  compile it in `make check-vst`, and delete the copies.
 - NOT proven: that `checker.c` discharges each hypothesis of the instances (the syntactic
   walk `win_exits_live`, the branch-depth / jump census at the join) — by inspection and the
   conc-matrix "jump x spawn-window" cells only. NOT modelled at all: the spawn-target race

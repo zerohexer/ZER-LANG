@@ -1524,6 +1524,42 @@ int main(void) {
         }
     }
 
+    /* ---- one object passed as TWO arguments to a function that lends one of them
+     * to a thread (BUG-1303 / 1645 / 1646 / 1654) ----
+     * `f` spawns with its first parameter and writes through its second before the
+     * join. "The same object" was decided by NAME, so every spelling without a
+     * name — a call result, a pointer read out of a field — was a different object
+     * from everything. SPELLING of the second argument x {same object, distinct}. */
+    fprintf(stderr, "\n  -- one object as two arguments of a lending function --\n");
+    {
+        #define AF "void w(*u32 a){ for (u32 i = 0; i < 4; i += 1) { *a += 1; } }\n" \
+                   "void f(*u32 p, *u32 q){ ThreadHandle th = spawn w(p); *q += 1; th.join(); }\n" \
+                   "*u32 id(*u32 x){ return x; }\nstruct H { *u32 p; }\nu32 g;\n*u32 getg(){ return &g; }\n" \
+                   "void plain(*u32 p, *u32 q){ *p += 1; *q += 1; }\n"
+        static const struct { const char *name; int neg; const char *code; } ac[] = {
+            { "same name twice", 1, AF "u32 main(){ u32 v = 0; f(&v, &v); return 0; }\n" },
+            { "pointer local alias", 1, AF "u32 main(){ u32 v = 0; *u32 q = &v; f(&v, q); return 0; }\n" },
+            { "local bound to a call result", 1, AF "u32 main(){ u32 v = 0; *u32 q = id(&v); f(&v, q); return 0; }\n" },
+            { "nested call result", 1, AF "u32 main(){ u32 v = 0; f(&v, id(&v)); return 0; }\n" },
+            { "call result first", 1, AF "u32 main(){ u32 v = 0; f(id(&v), &v); return 0; }\n" },
+            { "carrier field", 1, AF "u32 main(){ u32 v = 0; H h; h.p = &v; f(&v, h.p); return 0; }\n" },
+            { "getter of a global", 1, AF "u32 main(){ f(&g, getg()); return 0; }\n" },
+            { "ok: two names", 0, AF "u32 main(){ u32 a = 0; u32 b = 0; f(&a, &b); return 0; }\n" },
+            { "ok: carrier of another object", 0, AF "u32 main(){ u32 a = 0; u32 b = 0; H h; h.p = &b; f(&a, h.p); return 0; }\n" },
+            { "ok: unknown, callee lends nothing", 0, AF "u32 main(){ u32 a = 0; plain(&a, id(&a)); return 0; }\n" },
+        };
+        #undef AF
+        for (size_t ai = 0; ai < sizeof(ac) / sizeof(ac[0]); ai++) {
+            valid_cells++;
+            char nm[160];
+            snprintf(nm, sizeof(nm), "alias-args/%s", ac[ai].name);
+            int ok = ac[ai].neg ? run_neg(nm, ac[ai].code) : run_pos(nm, ac[ai].code);
+            fprintf(stderr, "  [%-34s][%s] %s\n", ac[ai].name, ac[ai].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);
     fprintf(stderr, "    false negatives: %d | invalid probes: %d | over-rejections: %d\n",
             false_neg, invalid_probe, over_reject);

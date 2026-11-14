@@ -422,6 +422,23 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   `shared_opaque_handle_to_c_ok_bug1653` (runs); conc-matrix "shared *opaque handle leaves
   the lock" (20 cells, 11 false negatives on the previous build).
 
+- **BUG-1654 — one object passed as two arguments, under a spelling with no name.** A
+  function that lends one pointer parameter to a scoped spawn and writes through another
+  before the join is refused when a call passes one object as both (BUG-1303). "The same
+  object" was decided by NAME (`alias_arg_root`), and a spelling without a name returned
+  NULL, which compared unequal to everything: `f(&v, id(&v))` (a call result), `f(&v, h.p)`
+  after `h.p = &v` (a pointer read out of a field), `f(&g, getg())` (a getter of a global's
+  address) — each accepted, each a TSan-confirmed race. Fix: an unresolvable pointer / slice
+  argument is a sentinel root that may alias ANY other pointer argument and any global the
+  callee lends by name (its own wording: "cannot be resolved to the object it points at");
+  a field / element read of a carrier resolves through the carrier's recorded
+  `borrow_root_name`, so `h.p` is reported precisely ("both reach 'v'") and a carrier of a
+  DIFFERENT object stays accepted. The error still needs the callee to have a (lent, used)
+  pair for those positions, so ordinary calls are untouched: 0 verdict changes over the
+  corpus. Tests: three `alias_spawn_arg_*_bug1654` negatives, positive
+  `alias_spawn_distinct_objects_ok_bug1654` (runs); conc-matrix "one object as two arguments
+  of a lending function" (10 cells; 4 false negatives on the previous build).
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

@@ -4424,3 +4424,20 @@ except into C (BUG-1653 in BUGS-FIXED.md); the precise direct-call case is the
 over-rejection recorded in its place. Gate: conc-matrix "shared *opaque handle leaves the
 lock" (SINK x CARRIER).
 
+## CLOSED 2026-11-14 (BUG-1654) — one object passed as two arguments under names the checker could not compare
+
+Was open in `docs/limitations.md` as:
+
+- [residual of: **LOW: parameter aliasing into a scoped spawn** — closed by BUG-1303]
+  Residual: the
+  pairs are keyed by POSITION up to 64 params, and "same object" is decided by NAME
+  (`alias_arg_root`) — two different pointers to one object that the checker cannot name
+  alike (`f(p, q)` with `q` computed through a call) are not matched.
+
+Measured before the fix (ThreadSanitizer): `f(&v, id(&v))`, `f(&v, h.p)` after `h.p = &v`,
+and `f(&g, getg())` — each a data race, each accepted, because `alias_arg_root` returned
+NULL for an argument without a name and NULL compared unequal to everything. The fix makes
+an unresolvable pointer argument a possible alias of any other, and resolves a pointer read
+out of a carrier through the carrier's recorded root. Corpus cost by compiling the corpus:
+0 verdict changes. Gate: conc-matrix "one object as two arguments of a lending function".
+

@@ -2,8 +2,8 @@
 
 **This file holds OPEN entries only**: accept-unsafe holes, over-rejections, loud gaps,
 deferred fixes, and the standing floors. It is meant to be read whole. `make check` enforces
-it (`tools/audit_limitations.sh`): a section or list item marked closed, or a file past the
-size budget, fails the build.
+it: a section or list item marked closed fails the build (`tools/audit_limitations.sh`), and
+so does a file past its size budget (`tools/audit_docs_budget.sh`).
 
 | Where | What |
 |---|---|
@@ -168,10 +168,13 @@ What is machine-checked, and where the chain stops:
   enforces it on every program form. "100% data-race-free, proven" is therefore NOT a claim
   this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
   proven" is.
-- Still OPEN and accept-unsafe (each recorded above or in the older sections): two
-  pointers to one object the checker cannot name alike (`f(p, q)`, `q` from a call) at the
-  lent-param pair. Recorded but NOT a race as far as measured: the handler-side split RMW
-  done in helpers (a handler is not preempted by main code). `cinclude` code is a floor.
+- Accept-unsafe items still recorded as OPEN in this class: none as of 2026-11-14 — the last
+  three (a thread's split read-modify-write through memory, the `*opaque` handle handed on,
+  one object passed under two names to a lending function) were closed by BUG-1652..1654.
+  That is a statement about this ledger — what was probed and measured — and not a proof:
+  each of those three was found by probing, not by a failing proof. Recorded and NOT a race
+  as far as measured: the handler-side split RMW done in helpers (a handler is not preempted
+  by main code). `cinclude` code is a floor.
 
 **C. Values / bare metal (LOW, loud).**
 - `r.handle = (*opaque)&gd;` — a cast-to-`*opaque` of an address assigned DIRECTLY into a
@@ -641,11 +644,15 @@ Each reproducer is in the ag9 report shape; none needs `cinclude`.
   `@once`** — the publish-once exemption needs the parent's window to END, which only a join
   gives. Use a scoped spawn. Also the parent may not call ANY function that reaches the global
   outside that same `@once` during the window.
-- [residual of: **LOW: parameter aliasing into a scoped spawn** — closed by BUG-1303]
-  Residual: the
-  pairs are keyed by POSITION up to 64 params, and "same object" is decided by NAME
-  (`alias_arg_root`) — two different pointers to one object that the checker cannot name
-  alike (`f(p, q)` with `q` computed through a call) are not matched.
+- [residual of: one object passed as two arguments to a function that lends one of them to a
+  thread — closed by BUG-1303, BUG-1646, BUG-1654]
+  **Over-rejection (loud):** an argument the checker cannot resolve to an object (a call
+  result, a pointer read out of a field with no recorded root) is treated as possibly the
+  same object as any other pointer argument, so `f(&a, fresh())` is refused for a lending
+  `f` even when `fresh()` returns a different object. Bind the pointer to a local taken with
+  `&`, or pass distinct named objects. Recovering it needs the return summary ("which
+  argument may this call return, or which global") applied at this sink. The pairs are still
+  keyed by POSITION up to 64 params.
 
 - **Over-rejections:** a heap pointer lent to a scoped spawn stays TRANSFERRED after `th.join()`
   (`t.v` / `free(t)` after the join refused, "freed at line <spawn>"); a local Barrier lent to a

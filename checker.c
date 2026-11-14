@@ -38951,6 +38951,13 @@ static int param_alias_of_value(Checker *c, Node *e) {
 /* BUG-1303: the object a pointer / slice ARGUMENT designates, by name — `&v`,
  * `&v.f`, `v[..]` name v; a pointer local names what it was bound to
  * (borrow_root_name), else itself. NULL when unknown. */
+/* BUG-1654: a pointer / slice argument whose object the checker CANNOT name — a
+ * call result (`id(&v)`, `getg()`), a pointer read out of a field with no
+ * recorded root. It was NULL, and NULL meant "not the same object as anything",
+ * so `f(&v, id(&v))`, `f(&v, h.p)` and `f(&g, getg())` passed one object twice
+ * to a function that lends one parameter to a thread and writes through the
+ * other (TSan: data race). Unknown must mean "may be the same as any other". */
+static const char _alias_unknown_root[] = "";
 static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
     a = unwrap_ptr_launder(a);
     if (!a) return NULL;
@@ -38962,6 +38969,19 @@ static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
         if (s && s->borrow_root_name) { *len = s->borrow_root_len; return s->borrow_root_name; }
         *len = (uint32_t)a->ident.name_len;
         return a->ident.name;
+    } else if (a->kind == NODE_FIELD || a->kind == NODE_INDEX) {
+        /* a pointer READ out of a carrier (`h.p` after `h.p = &v`): the carrier's
+         * recorded root is the object */
+        Node *r = a;
+        for (int d = 0; r && d <= ZER_EXPR_WALK_MAX &&
+                        (r->kind == NODE_FIELD || r->kind == NODE_INDEX); d++)
+            r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+        if (r && r->kind == NODE_IDENT) {
+            Symbol *s = scope_lookup(c->current_scope, r->ident.name,
+                                     (uint32_t)r->ident.name_len);
+            if (s && s->borrow_root_name) { *len = s->borrow_root_len; return s->borrow_root_name; }
+        }
+        return NULL;
     } else return NULL;
     for (int d = 0; a && d <= ZER_EXPR_WALK_MAX; d++) {
         if (a->kind == NODE_FIELD) a = a->field.object;
@@ -39006,12 +39026,17 @@ static void alias_call_record(Checker *c, Node *call) {
         TypeKind k = type_dispatch_kind(at);
         if (k != TYPE_POINTER && k != TYPE_SLICE) continue;
         roots[i] = alias_arg_root(c, call->call.args[i], &lens[i]);
-        for (int j = 0; roots[i] && j < i; j++)
-            if (roots[j] && lens[j] == lens[i] && memcmp(roots[j], roots[i], lens[i]) == 0)
+        if (!roots[i]) {   /* BUG-1654: unknown — it may be any other argument's object, or a global */
+            roots[i] = _alias_unknown_root; lens[i] = 0;
+            dup = true;
+        }
+        for (int j = 0; j < i; j++)
+            if (roots[j] && roots[j] != _alias_unknown_root && roots[i] != _alias_unknown_root &&
+                lens[j] == lens[i] && memcmp(roots[j], roots[i], lens[i]) == 0)
                 dup = true;
         /* BUG-1645: an argument rooted at a GLOBAL is recorded too (the lend-vs-global
          * check compares its root with the callee's lent_globals once bodies are known) */
-        if (roots[i]) {
+        if (roots[i] != _alias_unknown_root) {
             Symbol *rs = scope_lookup(c->current_scope, roots[i], lens[i]);
             Symbol *rg = global_decl_lookup(c, roots[i], lens[i]);
             if (rg && rs == rg && !rg->is_function) dup = true;
@@ -39137,6 +39162,18 @@ static void check_alias_spawn_calls(Checker *c) {
             int i = r->callee->lent_globals[q].param;
             Symbol *lg = r->callee->lent_globals[q].g;
             if (i >= r->argc || !r->roots[i]) continue;
+            if (r->roots[i] == _alias_unknown_root) {   /* BUG-1654 */
+                checker_error(c, r->line,
+                    "argument %d cannot be resolved to the object it points at (a call "
+                    "result, or a pointer read out of a field), and '%.*s' lends that "
+                    "parameter to a scoped spawn while it touches '%.*s' by name before "
+                    "the join — if the argument points at '%.*s' the thread and the "
+                    "function both access one object (data race). Pass `&x` or a local "
+                    "bound to `&x`, so the object is known",
+                    i + 1, (int)r->callee->name_len, r->callee->name,
+                    (int)lg->name_len, lg->name, (int)lg->name_len, lg->name);
+                break;
+            }
             if (r->root_lens[i] != lg->name_len ||
                 memcmp(r->roots[i], lg->name, lg->name_len) != 0) continue;
             /* the argument's root names the GLOBAL itself, not a local shadowing it */
@@ -39155,6 +39192,19 @@ static void check_alias_spawn_calls(Checker *c) {
             if (!r->roots[i]) continue;
             for (int j = 0; j < r->argc && j < 64 && !done; j++) {
                 if (j == i || !r->roots[j] || !alias_pair_has(r->callee, i, j)) continue;
+                if (r->roots[i] == _alias_unknown_root || r->roots[j] == _alias_unknown_root) {
+                    int u = r->roots[i] == _alias_unknown_root ? i : j;   /* BUG-1654 */
+                    checker_error(c, r->line,
+                        "argument %d cannot be resolved to the object it points at (a "
+                        "call result, or a pointer read out of a field), and '%.*s' lends "
+                        "argument %d to a scoped spawn while it uses argument %d before "
+                        "the join — if both reach one object that is two accesses from "
+                        "two threads (data race). Pass `&x` or a local bound to `&x`, so "
+                        "the checker can tell the objects apart",
+                        u + 1, (int)r->callee->name_len, r->callee->name, i + 1, j + 1);
+                    done = true;
+                    continue;
+                }
                 if (r->root_lens[j] != r->root_lens[i] ||
                     memcmp(r->roots[j], r->roots[i], r->root_lens[i]) != 0) continue;
                 checker_error(c, r->line,

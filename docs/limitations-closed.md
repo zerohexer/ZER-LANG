@@ -4441,3 +4441,52 @@ an unresolvable pointer argument a possible alias of any other, and resolves a p
 out of a carrier through the carrier's recorded root. Corpus cost by compiling the corpus:
 0 verdict changes. Gate: conc-matrix "one object as two arguments of a lending function".
 
+## CLOSED 2026-11-14 (BUG-1655) — a cast to `*opaque` assigned directly into a struct field was refused by GCC
+
+Was open in `docs/limitations.md` as:
+
+- `r.handle = (*opaque)&gd;` — a cast-to-`*opaque` of an address assigned DIRECTLY into a
+  field of a shared struct — is accepted by the checker and refused by GCC ("conversion to
+  non-scalar type requested"): the assignment path emits the `_zer_opaque` wrap as a cast.
+  Found 2026-11-13 while probing BUG-1653. Workaround: bind it to a local first
+  (`*opaque h = (*opaque)&gd; r.handle = h;`).
+
+Root cause was wider than the entry: three emitters render a `(T)x` cast, and the one that
+renders a cast left inside a passthrough expression knew only the plain C cast. The same
+path stored 5 into a `bool` field for `s.b = (bool)n;` — silently — and refused the cast
+FROM `*opaque` as well. Fixed by one classifier (`typecast_shape`) read by all three.
+
+## CLOSED 2026-11-14 (BUG-1656 / BUG-1657) — two over-rejections introduced by BUG-1652 and BUG-1653
+
+Were open in `docs/limitations.md` as "the spawner's-window rule ignores locks — a
+read-modify-write in the window under the same CAS lock the thread's store holds is
+refused" and as:
+
+- [residual of: a shared struct's `*opaque` handle leaving its lock — closed by BUG-1299, BUG-1653]
+  **Over-rejection (loud):** the handle may be passed only to C. Passing it to a ZER helper
+  DIRECTLY — `use(r.handle);` — is refused although that statement holds the struct's lock
+  across the whole call (measured: TSan clean), because nothing proves the helper does not
+  store or return its parameter. A per-parameter "does not leak" summary, combined with
+  "the argument is read from the shared struct in THIS statement", would recover it. The
+  type gate is `type_carries_data_pointer`, so a pointer-carrying field of a LOCAL struct
+  that also holds the handle is refused with it.
+
+BUG-1656 makes the window rule lock-aware (exempt only when every read-modify-write of the
+flag on that line holds one lock and every thread store of it holds the same one).
+BUG-1657 lets a named ZER helper receive the handle when the call statement reads the
+field, decided after keep inference: refused if the helper keeps the parameter or returns
+it. Both measured with ThreadSanitizer (accepted forms: 0 reports).
+
+## CORRECTED 2026-11-14 — the `naked` entry
+
+The open ledger briefly carried:
+
+- **`naked` is dropped on the IR path** (LIVE — measured 2026-11-13). `naked void f() {
+  asm("nop"); }` is emitted as an ordinary C function: no `__attribute__((naked))`, a normal
+  prologue, and a trailing `return;`. A stub that relies on having no prologue (an
+  interrupt entry written in asm) is miscompiled silently. Detail and fix sketch:
+  `docs/limitations-legacy.md` "`naked` attribute silently dropped on IR path".
+
+"miscompiled silently" was wrong: the checker warns (BUG-852) and the drop is a recorded
+decision tied to the Option E rework. The entry in `docs/limitations.md` now says so.
+

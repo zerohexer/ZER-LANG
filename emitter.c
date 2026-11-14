@@ -2013,6 +2013,41 @@ static void emit_bitcast_enum_guard(Emitter *e, Type *t, const char *lv) {
  * Guarded at every emission site with EXACT bounds — hex-float powers of two, no
  * rounding slop, so the guard never rejects a representable value. NaN fails every
  * comparison, so `!(in range)` traps on it too. */
+/* BUG-1655: WHICH EMISSION SHAPE A `(T)x` CAST TAKES. Three emitters render a
+ * cast — emit_expr (global initializers, the AST path), IR_CAST (a cast that was
+ * lowered to its own instruction) and emit_rewritten_node (a cast left inside a
+ * passthrough expression: the value of `x.f = (T)e`, a defer body, a spawn
+ * argument). The first two each listed the special shapes; the third had "should
+ * be handled by IR_CAST" and a plain C cast, so
+ *     s.b = (bool)n;           stored 5 into a bool      (silent: `s.b == true` false)
+ *     r.h = (*opaque)&d;       cast to a struct          (GCC: non-scalar type)
+ *     h.d = (*Dev)op;          cast from a struct        (GCC, and no type-id check)
+ * One classifier, read by all three, so the arm set cannot drift again. */
+static uint32_t opaque_type_id(Type *t);
+typedef enum { TCS_PLAIN, TCS_TO_OPAQUE, TCS_FROM_OPAQUE, TCS_TO_BOOL } TypecastShape;
+static TypecastShape typecast_shape(Type *tgt_eff, Type *src_eff) {
+    if (!tgt_eff || !src_eff) return TCS_PLAIN;
+    TypeKind tk = type_dispatch_kind(tgt_eff), sk = type_dispatch_kind(src_eff);
+    Type *tu = type_unwrap_distinct(tgt_eff), *su = type_unwrap_distinct(src_eff);
+    bool tgt_opq = tk == TYPE_POINTER && tu->pointer.inner &&
+                   type_dispatch_kind(tu->pointer.inner) == TYPE_OPAQUE;
+    bool src_opq = sk == TYPE_OPAQUE ||
+                   (sk == TYPE_POINTER && su->pointer.inner &&
+                    type_dispatch_kind(su->pointer.inner) == TYPE_OPAQUE);
+    if (tgt_opq && sk == TYPE_POINTER) return TCS_TO_OPAQUE;
+    if (tk == TYPE_POINTER && src_opq) return TCS_FROM_OPAQUE;
+    if (tk == TYPE_BOOL &&
+        (type_is_integer(src_eff) || type_is_float(src_eff) || sk == TYPE_POINTER))
+        return TCS_TO_BOOL;
+    return TCS_PLAIN;
+}
+/* The runtime tag of a pointer wrapped INTO / expected OUT OF a `*opaque`. */
+static uint32_t typecast_pointee_tid(Type *ptr_eff) {
+    if (!ptr_eff || type_dispatch_kind(ptr_eff) != TYPE_POINTER) return 0;
+    Type *pu = type_unwrap_distinct(ptr_eff);
+    if (!pu->pointer.inner) return 0;
+    return opaque_type_id(type_unwrap_distinct(pu->pointer.inner));
+}
 static bool f2i_needs_guard(Type *src, Type *tgt) {
     if (!src || !tgt) return false;
     TypeKind sk = type_dispatch_kind(src);
@@ -5006,30 +5041,16 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         Type *src_eff = src ? type_unwrap_distinct(src) : NULL;
 
         /* pointer ↔ *opaque: use _zer_opaque wrap/unwrap (same as @ptrcast) */
-        if (tgt_eff && src_eff &&
-            tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
-            type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
-            src_eff->kind == TYPE_POINTER) {
+        TypecastShape tcs = typecast_shape(tgt_eff, src_eff);   /* BUG-1655 */
+        if (tcs == TCS_TO_OPAQUE) {
             /* casting TO *opaque — wrap with type_id */
-            uint32_t tid = 0;
-            if (src_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                tid = opaque_type_id(inner);   /* BUG-1166 */
-            }
+            uint32_t tid = typecast_pointee_tid(src_eff);   /* BUG-1166 */
             emit(e, "(_zer_opaque){(void*)(");
             emit_expr(e, node->typecast.expr);
             emit(e, "), %u}", (unsigned)tid);
-        } else if (tgt_eff && src_eff &&
-                   tgt_eff->kind == TYPE_POINTER &&
-                   ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
-                     type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
-                    src_eff->kind == TYPE_OPAQUE)) {
+        } else if (tcs == TCS_FROM_OPAQUE) {
             /* casting FROM *opaque — unwrap .ptr with type check */
-            uint32_t expected_tid = 0;
-            if (tgt_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                expected_tid = opaque_type_id(inner);   /* BUG-1166 */
-            }
+            uint32_t expected_tid = typecast_pointee_tid(tgt_eff);   /* BUG-1166 */
             if (expected_tid > 0) {
                 int tmp = e->temp_count++;
                 emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
@@ -5046,9 +5067,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 emit_expr(e, node->typecast.expr);
                 emit(e, ").ptr)");
             }
-        } else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && src_eff &&
-                   (type_is_integer(src_eff) || type_is_float(src_eff) ||
-                    src_eff->kind == TYPE_POINTER)) {
+        } else if (tcs == TCS_TO_BOOL) {
             /* To bool: use truthy conversion (!!x), not plain integer cast.
              * ZER emits bool as uint8_t so (uint8_t)5 gives 5, not 1 —
              * BUG-586 fixed this in IR_CAST but the AST path (used for
@@ -13090,6 +13109,42 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             emit_f2i_close(e, t3, tmp);
             return;
         }
+        /* BUG-1655: the special shapes, exactly as the other two emitters */
+        switch (typecast_shape(t3 ? type_unwrap_distinct(t3) : NULL,
+                               s3 ? type_unwrap_distinct(s3) : NULL)) {
+        case TCS_TO_OPAQUE:
+            emit(e, "(_zer_opaque){(void*)(");
+            emit_rewritten_node(e, node->typecast.expr, func);
+            emit(e, "), %u}", (unsigned)typecast_pointee_tid(type_unwrap_distinct(s3)));
+            return;
+        case TCS_FROM_OPAQUE: {
+            uint32_t expected_tid = typecast_pointee_tid(type_unwrap_distinct(t3));
+            if (expected_tid > 0) {
+                int tmp = e->temp_count++;
+                emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
+                emit_rewritten_node(e, node->typecast.expr, func);
+                emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
+                     "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); (",
+                     tmp, (unsigned)expected_tid, tmp);
+                emit_type(e, t3);
+                emit(e, ")_zer_pc%d.ptr; })", tmp);
+            } else {
+                emit(e, "((");
+                emit_type(e, t3);
+                emit(e, ")(");
+                emit_rewritten_node(e, node->typecast.expr, func);
+                emit(e, ").ptr)");
+            }
+            return;
+        }
+        case TCS_TO_BOOL:
+            emit(e, "((uint8_t)!!(");
+            emit_rewritten_node(e, node->typecast.expr, func);
+            emit(e, "))");
+            return;
+        case TCS_PLAIN:
+            break;
+        }
         bool w3 = emit_intn_value_wrap_open(e, t3);   /* BUG-1385 */
         emit(e, "((");
         if (t3) emit_type(e, t3);
@@ -15619,30 +15674,17 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_local_name(e, func, inst->dest_local);
             emit(e, " = ");
 
+            TypecastShape tcs = typecast_shape(tgt_eff, src_eff);   /* BUG-1655 */
             /* To *opaque: wrap with type_id */
-            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
-                type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
-                src_eff && src_eff->kind == TYPE_POINTER) {
-                uint32_t tid = 0;
-                if (src_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    tid = opaque_type_id(inner);   /* BUG-1166 */
-                }
+            if (tcs == TCS_TO_OPAQUE) {
+                uint32_t tid = typecast_pointee_tid(src_eff);   /* BUG-1166 */
                 emit(e, "(_zer_opaque){(void*)(");
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, "), %u}", (unsigned)tid);
             }
             /* From *opaque: unwrap .ptr with type check */
-            else if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
-                     src_eff &&
-                     ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
-                       type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
-                      src_eff->kind == TYPE_OPAQUE)) {
-                uint32_t expected_tid = 0;
-                if (tgt_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    expected_tid = opaque_type_id(inner);   /* BUG-1166 */
-                }
+            else if (tcs == TCS_FROM_OPAQUE) {
+                uint32_t expected_tid = typecast_pointee_tid(tgt_eff);   /* BUG-1166 */
                 if (expected_tid > 0 && inst->src1_local >= 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
@@ -15664,9 +15706,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * In C, `_Bool` has special conversion rules (non-zero → 1), but
              * ZER emits bool as uint8_t so a plain `(uint8_t)5` gives 5, not 1.
              * BUG-586: test expects `(bool)5 == true`. */
-            else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && inst->src1_local >= 0 &&
-                     src_eff && (type_is_integer(src_eff) || type_is_float(src_eff) ||
-                                 src_eff->kind == TYPE_POINTER)) {
+            else if (tcs == TCS_TO_BOOL && inst->src1_local >= 0) {
                 emit(e, "((uint8_t)!!(");
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, "))");

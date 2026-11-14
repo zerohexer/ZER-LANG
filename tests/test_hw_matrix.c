@@ -1181,6 +1181,26 @@ int main(void) {
             { "ok: locked, parent store locked", 0,
               "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "g += 1;" UL " }\n"
               "u32 main(){ ThreadHandle a = spawn w(); " LK "g = 5;" UL " a.join(); return 0; }\n" },
+            /* BUG-1656: the spawner's read-modify-write under the lock every
+             * thread's store of the flag holds is exact */
+            { "ok: window RMW, same lock", 0,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "g = 3;" UL " }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); " LK "g += 1;" UL " a.join(); return 0; }\n" },
+            { "ok: window split RMW, same lock", 0,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "g = 3;" UL " }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); " LK "u32 t = g; g = t + 1;" UL " a.join(); return 0; }\n" },
+            { "window/locked, thread store not", 1,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ g = 3; }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); " LK "g += 1;" UL " a.join(); return 0; }\n" },
+            { "window/two different locks", 1,
+              "volatile u32 g;\nu32 lk;\nu32 lk2;\nvoid w(){ " LK "g = 3;" UL " }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); while (!@atomic_cas(&lk2, 0, 1)) { } g += 1; @atomic_store(&lk2, 0); a.join(); return 0; }\n" },
+            { "window/locked and unlocked, one line", 1,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "g = 3;" UL " }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); " LK "g += 1;" UL " g += 1; a.join(); return 0; }\n" },
+            { "window/thread has one unlocked store", 1,
+              "volatile u32 g;\nu32 lk;\nvoid w(){ " LK "g = 3;" UL " g = 4; }\n"
+              "u32 main(){ ThreadHandle a = spawn w(); " LK "g += 1;" UL " a.join(); return 0; }\n" },
             { "ok: thread only reads", 0,
               "volatile u32 g;\nvoid w(){ u32 t = g; if (t > 5) { } }\n"
               "u32 main(){ ThreadHandle a = spawn w(); g = g + 1; a.join(); return 0; }\n" },

@@ -1495,7 +1495,18 @@ int main(void) {
             { "cast/struct literal", 1, OP "void w(){ Box b = { .h = r.handle }; *Dev d = (*Dev)b.h; d.v = 1; }" OM },
             { "call/local to ZER fn", 1, OP "void use(*opaque h){ *Dev d = (*Dev)h; d.v = 1; }\n"
                                          "void w(){ *opaque h = r.handle; use(h); }" OM },
-            { "call/field to ZER fn", 1, OP "void use(*opaque h){ }\nvoid w(){ use(r.handle); }" OM },
+            /* BUG-1657: read in the calling statement, so the lock is held across
+             * the call — exact unless the helper keeps or returns the value */
+            { "ok: field to a helper that uses it", 0, OP "void use(*opaque h){ *Dev d = (*Dev)h; d.v += 1; }\nvoid w(){ use(r.handle); }" OM },
+            { "ok: helper hands it to C", 0, OP "Dev gd;\nvoid use(*opaque h){ i32 k = memcmp(h, (*opaque)&gd, 4); }\nvoid w(){ use(r.handle); }" OM },
+            { "ok: helper forwards to a helper", 0, OP "void in2(*opaque h){ *Dev d = (*Dev)h; d.v += 1; }\nvoid use(*opaque h){ in2(h); }\nvoid w(){ use(r.handle); }" OM },
+            { "call/helper stores it", 1, OP "?*opaque gh = null;\nvoid use(*opaque h){ gh = h; }\nvoid w(){ use(r.handle); }" OM },
+            { "call/helper stores the cast", 1, OP "?*Dev gdp = null;\nvoid use(*opaque h){ *Dev d = (*Dev)h; gdp = d; }\nvoid w(){ use(r.handle); }" OM },
+            { "call/helper returns it", 1, OP "*opaque use(*opaque h){ return h; }\nvoid w(){ *opaque x = use(r.handle); }" OM },
+            { "call/helper returns the cast", 1, OP "*Dev use(*opaque h){ *Dev d = (*Dev)h; return d; }\nvoid w(){ *Dev x = use(r.handle); x.v = 1; }" OM },
+            { "call/helper's helper stores it", 1, OP "?*opaque gh = null;\nvoid in2(*opaque h){ gh = h; }\nvoid use(*opaque h){ in2(h); }\nvoid w(){ use(r.handle); }" OM },
+            { "call/helper stores via out-param", 1, OP "void use(*opaque h, *Box o){ o.h = h; }\nvoid w(){ Box b; use(r.handle, &b); }" OM },
+            { "call/helper stores in a static", 1, OP "void use(*opaque h){ static ?*opaque k = null; k = h; }\nvoid w(){ use(r.handle); }" OM },
             { "call/struct carrier", 1, OP "void take(Box b){ }\nvoid w(){ Box b; b.h = r.handle; take(b); }" OM },
             { "call/funcptr", 1, OP "void use(*opaque h){ }\nvoid w(){ *(*opaque) fp = use; *opaque h = r.handle; fp(h); }" OM },
             { "return/field", 1, OP "*opaque get(){ return r.handle; }" OM },

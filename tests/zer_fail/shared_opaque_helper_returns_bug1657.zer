@@ -1,0 +1,14 @@
+// expect-error: which returns it
+// BUG-1657: ... nor return it (here as the ZER pointer it was cast to).
+struct Dev { u32 v; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+*Dev use(*opaque h) { *Dev d = (*Dev)h; return d; }
+u32 main() {
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    *Dev x = use(r.handle);
+    x.v = 1;
+    return 0;
+}

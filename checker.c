@@ -6233,6 +6233,70 @@ static void reject_shared_opaque_leak(Checker *c, Node *v, int line, const char 
         "into a ZER pointer reaches the object unlocked. Keep it in a local and "
         "pass it only to C functions; keep ZER data in the shared struct itself", how);
 }
+/* BUG-1657: THE ONE HAND-ON THAT IS EXACT. `use(r.handle);` reads the field in the
+ * statement that makes the call, so the struct's lock is held until `use` returns
+ * (measured: ThreadSanitizer clean, while `h = r.handle; use(h);` races). What is
+ * left to prove is that `use` does not let the value outlive the call — and that
+ * is precisely what keep inference and the return summary already decide for
+ * every pointer parameter: stored anywhere that outlives the call (a global, a
+ * static, a field of another parameter, a thread) = `keep`; returned = a bit of
+ * `ret_param_mask`. Both are known only after every body is checked, so the call
+ * is recorded here and judged at the end of check_keep_inference. */
+static struct SharedOpaquePass {
+    Symbol *callee; int param; int line; const char *file, *src;
+} *_so_passes = NULL;
+static int _so_pass_n = 0, _so_pass_cap = 0;
+static bool shared_opaque_direct_read(Checker *c, Node *v) {
+    v = v ? unwrap_ptr_launder(v) : NULL;
+    if (!v || (v->kind != NODE_FIELD && v->kind != NODE_INDEX)) return false;
+    Type *vt = checker_get_type(c, v);
+    return vt && type_carries_data_pointer(vt, 0) && lvalue_path_through_shared(c, v);
+}
+/* false = could not be recorded: the caller reports the leak now (reject). */
+static bool shared_opaque_pass_defer(Checker *c, Symbol *callee, int param, int line) {
+    for (int i = 0; i < _so_pass_n; i++)
+        if (_so_passes[i].callee == callee && _so_passes[i].param == param &&
+            _so_passes[i].line == line && _so_passes[i].file == c->file_name) return true;
+    if (_so_pass_n >= _so_pass_cap) {
+        int nc = _so_pass_cap ? _so_pass_cap * 2 : 8;
+        struct SharedOpaquePass *nb = (struct SharedOpaquePass *)realloc(_so_passes,
+                                          (size_t)nc * sizeof(*nb));
+        if (!nb) return false;
+        _so_passes = nb; _so_pass_cap = nc;
+    }
+    struct SharedOpaquePass *k = &_so_passes[_so_pass_n++];
+    k->callee = callee; k->param = param; k->line = line;
+    k->file = c->file_name; k->src = c->source;
+    return true;
+}
+static void check_shared_opaque_passes(Checker *c) {
+    const char *sv_fn = c->file_name, *sv_src = c->source;
+    for (int i = 0; i < _so_pass_n; i++) {
+        struct SharedOpaquePass *k = &_so_passes[i];
+        Type *ft = k->callee && k->callee->type ? type_unwrap_distinct(k->callee->type) : NULL;
+        bool is_fn = ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR;
+        bool in_range = is_fn && k->param >= 0 && k->param < (int)ft->func_ptr.param_count &&
+                        k->param < 64;
+        /* unknown signature, or a parameter the masks cannot name: the leak */
+        bool keeps = !in_range || !ft->func_ptr.param_keeps ||
+                     ft->func_ptr.param_keeps[k->param];
+        bool returns = !in_range ||
+            (ft->func_ptr.ret && type_carries_data_pointer(ft->func_ptr.ret, 0) &&
+             (!k->callee->ret_summary_complete ||
+              ((k->callee->ret_param_mask >> k->param) & 1)));
+        if (!keeps && !returns) continue;
+        c->file_name = k->file; c->source = k->src;
+        checker_error(c, k->line,
+            "a *opaque read out of a shared struct is passed to '%.*s', which %s it — "
+            "the struct's lock is held only until this call returns, so whoever turns "
+            "the value back into a ZER pointer afterwards reaches the object unlocked. "
+            "A helper may USE the handle during the call; it may not keep or return it",
+            (int)k->callee->name_len, k->callee->name,
+            keeps ? "stores" : "returns");
+    }
+    c->file_name = sv_fn; c->source = sv_src;
+    _so_pass_n = 0;   /* one program per run */
+}
 static void check_shared_opaque_store(Checker *c, Node *node) {
     Node *t = node->assign.target, *v = node->assign.value;
     if (!t || !v || t->kind == NODE_IDENT) return;   /* a bare name: the caller's sticky flag */
@@ -17824,10 +17888,20 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             bool to_c = ofs && ofs->is_function && ofs->func_node &&
                         ofs->func_node->kind == NODE_FUNC_DECL &&
                         !ofs->func_node->func_decl.body;
+            bool zer_named = ofs && ofs->is_function && ofs->func_node &&
+                             ofs->func_node->kind == NODE_FUNC_DECL &&
+                             ofs->func_node->func_decl.body;
             if (!to_c)
-                for (int oi = 0; oi < node->call.arg_count; oi++)
+                for (int oi = 0; oi < node->call.arg_count; oi++) {
+                    /* BUG-1657: read in THIS statement and handed to a named ZER
+                     * function — exact unless the callee keeps or returns it,
+                     * which only the post pass knows */
+                    if (zer_named && shared_opaque_direct_read(c, node->call.args[oi]) &&
+                        shared_opaque_pass_defer(c, ofs, oi, (int)node->loc.line))
+                        continue;
                     reject_shared_opaque_leak(c, node->call.args[oi], node->loc.line,
                         "is passed to a ZER function (or through a function pointer)");
+                }
         }
         call_rmw_globals(c, c->rmw_taints, c->rmw_taint_count, node, main_call_rmw_hit, node);
         vf_for_each_callee(c, node, main_call_gin, node);   /* BUG-1650 */
@@ -25539,6 +25613,7 @@ static void record_parent_volatile_rmw(Checker *c, Symbol *sym, int line) {
     c->par_vol_rmw[c->par_vol_rmw_n].src = c->source;
     c->par_vol_rmw_n++;
 }
+static bool vol_win_rmw_locked_ok(Symbol *g, int line, const char *file);
 static void check_parent_volatile_rmw(Checker *c) {
     const char *sv_fn = c->file_name, *sv_src = c->source;
     for (int i = 0; i < c->par_vol_rmw_n; i++) {
@@ -25546,6 +25621,9 @@ static void check_parent_volatile_rmw(Checker *c) {
         for (int k = 0; k < c->thr_vol_n && !hit; k++) hit = c->thr_vol[k] == c->par_vol_rmw[i].s;
         if (!hit) continue;
         Symbol *g = c->par_vol_rmw[i].s;
+        /* BUG-1656: under the SAME lock every thread's store of it holds, the
+         * read-modify-write is exact */
+        if (vol_win_rmw_locked_ok(g, c->par_vol_rmw[i].line, c->par_vol_rmw[i].file)) continue;
         c->file_name = c->par_vol_rmw[i].file; c->source = c->par_vol_rmw[i].src;
         checker_error(c, c->par_vol_rmw[i].line,
             "non-atomic read-modify-write of volatile global '%.*s' while a spawned "
@@ -25557,18 +25635,59 @@ static void check_parent_volatile_rmw(Checker *c) {
     c->file_name = sv_fn; c->source = sv_src;
 }
 
-static struct VolStore { Symbol *g, *lock; } *_vol_stores = NULL;
+static struct VolStore { Symbol *g, *lock; bool thread; } *_vol_stores = NULL;
 static int _vol_store_n = 0, _vol_store_cap = 0;
-static void vol_store_note(Symbol *g, Symbol *lock) {
+static void vol_store_note(Symbol *g, Symbol *lock, bool thread) {
     for (int i = 0; i < _vol_store_n; i++)
-        if (_vol_stores[i].g == g && _vol_stores[i].lock == lock) return;
+        if (_vol_stores[i].g == g && _vol_stores[i].lock == lock &&
+            _vol_stores[i].thread == thread) return;
     if (_vol_store_n >= _vol_store_cap) {
         int nc = _vol_store_cap ? _vol_store_cap * 2 : 16;
         struct VolStore *nb = (struct VolStore *)realloc(_vol_stores, (size_t)nc * sizeof(*nb));
         if (!nb) return;
         _vol_stores = nb; _vol_store_cap = nc;
     }
-    _vol_stores[_vol_store_n].g = g; _vol_stores[_vol_store_n].lock = lock; _vol_store_n++;
+    _vol_stores[_vol_store_n].g = g; _vol_stores[_vol_store_n].lock = lock;
+    _vol_stores[_vol_store_n].thread = thread; _vol_store_n++;
+}
+/* BUG-1656: THE SPAWNER'S READ-MODIFY-WRITE UNDER A LOCK. The window rule
+ * (BUG-1591) refused it whenever a thread stores the flag, lock or no lock —
+ * `LOCK; g += 1; UNLOCK;` beside a thread doing `LOCK; g = i; UNLOCK;` is exact
+ * and was an error. Recorded per source line (the key the window rule reports
+ * by): the lock held at every read-modify-write of `g` on that line. One of them
+ * unlocked, or two different locks, and the line is not exempt. */
+static struct VolWinRmw { Symbol *g, *lock; int line; const char *file; bool mixed; }
+    *_vol_win_rmws = NULL;
+static int _vol_win_rmw_n = 0, _vol_win_rmw_cap = 0;
+static bool _vol_win_rmw_lost = false;   /* an entry could not be kept: no exemption */
+static void vol_win_rmw_note(Symbol *g, int line, const char *file, Symbol *lock) {
+    for (int i = 0; i < _vol_win_rmw_n; i++) {
+        struct VolWinRmw *k = &_vol_win_rmws[i];
+        if (k->g != g || k->line != line || k->file != file) continue;
+        if (k->lock != lock) k->mixed = true;
+        return;
+    }
+    if (_vol_win_rmw_n >= _vol_win_rmw_cap) {
+        int nc = _vol_win_rmw_cap ? _vol_win_rmw_cap * 2 : 8;
+        struct VolWinRmw *nb = (struct VolWinRmw *)realloc(_vol_win_rmws, (size_t)nc * sizeof(*nb));
+        if (!nb) { _vol_win_rmw_lost = true; return; }
+        _vol_win_rmws = nb; _vol_win_rmw_cap = nc;
+    }
+    struct VolWinRmw *k = &_vol_win_rmws[_vol_win_rmw_n++];
+    k->g = g; k->lock = lock; k->line = line; k->file = file; k->mixed = false;
+}
+static bool vol_win_rmw_locked_ok(Symbol *g, int line, const char *file) {
+    if (_vol_win_rmw_lost) return false;
+    struct VolWinRmw *k = NULL;
+    for (int i = 0; i < _vol_win_rmw_n && !k; i++)
+        if (_vol_win_rmws[i].g == g && _vol_win_rmws[i].line == line &&
+            _vol_win_rmws[i].file == file) k = &_vol_win_rmws[i];
+    /* not seen by the context walk, unlocked, or under two locks: the strict rule */
+    if (!k || !k->lock || k->mixed) return false;
+    for (int j = 0; j < _vol_store_n; j++)
+        if (_vol_stores[j].thread && _vol_stores[j].g == g && _vol_stores[j].lock != k->lock)
+            return false;   /* a thread stores it outside that lock */
+    return true;
 }
 static struct VolLockedRmw { Symbol *g, *lock; struct SyncSpawnSite *site; } *_vol_locked = NULL;
 static int _vol_locked_n = 0, _vol_locked_cap = 0;
@@ -25615,6 +25734,7 @@ static void check_volatile_locked_rmw(Checker *c) {
 static void vol_rmw_tables_reset(void) {   /* one program per run (the LSP re-checks) */
     _vol_rmw_fact_n = 0; _vol_rmw_pfact_n = 0; _vol_store_n = 0; _vol_locked_n = 0;
     _vol_locked_lost = false;
+    _vol_win_rmw_n = 0; _vol_win_rmw_lost = false;
 }
 
 /* THE exemption set of the spawn race scan: does a non-function global `sym`
@@ -26002,7 +26122,7 @@ static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
      * same global has to be checked against. */
     if (w->rmw_mode && write && g && g->is_volatile && !g->is_function && g->type &&
         volatile_global_exempt_from_race_check(w->c, g))
-        vol_store_note(g, ctx.lock);
+        vol_store_note(g, ctx.lock, w->rmw_mode == 1);
     if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
     SyncAcc a = { g, write, ctx.lock, ctx.acq, ctx.pub };
     sync_acc_add(w->out, a);
@@ -26059,6 +26179,7 @@ static void sync_vol_rmw_facts(SyncWalk *w, Node *n, SyncCtx ctx) {
             const char *sf = c->file_name, *ss = c->source;
             c->file_name = f->file; c->source = f->src;
             record_parent_volatile_rmw(c, f->g, f->line);
+            vol_win_rmw_note(f->g, f->line, f->file, ctx.lock);   /* BUG-1656 */
             c->file_name = sf; c->source = ss;
         }
     }
@@ -42052,6 +42173,7 @@ void check_keep_inference(Checker *c) {
         }
         checker_error(c, e->line, msg, e->arg_pos, (int)e->arg_name_len, e->arg_name);
     }
+    check_shared_opaque_passes(c);   /* BUG-1657: after the keep fixpoint above */
 }
 
 /* Register builtin carry-op result struct types so `AddCarry64 r = @addc(...)`

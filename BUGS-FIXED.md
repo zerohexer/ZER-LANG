@@ -439,6 +439,40 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   `alias_spawn_distinct_objects_ok_bug1654` (runs); conc-matrix "one object as two arguments
   of a lending function" (10 cells; 4 false negatives on the previous build).
 
+- **BUG-1655 — a cast left inside an assignment was rendered by an emitter that knew only
+  the plain C cast.** Three emitters render `(T)x`: `emit_expr` (global initializers),
+  `IR_CAST` (a cast lowered to its own instruction) and `emit_rewritten_node` (a cast kept
+  inside a passthrough expression — the value of `x.f = (T)e`, an element or global store,
+  a defer body). The first two each listed the special shapes; the third said "should be
+  handled by IR_CAST" and emitted `((T)e)`. So `s.b = (bool)n;` stored 5 into a bool and
+  `s.b == true` was FALSE (silent, exit 1); `r.h = (*opaque)&d;` was a cast to a struct
+  (GCC: "conversion to non-scalar type"); `h.d = (*Dev)op;` was a cast from one (GCC, and
+  no type-id check). Fix: ONE classifier `typecast_shape` (+ `typecast_pointee_tid`) read
+  by all three emitters, so the arm set cannot drift. Tests:
+  `typecast_bool_into_field_bug1655` (exit 1 before), `typecast_shapes_all_positions_bug1655`
+  (cast kind x position, runtime-checked).
+- **BUG-1656 — the spawner's read-modify-write of a volatile flag under a lock was refused.**
+  The window rule (BUG-1591) fired whenever a thread stores the flag, lock or no lock.
+  It is now exempt when every read-modify-write of the flag on that source line holds ONE
+  CAS lock and every THREAD store of the flag holds the same lock (`vol_win_rmw_note` /
+  `vol_win_rmw_locked_ok`; stores carry `thread`). Not exempt: the thread's store unlocked,
+  two different locks, a locked and an unlocked one on the same line, one extra unlocked
+  thread store. TSan clean on the accepted form. Tests: positive
+  `window_volatile_rmw_same_lock_ok_bug1656` (2000 increments, none lost; refused before),
+  negative `window_volatile_rmw_other_lock_bug1656`; six hw-matrix cells.
+- **BUG-1657 — a helper may use a shared struct's handle during the call that read it.**
+  BUG-1653 refused every hand-on to a ZER function. `use(r.handle);` reads the field in the
+  statement that makes the call, so the struct's lock is held until `use` returns (TSan:
+  clean; through a local it races and stays refused). What remained to prove — that the
+  helper does not let the value outlive the call — is what keep inference and the return
+  summary already decide for every pointer parameter, so the call is recorded and judged at
+  the end of `check_keep_inference` (`shared_opaque_pass_defer` /
+  `check_shared_opaque_passes`): refused if the parameter is `keep` (stored in a global, a
+  static, another parameter's field — directly, as the pointer it was cast to, or by a
+  callee) or returned. Tests: positive `shared_opaque_helper_uses_ok_bug1657` (two threads,
+  2000 increments through the helper, none lost; refused before), negatives
+  `shared_opaque_helper_{keeps,returns}_bug1657`; ten conc-matrix cells.
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

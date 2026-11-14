@@ -37,11 +37,17 @@ the section was closed or is legacy — grep the title in the two files above.
   behaviour (datasheet facts); liveness — a deadlock or livelock that is a LOGIC error (lock
   order across statements is prevented by construction; waiting forever on a condition is
   not); the emitter and GCC are trusted (a sound checker is not a verified compiler).
-- **`naked` is dropped on the IR path** (LIVE — measured 2026-11-13). `naked void f() {
-  asm("nop"); }` is emitted as an ordinary C function: no `__attribute__((naked))`, a normal
-  prologue, and a trailing `return;`. A stub that relies on having no prologue (an
-  interrupt entry written in asm) is miscompiled silently. Detail and fix sketch:
-  `docs/limitations-legacy.md` "`naked` attribute silently dropped on IR path".
+- **`naked` grants asm permission but is NOT emitted as an attribute** (a DECISION, and the
+  compiler says so: `warning: 'naked' is accepted for asm permission but the attribute is
+  NOT emitted …`, BUG-852). The function is an ordinary C function with a prologue and a
+  trailing `return;`. It is not restored by a flag flip, for measured reasons recorded at
+  the warning in `checker.c`: most `tests/zer/asm_*.zer` CALL their naked function and
+  would fault without an epilogue, and GCC allows only basic asm in a naked function while
+  ZER's structured `asm { inputs: … }` — the form the operand tracking is built on — is
+  extended asm. Decoupling "may write asm" from "emit no prologue" is the locked Option E
+  rework (`docs/option_e_plan.md`). For true naked code today, write the stub in C and
+  bring it in with `cinclude`. (An earlier revision of this entry called it a silent
+  miscompile; that was wrong — the probe had grepped for errors only.)
 - **Bare-metal `.bss` zeroing is a build-system contract** — auto-zero of globals relies on
   the startup code clearing `.bss`. Not re-measured in the 2026-11-13 split; see legacy
   "Bare-metal: `.bss` zeroing requirement".
@@ -138,11 +144,11 @@ each a missing SUMMARY fact, not a missing key:
    rule (a handler is not preempted by main) is the conservative half, the main side is the
    lost update and is covered; ~~(c) the SPAWN scan's sink does not read the global carrier
    relation~~ — CLOSED (BUG-1652: both thread sinks now read the main checker's facts).
-   **Residuals of BUG-1652 (precision, loud):** the spawner's-window rule ignores locks — a
-   read-modify-write in the window under the same CAS lock the thread's store holds is
-   refused; a thread's unlocked read-modify-write is refused even when it is the flag's only
-   writer (use `@atomic_*`, or the `@once` form); the carrier relation is flow-insensitive,
-   so in `vm = g; g = vm + 1;` the diagnostic may name the carrier `vm` rather than `g`.
+   **Residuals of BUG-1652 (precision, loud):** a thread's unlocked read-modify-write is
+   refused even when it is the flag's only writer (use `@atomic_*`, a CAS lock, or the
+   `@once` form) — the rule the spawn scan always had; the carrier relation is
+   flow-insensitive, so in `vm = g; g = vm + 1;` the diagnostic may name the carrier `vm`
+   rather than `g`. (The spawner's window rule is lock-aware since BUG-1656.)
 
 8. [residual of: BUG-1625 sees a CHECKED body only — closed by BUG-1649]
    **Residual (precision, loud):** that late check does not apply the `@once`
@@ -177,11 +183,6 @@ What is machine-checked, and where the chain stops:
   by main code). `cinclude` code is a floor.
 
 **C. Values / bare metal (LOW, loud).**
-- `r.handle = (*opaque)&gd;` — a cast-to-`*opaque` of an address assigned DIRECTLY into a
-  field of a shared struct — is accepted by the checker and refused by GCC ("conversion to
-  non-scalar type requested"): the assignment path emits the `_zer_opaque` wrap as a cast.
-  Found 2026-11-13 while probing BUG-1653. Workaround: bind it to a local first
-  (`*opaque h = (*opaque)&gd; r.handle = h;`).
 - A shift COUNT literal is typed against the LEFT operand: `u3 y = x << 8;` is "cannot
   initialize 'u3' with 'u32'" while `x << 7` compiles (the documented result is 0).
 - Shift typing: a shift's result is the COMMON type of its operands (by design), and a lone
@@ -631,14 +632,12 @@ What they leave:
 ## OPEN — concurrency residuals of the ag9 round (2026-09-24e; MEDIUM — accept-unsafe races; LOW — over-rejections)
 
 Each reproducer is in the ag9 report shape; none needs `cinclude`.
-- [residual of: a shared struct's `*opaque` handle leaving its lock — closed by BUG-1299, BUG-1653]
-  **Over-rejection (loud):** the handle may be passed only to C. Passing it to a ZER helper
-  DIRECTLY — `use(r.handle);` — is refused although that statement holds the struct's lock
-  across the whole call (measured: TSan clean), because nothing proves the helper does not
-  store or return its parameter. A per-parameter "does not leak" summary, combined with
-  "the argument is read from the shared struct in THIS statement", would recover it. The
-  type gate is `type_carries_data_pointer`, so a pointer-carrying field of a LOCAL struct
-  that also holds the handle is refused with it.
+- [residual of: a shared struct's `*opaque` handle leaving its lock — closed by BUG-1299, BUG-1653, BUG-1657]
+  **Over-rejections (loud):** a helper may use the handle only when the call statement
+  itself reads the field (`use(r.handle);`); through a local (`h = r.handle; use(h);`) it
+  is refused, correctly — no lock is held then. A function-pointer callee is refused (its
+  keep summary is the worst case). The type gate is `type_carries_data_pointer`, so a
+  pointer-carrying field of a LOCAL struct that also holds the handle is refused with it.
 
 - **LOW (over-rejection, from BUG-1276): a fire-and-forget thread may not write a global inside
   `@once`** — the publish-once exemption needs the parent's window to END, which only a join
@@ -646,13 +645,15 @@ Each reproducer is in the ag9 report shape; none needs `cinclude`.
   outside that same `@once` during the window.
 - [residual of: one object passed as two arguments to a function that lends one of them to a
   thread — closed by BUG-1303, BUG-1646, BUG-1654]
-  **Over-rejection (loud):** an argument the checker cannot resolve to an object (a call
-  result, a pointer read out of a field with no recorded root) is treated as possibly the
-  same object as any other pointer argument, so `f(&a, fresh())` is refused for a lending
-  `f` even when `fresh()` returns a different object. Bind the pointer to a local taken with
-  `&`, or pass distinct named objects. Recovering it needs the return summary ("which
-  argument may this call return, or which global") applied at this sink. The pairs are still
-  keyed by POSITION up to 64 params.
+  **Over-rejection (loud), left on purpose:** a nested call result the checker cannot name
+  (`f(&a, fresh())`) is treated as possibly the same object as any other pointer argument
+  of a LENDING function. The rewrite is one line and is accepted — bind the result to a
+  local first (`*T q = fresh(); f(&a, q);`): a local's root is resolved through the same
+  query the spawn borrow uses (measured: getter, alias, carrier, reassignment, branch all
+  resolve). Teaching the nested spelling the same resolution was examined and not done: a
+  pointer read through a PARAMETER (`hp.p`) must stay unknown, and the relaxation would
+  rest on distinguishing that case inside a rule whose failure mode is a race. The pairs
+  are keyed by POSITION up to 64 params.
 
 - **Over-rejections:** a heap pointer lent to a scoped spawn stays TRANSFERRED after `th.join()`
   (`t.v` / `free(t)` after the join refused, "freed at line <spawn>"); a local Barrier lent to a

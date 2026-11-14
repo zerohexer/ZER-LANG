@@ -1,0 +1,16 @@
+// GAP (2026-11-14, docs/limitations.md section B item 11): a callee re-aims a local pointer through a pointer to it
+// (`aim(&p)` does `*pp = getp();`); `*p += 1` is then taken for an access to the thread's own stack.
+// ThreadSanitizer reports a data race. Compile-clean IS the gap.
+u32 flagx;
+u32 g;
+u32 dummy;
+*u32 getp() { return &g; }
+void aim(**u32 pp) { *pp = getp(); }
+void w() { @atomic_store(&flagx, 1); u32 loc = 0; *u32 p = &loc; aim(&p); for (u32 i = 0; i < 100000; i += 1) { *p += 1; } }
+void w2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { g += 1; } }
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

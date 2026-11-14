@@ -1,0 +1,18 @@
+// GAP (2026-11-14, docs/limitations.md section B item 11): two global Handles name ONE pool slot (`h2 = h1;`); a thread
+// works through each. A Handle dereference is not recorded as an access to its Pool.
+// ThreadSanitizer reports a data race. Compile-clean IS the gap.
+u32 flagx;
+struct Task { u32 v; }
+Pool(Task, 4) pool;
+Handle(Task) h1;
+Handle(Task) h2;
+void setup() { h1 = pool.alloc() orelse return; h2 = h1; }
+void w() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { h1.v += 1; } }
+void w2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { h2.v += 1; } }
+i32 main() {
+    setup();
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

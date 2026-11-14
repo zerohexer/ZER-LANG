@@ -1,0 +1,17 @@
+// GAP (2026-11-14, docs/limitations.md section B item 11): a local struct whose pointer field a CALLEE re-aims
+// (`fill(&hh)` stores a pointer to the global `g` into `hh.p`); `*hh.p += 1` is then taken for an access to the
+// thread's own stack.
+// ThreadSanitizer reports a data race. Compile-clean IS the gap.
+u32 flagx;
+u32 g;
+struct H { *u32 p; }
+*u32 getp() { return &g; }
+void fill(*H h) { h.p = getp(); }
+void w() { @atomic_store(&flagx, 1); u32 loc = 0; H hh = { .p = &loc }; fill(&hh); for (u32 i = 0; i < 100000; i += 1) { *hh.p += 1; } }
+void w2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { g += 1; } }
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

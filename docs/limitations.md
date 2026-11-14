@@ -247,39 +247,43 @@ each a missing SUMMARY fact, not a missing key:
    not run in it (a `defer` body, the spin body) is complete — it was found by probing.
 
 11. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; every baseline
-   accepts it): a write through a pointer the context walk cannot NAME.** When a thread
+   accepts it): an access through a pointer the context walk cannot NAME.** When a thread
    uses any `@atomic_*` / `@barrier`, the spawn scan's "touches a non-shared global"
    finding is a warning and the context walk judges each access against the other
-   threads'. The walk attributes an access to a global through its name, `&g`, a slice, a
-   struct literal, a pointer name's declaration and reassignments, and parameters. It
-   attributes NOTHING to an access through
-   - a pointer loaded out of memory and bound to a new name — `if (h.p) |q| { *q += 1; }`
-     with `h.p = &g;` done at run time (`tests/zer_gaps/spawn_race_through_loaded_pointer.zer`);
-   - a pointer a call returned — `*getp() += 1`, `*u32 q = getp(); *q += 1;`
-     (`tests/zer_gaps/spawn_race_through_returned_pointer.zer`);
-   and it keys an access through a global pointer or Handle whose target it cannot
-   resolve by that pointer's NAME, so TWO NAMES FOR ONE OBJECT do not meet: `p1 = n;
-   p2 = n;` (one heap object, a thread on each pointer), `h2 = h1;` (one pool slot, a
-   thread on each Handle), `gp = getp();` against `g` by name — all measured, all racing.
-   Two threads doing any of these compile with two warnings. (A global pointer
-   used by name — `*gp += 1`, `**gpp`, a view slice, a struct with a static pointer
-   initializer — IS attributed: measured.) Fix sketch, not built — the walk has three
-   answers for a pointer and uses two: KNOWN globals (recorded), a STACK address of the
-   thread's own (private), and UNKNOWN, which it treats as private. (i) Record an access
-   through an unknown pointer as an access to "some object of type T", carrying its lock
-   / flag tags like any other; it conflicts with another thread's access to any memory
-   that may hold a T (ZER has no pointer arithmetic and casts are provenance-checked, so
-   the type is a sound key), unless a common lock or a hand-off orders them. (ii) Sharpen
-   UNKNOWN where the answer exists: the targets ever stored into a pointer field, the
-   addresses a function returns (`for_each_value_pointee` is the one query to extend).
-   (iii) The open design question, and why this is not a one-line "refuse the unknown":
-   a thread's own fresh allocation is private only until its pointer escapes, so (i)
-   alone refuses two workers that each use their own heap object — it needs the keep /
-   escape queries to say "never published". An unresolvable case must end as an
-   INCOMPLETE set, as the depth cap does (BUG-1665): an incomplete set orders
-   nothing. Until then: reach shared data by name or by index, not through a pointer
-   fetched at run time, or keep it in a `shared struct`. Reproducers are executed with the
-   expectation inverted (compile-clean IS the gap).
+   threads'. The walk has three answers for where a reference points — KNOWN globals
+   (recorded), the thread's OWN STACK (private), and UNKNOWN — and treats unknown as
+   private. Eight measured shapes, one executed reproducer each in `tests/zer_gaps/`
+   (`spawn_race_*`; two threads, two warnings, a data race):
+   - *unknown, taken for private:* a pointer loaded out of memory and bound to a new name
+     (`…through_loaded_pointer`), returned by a call (`…through_returned_pointer`),
+     planted in a local struct by a callee (`…local_struct_filled_by_callee`) or in a
+     local pointer through a pointer to it (`…pointer_to_local_pointer`), or assigned
+     LATER in the loop than the access (`…pointer_reassigned_in_loop` — bindings are read
+     in source order);
+   - *known, keyed by the wrong name:* two global pointers to one heap object
+     (`…two_pointers_one_object`), two Handles for one pool slot
+     (`…two_handles_one_slot` — a Handle dereference is not recorded as an access to its
+     Pool), a global struct's pointer field against the global it points at
+     (`…global_struct_pointer_vs_name`).
+   (A never-reassigned global pointer used by name, `**gpp`, a view slice, two threads
+   through the SAME global struct or Handle ARE caught: measured.)
+   **Design of the fix, measured but not built.** (i) A local's class must be
+   flow-INSENSITIVE: its declaration plus every write of the name or of part of it
+   anywhere in the function, and its address being taken — `ast_name_writes_parts` is that
+   walk; a name bound more than once is unknown. (ii) A dereference through a GLOBAL must
+   record what the global may hold (the enumerating resolver `for_each_write_target_ex`,
+   not the single-answer `resolve_write_target_global` the walk uses), and that resolver
+   needs a "could not follow" answer. (iii) A Handle dereference records its allocator
+   (`field.handle_alloc`). (iv) What remains unknown makes the access set INCOMPLETE, as
+   the depth cap does (BUG-1665): an incomplete set of such a thread is an error. A
+   scratch build of (iii) + (iv) with a source-ordered (i) rejects five of the eight shapes
+   and changes NO other verdict in the corpus (4,000 files) — the cost of being strict is
+   small, and threads that use no `@atomic` are already held to "touch no non-shared
+   global at all". The payable over-rejection afterwards: an access through an unknown
+   pointer under a lock every writer holds (key such accesses by pointee TYPE instead of
+   refusing them), and a thread's own never-published heap object. Until it is built:
+   reach shared data by name or by index, not through a pointer fetched at run time, or
+   keep it in a `shared struct`.
 
 **B2. Proof status of the data-race class (2026-11-14 — read before claiming "proven").**
 What is machine-checked, and where the chain stops:
@@ -330,7 +334,7 @@ What is machine-checked, and where the chain stops:
   this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
   proven" is.
 - Accept-unsafe items still recorded as OPEN in this class: ONE as of 2026-11-14 — a
-  write through a pointer the context walk cannot name (item 11; two reproducers). Closed
+  access through a pointer the context walk cannot name (item 11; eight reproducers). Closed
   the same day: the lock regions (BUG-1663), the flag hand-off (BUG-1664), the silent
   depth cap (BUG-1665); before them BUG-1652..1654. That is a statement about this ledger
   — what was probed and measured — and NOT a proof, and its record is poor: "none" was
@@ -388,8 +392,9 @@ What is machine-checked, and where the chain stops:
 ## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
 
 1. [residual of: What the atomic/barrier downgrade check still trusts — closed by BUG-1663, BUG-1664]
-   **What the context walk still does not follow.** A pointer read back out of memory
-   or returned by a call: ACCEPT-UNSAFE, section B item 11. A C caller is still invisible
+   **What the context walk still does not follow.** A pointer it cannot name — read
+   back out of memory, returned by a call, re-aimed behind its back, or a second name
+   for one object: ACCEPT-UNSAFE, section B item 11. A C caller is still invisible
    beyond "may run more than once".
    [residual of BUG-1665] A thread whose code is deeper than the walk's cap (about eighty
    calls on one path) is refused even when every access is locked: shorten the chain or

@@ -1,0 +1,4 @@
+// expect-error: contains a label
+// BUG-1658: the no-label rule was asked only of the structured form.
+naked void spin() { asm("again: jmp again"); }
+u32 main() { return 0; }

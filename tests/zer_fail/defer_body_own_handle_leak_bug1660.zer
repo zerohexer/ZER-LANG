@@ -1,0 +1,18 @@
+// expect-error: never freed
+// BUG-1660 (regression pin, rejected before and after): the body's own handle is never freed — that is the leak, and it must
+// be reported against the body's handle. The leftover rename made the body's use
+// of its capture `h` a use of the ENCLOSING handle, so the first diagnostic was a
+// "use after free" of a variable the body does not touch.
+struct T { u32 a; }
+Pool(T, 2) pool;
+u32 work() {
+    Handle(T) h = pool.alloc() orelse return;
+    pool.free(h);
+    {
+        Handle(T) h = pool.alloc() orelse return;
+        defer { ?Handle(T) mh = pool.alloc(); if (mh) |h| { pool.get(h).a = 9; } }
+        pool.free(h);
+    }
+    return 0;
+}
+u32 main() { work(); return 0; }

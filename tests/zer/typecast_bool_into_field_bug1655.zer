@@ -1,0 +1,12 @@
+// BUG-1655 (the silent half): `s.b = (bool)n;` stored the INTEGER into the bool —
+// the cast was left inside the assignment and rendered by an emitter path that
+// knew only the plain C cast, so `s.b == true` was false for n = 5. Exit 1 before.
+struct S { bool b; u32 n; }
+S s;
+u32 five() { return 5; }
+u32 main() {
+    u32 n = five();
+    s.b = (bool)n;
+    if (s.b == true) { return 0; }
+    return 1;
+}

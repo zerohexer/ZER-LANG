@@ -1,0 +1,14 @@
+// expect-error: cannot be resolved to the object it points at
+// BUG-1654: a getter returning a global's address, beside `&g` itself.
+u32 g;
+void w(*u32 a) { for (u32 i = 0; i < 1000; i += 1) { *a += 1; } }
+void f(*u32 p, *u32 q) {
+    ThreadHandle th = spawn w(p);
+    for (u32 i = 0; i < 1000; i += 1) { *q += 1; }
+    th.join();
+}
+*u32 getg() { return &g; }
+u32 main() {
+    f(&g, getg());
+    return 0;
+}

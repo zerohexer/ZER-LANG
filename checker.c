@@ -1658,6 +1658,12 @@ static Type *check_expr(Checker *c, Node *node);
 static void check_stmt(Checker *c, Node *node);
 static void check_stmt_cond_body(Checker *c, Node *body);
 static bool esc_fn_is_sticky(Checker *c);   /* BUG-1611: the body has a label / goto */
+static void esc_note_spawn(Checker *c);    /* BUG-1648 */
+static bool esc_latched(Checker *c);
+static bool esc_join_after_jumps(Checker *c, int line);
+static void esc_note_open(Checker *c, Node *spawn);
+static void esc_latch_suspend(Checker *c, bool resume);
+static bool esc_note_lent(Checker *c, Symbol *vs, int param_pos, bool is_global, const void *site, bool closed);
 static Type *resolve_type(Checker *c, TypeNode *tn);
 static void register_builtin_pair_types(Checker *c);
 
@@ -6122,13 +6128,32 @@ static bool opaque_read_from_shared(Checker *c, Node *e) {
     for (int depth = 0; e && depth <= ZER_EXPR_WALK_MAX; depth++) {
         switch (e->kind) {
         case NODE_FIELD:
-        case NODE_INDEX:
-            return lvalue_path_through_shared(c, e);
+        case NODE_INDEX: {
+            if (lvalue_path_through_shared(c, e)) return true;
+            /* BUG-1653: a part of a LOCAL aggregate that was handed such a value */
+            Node *r = e;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX))
+                r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+            if (!r || r->kind != NODE_IDENT) return false;
+            Symbol *s = scope_lookup(c->current_scope, r->ident.name,
+                                     (uint32_t)r->ident.name_len);
+            return s && s->opaque_from_shared;
+        }
         case NODE_IDENT: {
             Symbol *s = scope_lookup(c->current_scope, e->ident.name,
                                      (uint32_t)e->ident.name_len);
             return s && s->opaque_from_shared;
         }
+        case NODE_STRUCT_INIT:   /* BUG-1653: a literal carrying one in a field */
+            for (int i = 0; i < e->struct_init.field_count; i++) {
+                Node *fv = e->struct_init.fields[i].value;
+                if (!fv) continue;
+                Type *ft = fv->kind == NODE_STRUCT_INIT ? NULL : checker_get_type(c, fv);
+                if (fv->kind != NODE_STRUCT_INIT && (!ft || !type_carries_data_pointer(ft, 0)))
+                    continue;
+                if (opaque_read_from_shared(c, fv)) return true;
+            }
+            return false;
         case NODE_TYPECAST:
             e = e->typecast.expr;
             continue;
@@ -6141,8 +6166,8 @@ static bool opaque_read_from_shared(Checker *c, Node *e) {
             e = e->orelse.expr;
             continue;
         /* Not a read of a stored *opaque: a call RESULT, a literal, arithmetic,
-         * a statement. (A call returning a shared field is the documented
-         * residual — limitations.md.) */
+         * a statement. (A ZER function cannot return one — BUG-1653 — so a call
+         * result is one only when the callee is C, which is the floor.) */
         case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
         case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
         case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
@@ -6155,7 +6180,6 @@ static bool opaque_read_from_shared(Checker *c, Node *e) {
         case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT:
         case NODE_NULL_LIT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
         case NODE_CALL: case NODE_SLICE: case NODE_CAST: case NODE_SIZEOF:
-        case NODE_STRUCT_INIT:
             return false;
         }
     }
@@ -6176,6 +6200,121 @@ static void reject_shared_opaque_unwrap(Checker *c, Node *src, Type *target, int
         "%s turns a *opaque read out of a shared struct into a ZER pointer — the "
         "object it points to would be accessed outside the struct's lock; keep ZER "
         "data in the shared struct itself, and pass a *opaque field only to C", what);
+}
+
+/* BUG-1653: THE HANDLE MUST NOT LEAVE THE STATEMENT'S REACH. The struct's lock is
+ * held for the statement that reads the field and for nothing after it. BUG-1299
+ * refused turning the value back into a ZER pointer where it could SEE that it
+ * came from a shared struct: at the field, at a local holding it, at a capture.
+ * Every way of handing it on made it invisible again —
+ *     *opaque h = r.handle;  use(h);          // `use` casts its parameter
+ *     *opaque get() { return r.handle; }      // the caller casts the result
+ *     void fill(*Box b) { b.h = r.handle; }   // the caller casts b.h
+ * each a write to the pointee from two threads with no lock held (TSan).
+ * A ZER pointer field is refused in a shared struct outright; the `*opaque` field
+ * exists for C handles, so the rule is the one its diagnostic always stated: the
+ * value may sit in a local (which then carries the fact) and may be passed to C.
+ * It may not be passed to a ZER function or a thread, returned, or stored where it
+ * outlives the function. */
+static bool target_path_derefs(Checker *c, Node *n);
+static bool shared_opaque_value(Checker *c, Node *v) {
+    if (!v) return false;
+    if (v->kind != NODE_STRUCT_INIT) {   /* a literal has no type of its own */
+        Type *vt = checker_get_type(c, v);
+        if (!vt || !type_carries_data_pointer(vt, 0)) return false;
+    }
+    return opaque_read_from_shared(c, v);
+}
+static void reject_shared_opaque_leak(Checker *c, Node *v, int line, const char *how) {
+    if (!shared_opaque_value(c, v)) return;
+    checker_error(c, line,
+        "a *opaque read out of a shared struct %s — the struct's lock is held only "
+        "for the statement that reads the field, so whoever turns the value back "
+        "into a ZER pointer reaches the object unlocked. Keep it in a local and "
+        "pass it only to C functions; keep ZER data in the shared struct itself", how);
+}
+/* BUG-1657: THE ONE HAND-ON THAT IS EXACT. `use(r.handle);` reads the field in the
+ * statement that makes the call, so the struct's lock is held until `use` returns
+ * (measured: ThreadSanitizer clean, while `h = r.handle; use(h);` races). What is
+ * left to prove is that `use` does not let the value outlive the call — and that
+ * is precisely what keep inference and the return summary already decide for
+ * every pointer parameter: stored anywhere that outlives the call (a global, a
+ * static, a field of another parameter, a thread) = `keep`; returned = a bit of
+ * `ret_param_mask`. Both are known only after every body is checked, so the call
+ * is recorded here and judged at the end of check_keep_inference. */
+static struct SharedOpaquePass {
+    Symbol *callee; int param; int line; const char *file, *src;
+} *_so_passes = NULL;
+static int _so_pass_n = 0, _so_pass_cap = 0;
+static bool shared_opaque_direct_read(Checker *c, Node *v) {
+    v = v ? unwrap_ptr_launder(v) : NULL;
+    if (!v || (v->kind != NODE_FIELD && v->kind != NODE_INDEX)) return false;
+    Type *vt = checker_get_type(c, v);
+    return vt && type_carries_data_pointer(vt, 0) && lvalue_path_through_shared(c, v);
+}
+/* false = could not be recorded: the caller reports the leak now (reject). */
+static bool shared_opaque_pass_defer(Checker *c, Symbol *callee, int param, int line) {
+    for (int i = 0; i < _so_pass_n; i++)
+        if (_so_passes[i].callee == callee && _so_passes[i].param == param &&
+            _so_passes[i].line == line && _so_passes[i].file == c->file_name) return true;
+    if (_so_pass_n >= _so_pass_cap) {
+        int nc = _so_pass_cap ? _so_pass_cap * 2 : 8;
+        struct SharedOpaquePass *nb = (struct SharedOpaquePass *)realloc(_so_passes,
+                                          (size_t)nc * sizeof(*nb));
+        if (!nb) return false;
+        _so_passes = nb; _so_pass_cap = nc;
+    }
+    struct SharedOpaquePass *k = &_so_passes[_so_pass_n++];
+    k->callee = callee; k->param = param; k->line = line;
+    k->file = c->file_name; k->src = c->source;
+    return true;
+}
+static void check_shared_opaque_passes(Checker *c) {
+    const char *sv_fn = c->file_name, *sv_src = c->source;
+    for (int i = 0; i < _so_pass_n; i++) {
+        struct SharedOpaquePass *k = &_so_passes[i];
+        Type *ft = k->callee && k->callee->type ? type_unwrap_distinct(k->callee->type) : NULL;
+        bool is_fn = ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR;
+        bool in_range = is_fn && k->param >= 0 && k->param < (int)ft->func_ptr.param_count &&
+                        k->param < 64;
+        /* unknown signature, or a parameter the masks cannot name: the leak */
+        bool keeps = !in_range || !ft->func_ptr.param_keeps ||
+                     ft->func_ptr.param_keeps[k->param];
+        bool returns = !in_range ||
+            (ft->func_ptr.ret && type_carries_data_pointer(ft->func_ptr.ret, 0) &&
+             (!k->callee->ret_summary_complete ||
+              ((k->callee->ret_param_mask >> k->param) & 1)));
+        if (!keeps && !returns) continue;
+        c->file_name = k->file; c->source = k->src;
+        checker_error(c, k->line,
+            "a *opaque read out of a shared struct is passed to '%.*s', which %s it — "
+            "the struct's lock is held only until this call returns, so whoever turns "
+            "the value back into a ZER pointer afterwards reaches the object unlocked. "
+            "A helper may USE the handle during the call; it may not keep or return it",
+            (int)k->callee->name_len, k->callee->name,
+            keeps ? "stores" : "returns");
+    }
+    c->file_name = sv_fn; c->source = sv_src;
+    _so_pass_n = 0;   /* one program per run */
+}
+static void check_shared_opaque_store(Checker *c, Node *node) {
+    Node *t = node->assign.target, *v = node->assign.value;
+    if (!t || !v || t->kind == NODE_IDENT) return;   /* a bare name: the caller's sticky flag */
+    if (!shared_opaque_value(c, v)) return;
+    if (lvalue_path_through_shared(c, t)) return;    /* stays behind a shared struct's lock */
+    Node *r = t;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX))
+        r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+    Symbol *rs = (r && r->kind == NODE_IDENT)
+        ? scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len) : NULL;
+    if (rs && !rs->is_function && !rs->is_static &&
+        !name_is_global_here(c, rs->name, (uint32_t)rs->name_len) &&
+        !target_path_derefs(c, t)) {
+        rs->opaque_from_shared = true;               /* a part of a local aggregate */
+        return;
+    }
+    reject_shared_opaque_leak(c, v, node->loc.line,
+        "is stored where it outlives the function (a global, or through a pointer)");
 }
 
 static void array_view_qualifiers(Checker *c, Node *v, bool *is_vol, bool *is_const) {
@@ -6870,9 +7009,77 @@ static void rmw_arg_targets_main(Checker *c, Node *arg, WriteTargetFn fn, void *
     if (s && !s->is_function && s->type && type_carries_data_pointer(s->type, 0))
         for_each_write_target_ex(c, a, true, arg_target_filter, &u);
 }
+/* ---- BUG-1652: ONE answer to "is this statement a read-modify-write of volatile
+ * global g?" for every THREAD sink ----------------------------------------------
+ * The question had three answers. The main checker's sink (main_rmw_visit and the
+ * call sinks) knows every spelling — compound, written out, split through a local,
+ * a pointer, an out-parameter, a callee, memory (BUG-1010 / 1561 / 1650) — but fed
+ * only the ISR rule. The spawn scan re-derived a subset with its own taint table
+ * and no scopes, so a thread's `vmem = g; g = vmem + 1;` (any global carrier),
+ * `rd(&t); g = t + 1;` and `*p = g; g = t + 1;` were plain stores to it. And the
+ * spawner's window sink (BUG-1591) recognised the COMPOUND operator alone, so
+ * `g = g + 1`, the split forms and a helper doing `g += 1` all erased a thread's
+ * store unseen.
+ *
+ * Now: the main checker records each finding as a FACT keyed by the statement
+ * node, and the walk that already knows which code runs in a thread and which in
+ * a spawner's window (sync_walk) reads the facts at the nodes it visits. A
+ * spelling taught to the main sink reaches all three rules at once. */
+static struct VolRmwFact {
+    Node *node; Symbol *g; Node *once; int line; const char *file, *src;
+    bool win_only;   /* a CALL whose callee read-modify-writes through a parameter:
+                      * a thread walk judges that at the statement inside the callee
+                      * (it may sit in an @once the call does not) */
+} *_vol_rmw_facts = NULL;
+/* A statement that read-modify-writes THROUGH A PARAMETER (`*p += 1`), recorded by
+ * the param-mask scan; which global that is depends on the caller's argument. */
+static struct VolRmwPFact { Node *node; } *_vol_rmw_pfacts = NULL;
+static int _vol_rmw_pfact_n = 0, _vol_rmw_pfact_cap = 0;
+static void vol_rmw_pfact_add(Node *node) {
+    for (int i = 0; i < _vol_rmw_pfact_n; i++)
+        if (_vol_rmw_pfacts[i].node == node) return;
+    if (_vol_rmw_pfact_n >= _vol_rmw_pfact_cap) {
+        int nc = _vol_rmw_pfact_cap ? _vol_rmw_pfact_cap * 2 : 16;
+        struct VolRmwPFact *nb = (struct VolRmwPFact *)realloc(_vol_rmw_pfacts,
+                                     (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _vol_rmw_pfacts = nb; _vol_rmw_pfact_cap = nc;
+    }
+    _vol_rmw_pfacts[_vol_rmw_pfact_n++].node = node;
+}
+static int _vol_rmw_fact_n = 0, _vol_rmw_fact_cap = 0;
+/* A threadlocal global is one object PER THREAD: nothing another thread does can
+ * land between the two halves of a read-modify-write of it. */
+static bool global_is_threadlocal(Symbol *g) {
+    return g && g->func_node && g->func_node->kind == NODE_GLOBAL_VAR &&
+           g->func_node->var_decl.is_threadlocal;
+}
+static void vol_rmw_fact_add_ex(Node *node, Symbol *g, Node *once, int line,
+                                const char *file, const char *src, bool win_only) {
+    if (!node || !g || g->is_function || !g->is_volatile || g->is_const) return;
+    if (global_is_threadlocal(g)) return;
+    for (int i = 0; i < _vol_rmw_fact_n; i++)
+        if (_vol_rmw_facts[i].node == node && _vol_rmw_facts[i].g == g) return;
+    if (_vol_rmw_fact_n >= _vol_rmw_fact_cap) {
+        int nc = _vol_rmw_fact_cap ? _vol_rmw_fact_cap * 2 : 16;
+        struct VolRmwFact *nb = (struct VolRmwFact *)realloc(_vol_rmw_facts,
+                                    (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _vol_rmw_facts = nb; _vol_rmw_fact_cap = nc;
+    }
+    struct VolRmwFact *f = &_vol_rmw_facts[_vol_rmw_fact_n++];
+    f->node = node; f->g = g; f->once = once; f->line = line; f->file = file; f->src = src;
+    f->win_only = win_only;
+}
+static void vol_rmw_fact_add(Checker *c, Node *node, Symbol *g, bool win_only) {
+    if (!node) return;
+    vol_rmw_fact_add_ex(node, g, c->cur_once_node, (int)node->loc.line,
+                        c->file_name, c->source, win_only);
+}
+/* `ud` is the NODE_CALL whose argument reaches g. */
 static void track_rmw_arg_visit(Checker *c, Symbol *g, void *ud) {
-    (void)ud;
     track_isr_global(c, g->name, g->name_len, true);
+    vol_rmw_fact_add(c, (Node *)ud, g, true);   /* BUG-1652 */
 }
 static void track_opaque_arg_visit(Checker *c, Symbol *g, void *ud) {
     (void)ud;
@@ -7270,14 +7477,30 @@ static void rmw_taint_maintain(Checker *c, RmwTaintEnt **tab, int *n, int *cap,
         return;
     }
     Node *rt = tg;
-    while (rt && (rt->kind == NODE_FIELD || rt->kind == NODE_INDEX)) {
+    bool through_ref = false;
+    while (rt && (rt->kind == NODE_FIELD || rt->kind == NODE_INDEX ||
+                  (rt->kind == NODE_UNARY && rt->unary.op == TOK_STAR))) {
+        if (rt->kind == NODE_UNARY) { through_ref = true; rt = rt->unary.operand; continue; }
         Node *ob = rt->kind == NODE_FIELD ? rt->field.object : rt->index_expr.object;
         TypeKind ok = type_dispatch_kind(checker_get_type(c, ob));
         if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE)
-            return;   /* writes through a reference: not the local's own storage */
+            through_ref = true;   /* writes through a reference */
         rt = ob;
     }
     if (!rt || rt->kind != NODE_IDENT) return;
+    if (through_ref) {
+        /* BUG-1650: `*p = g; g = *p + 1;` — the copy sits in the object a LOCAL
+         * pointer designates. The pointer's name carries it (a read through it
+         * finds it), and so does the local it was aimed at, when that is known
+         * (BUG-969's borrow root). A global pointer's pointee is the write-target
+         * query's (the memory relation above). */
+        Symbol *ps = scope_lookup(c->current_scope, rt->ident.name,
+                                  (uint32_t)rt->ident.name_len);
+        if (ps && global_decl_lookup(c, ps->name, ps->name_len) == ps) return;
+        if (ps && ps->borrow_root_name)
+            for (int i = 0; i < srcs.n; i++)
+                rmw_tab_add(tab, n, cap, ps->borrow_root_name, ps->borrow_root_len, srcs.v[i]);
+    }
     for (int i = 0; i < srcs.n; i++)
         rmw_tab_add(tab, n, cap, rt->ident.name, (uint32_t)rt->ident.name_len, srcs.v[i]);
 }
@@ -7403,6 +7626,7 @@ struct VfSummary {
     VfDest val_dest[VF_MAX_PARAMS];   /* argument i's value stored there */
     VfDest ptd_dest[VF_MAX_PARAMS];   /* argument j's pointee stored there */
     VfSet writes;                     /* every global the body writes (opaque fallback) */
+    VfSet gin[VF_MAX_PARAMS];         /* BUG-1650: globals whose value lands in arg j's pointee */
     bool opaque;
     int np;
 };
@@ -7413,7 +7637,8 @@ static uint64_t vf_summary_size(const struct VfSummary *s) {
                  (uint64_t)vf_popcount64(s->ret.ptd) + (uint64_t)s->writes.n + (s->opaque ? 1u : 0u);
     for (int i = 0; i < VF_MAX_PARAMS; i++)
         z += (uint64_t)s->val_dest[i].g.n + (uint64_t)vf_popcount64(s->val_dest[i].via) +
-             (uint64_t)s->ptd_dest[i].g.n + (uint64_t)vf_popcount64(s->ptd_dest[i].via);
+             (uint64_t)s->ptd_dest[i].g.n + (uint64_t)vf_popcount64(s->ptd_dest[i].via) +
+             (uint64_t)s->gin[i].n;
     return z;
 }
 static void vfdest_union(Checker *c, VfDest *d, const VfDest *s) {
@@ -7628,11 +7853,19 @@ static void vf_value(VfCtx *x, Node *e, VfSrc *out, int depth) {
 }
 
 /* Record that every source in `src` may be stored into `dst`. */
+static void mem_edge_add(Symbol *m, Symbol *s);
 static void vf_store(VfCtx *x, const VfSrc *src, const VfDest *dst) {
     for (int i = 0; i < VF_MAX_PARAMS; i++) {
         if (src->val & (1ULL << i)) vfdest_union(x->c, &x->s->val_dest[i], dst);
         if (src->ptd & (1ULL << i)) vfdest_union(x->c, &x->s->ptd_dest[i], dst);
+        /* BUG-1650: a GLOBAL's value stored through pointer parameter i
+         * (`void st(*u32 p) { *p = g; }`) — the caller's object now holds it */
+        if ((dst->via & (1ULL << i)) && src->g.n)
+            vfset_union(x->c, &x->s->gin[i], &src->g);
     }
+    /* ... and into a global: the whole-program memory relation */
+    for (int a = 0; a < dst->g.n; a++)
+        for (int b = 0; b < src->g.n; b++) mem_edge_add(dst->g.v[a], src->g.v[b]);
 }
 /* Where a store through argument expression `arg` lands, in this function's
  * terms (the pointee of `arg`). */
@@ -7723,6 +7956,15 @@ static void vf_call_callee(Checker *c, struct VfSummary *s, void *ud) {
             if (kind == 0) vf_value(x, call->call.args[b], &src, 0);
             else vf_arg_pointee(x, call->call.args[b], &src);
             vfset_union(c, &x->s->writes, &d.g);
+            vf_store(x, &src, &d);
+        }
+        if (s->gin[b].n) {   /* BUG-1650: the callee leaves globals in arg b's pointee */
+            VfDest d;
+            memset(&d, 0, sizeof(d));
+            vf_arg_dest(x, call->call.args[b], &d);
+            VfSrc src;
+            memset(&src, 0, sizeof(src));
+            vfset_union(c, &src.g, &s->gin[b]);
             vf_store(x, &src, &d);
         }
     }
@@ -8014,9 +8256,9 @@ static void call_rmw_globals(Checker *c, RmwTaintEnt *tab, int n, Node *call,
 static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
                                 bool is_compound, bool is_static_local, int line);
 static void main_call_rmw_hit(Checker *c, Symbol *g, bool may, void *ud) {
-    (void)ud;
     if (may) track_isr_global_opaque(c, g->name, g->name_len);
     else track_isr_global(c, g->name, g->name_len, true);
+    vol_rmw_fact_add(c, (Node *)ud, g, false);   /* BUG-1652: `ud` is the NODE_CALL */
 }
 static bool once_single_owner(Symbol *g, Node *once);
 static Node *_scan_once_node;
@@ -8072,8 +8314,10 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, MmioPwA
                 for (int pi = 0; pi < fd->func_decl.param_count && pi < 64; pi++) {
                     ParamDecl *pd = &fd->func_decl.params[pi];
                     if (pd->name && pd->name_len == root->ident.name_len &&
-                        memcmp(pd->name, root->ident.name, pd->name_len) == 0)
+                        memcmp(pd->name, root->ident.name, pd->name_len) == 0) {
                         *mask |= (1ULL << pi);
+                        vol_rmw_pfact_add(n);   /* BUG-1652 */
+                    }
                 }
             }
         }
@@ -8938,6 +9182,138 @@ static void mmio_opaque_arg_record(Checker *c, Node *arg, int line) {
     mmio_access_record(c, ab.addr, MMIO_SPAN_OPEN, false, true, line);
 }
 
+/* ---- BUG-1650: a read-modify-write split THROUGH MEMORY --------------------
+ * `mem = g; g = mem + 1;` is the same lost update as `u32 t = g; g = t + 1;`
+ * (BUG-1010), but the carrier is a GLOBAL: the local taint table never held it,
+ * and the two halves may sit in two functions, in either order. Two whole-
+ * program facts, both recorded while every body is checked:
+ *   edge (M <- S): an assignment stored a value with source global S into
+ *                  global M (M may hold a copy of S);
+ *   candidate (G, M): a plain store into G whose value read global M.
+ * After the last body, a candidate whose M reaches G over the edges IS the
+ * read-modify-write of G, in the context its store was checked in. */
+static struct MemEdge { Symbol *m, *s; } *_mem_edges = NULL;
+static int _mem_edge_n = 0, _mem_edge_cap = 0;
+static struct MemCand {
+    Symbol *g, *m; bool isr; Node *body; int line;
+    const char *file, *source, *module; uint32_t module_len;
+    Node *node, *once; bool crit;   /* BUG-1652: the store itself, for the thread rules */
+} *_mem_cands = NULL;
+static int _mem_cand_n = 0, _mem_cand_cap = 0;
+static void mem_edge_add(Symbol *m, Symbol *s) {
+    if (!m || !s || m == s || s->is_function || m->is_function) return;
+    for (int i = 0; i < _mem_edge_n; i++)
+        if (_mem_edges[i].m == m && _mem_edges[i].s == s) return;
+    if (_mem_edge_n >= _mem_edge_cap) {
+        int nc = _mem_edge_cap ? _mem_edge_cap * 2 : 16;
+        struct MemEdge *nb = (struct MemEdge *)realloc(_mem_edges, (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _mem_edges = nb; _mem_edge_cap = nc;
+    }
+    _mem_edges[_mem_edge_n].m = m; _mem_edges[_mem_edge_n].s = s; _mem_edge_n++;
+}
+static void mem_cand_add(Checker *c, Symbol *g, Symbol *m, Node *node) {
+    if (!g || !m || g == m || m->is_function || !node) return;
+    int line = (int)node->loc.line;
+    for (int i = 0; i < _mem_cand_n; i++)
+        if (_mem_cands[i].g == g && _mem_cands[i].m == m && _mem_cands[i].node == node &&
+            _mem_cands[i].isr == c->in_interrupt && _mem_cands[i].body == c->current_body)
+            return;
+    if (_mem_cand_n >= _mem_cand_cap) {
+        int nc = _mem_cand_cap ? _mem_cand_cap * 2 : 16;
+        struct MemCand *nb = (struct MemCand *)realloc(_mem_cands, (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _mem_cands = nb; _mem_cand_cap = nc;
+    }
+    struct MemCand *k = &_mem_cands[_mem_cand_n++];
+    k->g = g; k->m = m; k->isr = c->in_interrupt; k->body = c->current_body; k->line = line;
+    /* @critical makes the split atomic against an INTERRUPT (the ISR rule skips it);
+     * it excludes no other THREAD, so the store is still a fact for those rules. */
+    k->node = node; k->once = c->cur_once_node; k->crit = c->critical_depth > 0;
+    k->file = c->file_name; k->source = c->source;
+    k->module = c->current_module; k->module_len = c->current_module_len;
+}
+/* Does global `m` (transitively) hold a copy of `g`? A visited set ends cycles. */
+static bool mem_reaches(Symbol *m, Symbol *g, Symbol **seen, int *nseen, int cap) {
+    for (int i = 0; i < *nseen; i++) if (seen[i] == m) return false;
+    if (*nseen >= cap) return true;   /* cannot track: the rejecting answer */
+    seen[(*nseen)++] = m;
+    for (int i = 0; i < _mem_edge_n; i++) {
+        if (_mem_edges[i].m != m) continue;
+        if (_mem_edges[i].s == g) return true;
+        if (mem_reaches(_mem_edges[i].s, g, seen, nseen, cap)) return true;
+    }
+    return false;
+}
+static void check_mem_split_rmw(Checker *c) {
+    if (_mem_cand_n == 0 || _mem_edge_n == 0) { _mem_cand_n = 0; _mem_edge_n = 0; return; }
+    int cap = _mem_edge_n + 2;
+    Symbol **seen = (Symbol **)malloc((size_t)cap * sizeof(Symbol *));
+    bool sv_isr = c->in_interrupt; Node *sv_body = c->current_body;
+    int sv_crit = c->critical_depth;
+    const char *sv_fn = c->file_name, *sv_src = c->source, *sv_mod = c->current_module;
+    uint32_t sv_ml = c->current_module_len;
+    for (int i = 0; i < _mem_cand_n; i++) {
+        struct MemCand *k = &_mem_cands[i];
+        int ns = 0;
+        if (seen && !mem_reaches(k->m, k->g, seen, &ns, cap)) continue;
+        vol_rmw_fact_add_ex(k->node, k->g, k->once, k->line, k->file, k->source, false);   /* BUG-1652 */
+        if (k->crit) continue;
+        c->in_interrupt = k->isr; c->current_body = k->body; c->critical_depth = 0;
+        c->file_name = k->file; c->source = k->source;
+        c->current_module = k->module; c->current_module_len = k->module_len;
+        track_isr_global(c, k->g->name, k->g->name_len, true);
+    }
+    free(seen);
+    c->in_interrupt = sv_isr; c->current_body = sv_body; c->critical_depth = sv_crit;
+    c->file_name = sv_fn; c->source = sv_src;
+    c->current_module = sv_mod; c->current_module_len = sv_ml;
+    _mem_cand_n = 0; _mem_edge_n = 0;   /* one program per run (LSP re-checks) */
+}
+
+/* BUG-1650: a callee that stores a global's value through a pointer parameter
+ * leaves that copy in the caller's object — a LOCAL (the value-taint table) or a
+ * GLOBAL (the memory relation). `st(&m); g = m + 1;` is the split read-modify-
+ * write with the read done by the callee. */
+static void main_call_gin(Checker *c, struct VfSummary *s, void *ud) {
+    Node *call = (Node *)ud;
+    if (!s || s->opaque) return;
+    for (int k = 0; k < call->call.arg_count && k < VF_MAX_PARAMS; k++) {
+        if (!s->gin[k].n && !s->ptd_dest[k].g.n) continue;
+        Node *a = call->call.args[k] ? unwrap_ptr_launder(call->call.args[k]) : NULL;
+        VfSet pg = {0};
+        if (call->call.args[k]) call_arg_pointees(c, call->call.args[k], &pg);
+        for (int i = 0; i < pg.n; i++) {
+            for (int j = 0; j < s->gin[k].n; j++) {
+                mem_edge_add(pg.v[i], s->gin[k].v[j]);
+                /* BUG-1652: that store IS a store into the pointee whose value
+                 * read the source — the write-back half when the source holds a
+                 * copy of the pointee (`void f(*u32 p){ vm = *p; *p = vm + 1; }`). */
+                mem_cand_add(c, pg.v[i], s->gin[k].v[j], call);
+            }
+            /* ... and the callee copying the pointee into a global is the read half */
+            for (int j = 0; j < s->ptd_dest[k].g.n; j++)
+                mem_edge_add(s->ptd_dest[k].g.v[j], pg.v[i]);
+        }
+        if (!s->gin[k].n) continue;
+        /* the local the argument points into: `&m`, `&m.f`, or a pointer local */
+        Node *r = a;
+        if (r && r->kind == NODE_UNARY && r->unary.op == TOK_AMP) r = r->unary.operand;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE))
+            r = r->kind == NODE_FIELD ? r->field.object
+              : r->kind == NODE_INDEX ? r->index_expr.object : r->slice.object;
+        if (!r || r->kind != NODE_IDENT) continue;
+        Symbol *ls = scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len);
+        if (!ls || global_decl_lookup(c, ls->name, ls->name_len) == ls) continue;
+        for (int j = 0; j < s->gin[k].n; j++) {
+            rmw_tab_add(&c->rmw_taints, &c->rmw_taint_count, &c->rmw_taint_capacity,
+                        ls->name, ls->name_len, s->gin[k].v[j]);
+            if (ls->borrow_root_name)
+                rmw_tab_add(&c->rmw_taints, &c->rmw_taint_count, &c->rmw_taint_capacity,
+                            ls->borrow_root_name, ls->borrow_root_len, s->gin[k].v[j]);
+        }
+    }
+}
 /* The main-checker RMW sink, per target (BUG-1124). `ud` is the NODE_ASSIGN. */
 static bool target_is_bit_range(Checker *c, Node *target);
 static void main_rmw_visit(Checker *c, Symbol *g, void *ud) {
@@ -8948,7 +9324,17 @@ static void main_rmw_visit(Checker *c, Symbol *g, void *ud) {
                   assign_reads_own_target(c, node->assign.value, g) ||
                   rmw_value_taints_global(c, c->rmw_taints, c->rmw_taint_count,
                                           node->assign.value, g, 0);  /* BUG-1010 */
-    if (is_rmw) track_isr_global(c, g->name, g->name_len, true);
+    if (is_rmw) {
+        track_isr_global(c, g->name, g->name_len, true);
+        vol_rmw_fact_add(c, node, g, false);   /* BUG-1652 */
+    }
+    /* BUG-1650: what this store leaves in `g`, and whose copies it read */
+    VfSet srcs = {0};
+    rmw_value_sources(c, c->rmw_taints, c->rmw_taint_count, node->assign.value, 0, &srcs);
+    for (int i = 0; i < srcs.n; i++) {
+        mem_edge_add(g, srcs.v[i]);
+        if (!is_rmw) mem_cand_add(c, g, srcs.v[i], node);
+    }
 }
 
 /* The spawn-scan RMW sink, per target (BUG-1124). Reads the scan's value-taint
@@ -9014,6 +9400,7 @@ static void spawn_rmw_visit(Checker *c, Symbol *ts, void *ud) {
     SpawnRmwUd *u = (SpawnRmwUd *)ud;
     Node *node = u->node;
     if (u->hit || !ts || ts->is_function || ts->is_const) return;
+    if (global_is_threadlocal(ts)) return;   /* BUG-1652: `threadlocal volatile` was refused */
     bool is_rmw = (node->assign.op != TOK_EQ) ||
                   target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                   assign_reads_own_target(c, node->assign.value, ts) ||
@@ -11506,21 +11893,53 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
         r->handle.elem = subst_typenode(a, tn->handle.elem, param_name, param_len, replacement);
         return r;
     }
-    /* Pool/Ring/Slab DO carry an inner type (`.pool.elem` etc.) and are left
-     * unsubstituted DELIBERATELY: the emitter cannot stamp their inline storage
-     * for a monomorphized container, so substituting here would replace a clear
-     * type error with a broken emission. They therefore still report
-     * "undefined type 'T'" — accurate as far as it goes, though a dedicated
-     * "not supported as a container field" message would be kinder. Tracked in
-     * docs/limitations.md; do NOT add substitution here without the emitter
-     * work. Arena/Barrier/Semaphore carry no element type at all. */
+    /* BUG-1659: substitution is TOTAL — every kind that carries an inner type
+     * substitutes it. Pool / Ring / Slab used to be left alone on purpose ("the
+     * emitter cannot stamp their inline storage"), which did keep them out of
+     * the emitter but for the wrong stated reason: `Pool(T, 4)` was reported as
+     * "undefined type 'T'". They are refused as a container field by
+     * check_aggregate_member, the same rule a struct field obeys, and that
+     * rule needs the type to RESOLVE. A function-pointer field was left alone
+     * by oversight (it was listed with the leaves), so a callback over the
+     * template parameter — `*(T) -> void cb;` — could not be declared at all. */
+    case TYNODE_POOL: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->pool.elem = subst_typenode(a, tn->pool.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_RING: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->ring.elem = subst_typenode(a, tn->ring.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_SLAB: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->slab.elem = subst_typenode(a, tn->slab.elem, param_name, param_len, replacement);
+        return r;
+    }
+    case TYNODE_FUNC_PTR: {
+        TypeNode *r = (TypeNode *)arena_alloc(a, sizeof(TypeNode));
+        *r = *tn;
+        r->func_ptr.return_type = subst_typenode(a, tn->func_ptr.return_type,
+                                                 param_name, param_len, replacement);
+        if (tn->func_ptr.param_count > 0 && tn->func_ptr.param_types) {
+            r->func_ptr.param_types = (TypeNode **)arena_alloc(a,
+                (size_t)tn->func_ptr.param_count * sizeof(TypeNode *));
+            for (int pi = 0; pi < tn->func_ptr.param_count; pi++)
+                r->func_ptr.param_types[pi] = subst_typenode(a, tn->func_ptr.param_types[pi],
+                                                             param_name, param_len, replacement);
+        }
+        return r;
+    }
+    /* Leaves: no inner type. Arena / Barrier / Semaphore carry no element type. */
     case TYNODE_U8: case TYNODE_U16: case TYNODE_U32: case TYNODE_U64:
     case TYNODE_USIZE: case TYNODE_I8: case TYNODE_I16: case TYNODE_I32:
     case TYNODE_I64: case TYNODE_F32: case TYNODE_F64: case TYNODE_BOOL:
     case TYNODE_VOID: case TYNODE_OPAQUE: case TYNODE_NAMED:
-    case TYNODE_FUNC_PTR: case TYNODE_POOL: case TYNODE_RING:
-    case TYNODE_ARENA: case TYNODE_BARRIER:
-    case TYNODE_SLAB: case TYNODE_SEMAPHORE:
+    case TYNODE_ARENA: case TYNODE_BARRIER: case TYNODE_SEMAPHORE:
         return tn;
     }
     return tn;  /* defensive — unreachable with all cases enumerated */
@@ -11581,6 +12000,65 @@ static void reject_const_value_field(Checker *c, int line, TypeNode *tn, Type *f
         "a VARIABLE (declare the struct variable or parameter 'const') or a "
         "pointer's TARGET ('const *T', 'const [*]T'); a single field cannot be "
         "made read-only on its own", what, (int)name_len, name);
+}
+
+/* ---- the rules EVERY member of an aggregate obeys (BUG-1659) ----------------
+ *
+ * A struct field, a union variant and a field of a stamped container are the same
+ * thing to the emitter: one member of one C aggregate. Three rules hold for all of
+ * them, and each declaring site used to carry its own copy — the container stamp
+ * carried NONE:
+ *
+ *   - a `void` member has no size (BUG-224);
+ *   - Pool / Ring / Slab / Arena are storage with an identity — every method call
+ *     is resolved against a NAMED global, and their inline layout is emitted per
+ *     variable — so they cannot be a member (BUG-287 / 386 / 1112). The position
+ *     predicate is the VST-verified zer_container_position_valid;
+ *   - an async task's state struct is defined after every user aggregate, so one
+ *     held by value is an incomplete type (BUG-1238).
+ *
+ * `container C(T) { Ring(u8, 8) r; T x; }`, `{ void v; T x; }` and a by-value task
+ * field all passed the checker and reached GCC as C it refuses. The stamp site
+ * also substituted T into every field form EXCEPT a Pool / Ring / Slab element,
+ * so `Pool(T, 4)` was reported as "undefined type 'T'" — a message about a name
+ * the user had declared one line above. Substitution is now total and this one
+ * rule names the restriction.
+ *
+ * Aggregate-SPECIFIC rules stay at their site: by-value self-containment (each
+ * site knows its own in-progress type), shared / packed / move interactions
+ * (a struct has those attributes, a union and a container do not). */
+typedef enum { AGG_STRUCT, AGG_UNION, AGG_CONTAINER } AggKind;
+
+static void check_aggregate_member(Checker *c, AggKind k, int line,
+                                   const char *owner, size_t owner_len,
+                                   const char *name, size_t name_len, Type *mt) {
+    static const char *const member[]  = { "struct field", "union variant", "container field" };
+    static const char *const members[] = { "struct fields", "union variants", "container fields" };
+    static const char *const agg[]     = { "struct", "union", "container" };
+    static const char *const part[]    = { "field", "variant", "field" };
+    if (!mt) return;
+    TypeKind mk = type_dispatch_kind(mt);
+    if (mk == TYPE_VOID) {
+        checker_error(c, line, "%s '%.*s' cannot have type 'void'",
+                      member[k], (int)name_len, name);
+        return;
+    }
+    if ((mk == TYPE_POOL || mk == TYPE_RING || mk == TYPE_SLAB || mk == TYPE_ARENA) &&
+        zer_container_position_valid(k == AGG_UNION ? ZER_DP_VARIANT : ZER_DP_FIELD) == 0) {
+        checker_error(c, line,
+            "Pool/Ring/Slab/Arena cannot be %s — must be global or static variables "
+            "(%s '%.*s' of %s '%.*s'); declare the allocator as a global and keep a "
+            "Handle or an index in the aggregate",
+            members[k], part[k], (int)name_len, name, agg[k], (int)owner_len, owner);
+        return;
+    }
+    if (type_is_async_task(mt)) {
+        checker_error(c, line,
+            "%s '%.*s' of %s '%.*s' cannot hold an async task by value — an aggregate "
+            "is defined before the task's state is known; hold a '*_zer_async_...' "
+            "pointer to a task declared as a local or global",
+            part[k], (int)name_len, name, agg[k], (int)owner_len, owner);
+    }
 }
 
 /* BUG-1551: a `|*v|` capture is a pointer to the captured value. Over an ARRAY
@@ -12138,6 +12616,16 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 reject_const_value_field(c, fd->loc.line ? (int)fd->loc.line : (int)tn->loc.line,
                                          fd->type, sf->type, "container field",
                                          fd->name, fd->name_len);   /* BUG-1547 */
+                /* The rules of every aggregate member — this site had none of them
+                 * (BUG-1659). Recover with a sized type so the by-value walks that
+                 * follow an error have something finite to walk. */
+                {
+                    int errs_before = c->error_count;
+                    check_aggregate_member(c, AGG_CONTAINER,
+                                           fd->loc.line ? (int)fd->loc.line : (int)tn->loc.line,
+                                           cname, cnlen, fd->name, fd->name_len, sf->type);
+                    if (c->error_count != errs_before) sf->type = ty_u8;
+                }
                 /* J4: by-value self-containment guard (mirrors the
                  * NODE_STRUCT_DECL check). Now that the knot is tied, a field
                  * that IS the in-progress stamp by value — bare, or wrapped only
@@ -15444,6 +15932,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             /* BUG-1124: the same question for EVERY global the target may land on
              * (a retargeted pointer), each classified against its own name. */
             for_each_write_target(c, node->assign.target, main_rmw_visit, node);
+            check_shared_opaque_store(c, node);   /* BUG-1653 */
             track_mmio_register_write(c, node);   /* BUG-1358 */
 
             /* BUG-1010: maintain the taint. A plain `local = <expr>` SETS the
@@ -16067,9 +16556,16 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         tsym->nonkeep_root_mask = 0;
                     }
                     if (node->assign.target->kind == NODE_IDENT) {
-                        /* BUG-1299: sticky — a copy of a shared *opaque stays one. */
-                        if (opaque_read_from_shared(c, node->assign.value))
+                        /* BUG-1299: sticky — a copy of a shared *opaque stays one.
+                         * BUG-1653: a GLOBAL (or static) outlives the function. */
+                        if (opaque_read_from_shared(c, node->assign.value)) {
+                            if (tsym->is_static ||
+                                name_is_global_here(c, tsym->name, (uint32_t)tsym->name_len))
+                                reject_shared_opaque_leak(c, node->assign.value, node->loc.line,
+                                    "is stored where it outlives the function (a global, "
+                                    "or through a pointer)");
                             tsym->opaque_from_shared = true;
+                        }
                         /* BUG-1303: sticky too — once it held a param it may still. */
                         if (!tsym->param_alias_pos1)
                             tsym->param_alias_pos1 = param_alias_of_value(c, node->assign.value);
@@ -17282,7 +17778,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             if (cs && cs->is_function && cs->func_node) {
                 ensure_func_props(c, cs);
                 if (cs->props.can_detach) {
-                    c->after_spawn_in_func = true;
+                    c->after_spawn_in_func = true; esc_note_spawn(c);
                     c->unbounded_spawn_in_func = true;
                 }
             }
@@ -17484,7 +17980,32 @@ static Type *check_expr_impl(Checker *c, Node *node) {
         /* BUG-1561/1564: a call storing a value derived from a global back into
          * it (`wr(t + 1)` after `u32 t = rd();`, `wr(&g, g + 1)`, a forwarding
          * helper, an indirect call's candidates) read-modify-writes it. */
-        call_rmw_globals(c, c->rmw_taints, c->rmw_taint_count, node, main_call_rmw_hit, NULL);
+        /* BUG-1653: only a C function (no body) may be handed the handle */
+        {
+            Node *ocal = node->call.callee;
+            Symbol *ofs = (ocal && ocal->kind == NODE_IDENT &&
+                           name_is_global_here(c, ocal->ident.name, (uint32_t)ocal->ident.name_len))
+                ? global_decl_lookup(c, ocal->ident.name, (uint32_t)ocal->ident.name_len) : NULL;
+            bool to_c = ofs && ofs->is_function && ofs->func_node &&
+                        ofs->func_node->kind == NODE_FUNC_DECL &&
+                        !ofs->func_node->func_decl.body;
+            bool zer_named = ofs && ofs->is_function && ofs->func_node &&
+                             ofs->func_node->kind == NODE_FUNC_DECL &&
+                             ofs->func_node->func_decl.body;
+            if (!to_c)
+                for (int oi = 0; oi < node->call.arg_count; oi++) {
+                    /* BUG-1657: read in THIS statement and handed to a named ZER
+                     * function — exact unless the callee keeps or returns it,
+                     * which only the post pass knows */
+                    if (zer_named && shared_opaque_direct_read(c, node->call.args[oi]) &&
+                        shared_opaque_pass_defer(c, ofs, oi, (int)node->loc.line))
+                        continue;
+                    reject_shared_opaque_leak(c, node->call.args[oi], node->loc.line,
+                        "is passed to a ZER function (or through a function pointer)");
+                }
+        }
+        call_rmw_globals(c, c->rmw_taints, c->rmw_taint_count, node, main_call_rmw_hit, node);
+        vf_for_each_callee(c, node, main_call_gin, node);   /* BUG-1650 */
         if (node->call.callee) {
             Node *cal = node->call.callee;
             Symbol *rc = (cal->kind == NODE_IDENT)
@@ -17500,7 +18021,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * spawn scans already resolved the alias; this sink matched
                      * only the literal `&g`. */
                     rmw_arg_targets_main(c, node->call.args[i],
-                                         track_rmw_arg_visit, NULL);   /* BUG-1124 */
+                                         track_rmw_arg_visit, node);   /* BUG-1124 */
                 }
             } else if (callee_is_opaque_funcptr(c, cal)) {
                 /* BUG-1046: a call through a function pointer — no body to
@@ -17821,6 +18342,20 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                          * conditional-nesting check above, so a join on SOME paths
                          * leaves the window open — the same conservative direction
                          * that check already takes for the borrow. */
+                        /* BUG-1651: an OPEN window (a path left it with the thread
+                         * running — see win_exits_live) is released only by its
+                         * handle's TAIL JOIN: outside every conditional body and
+                         * @once, and after the function's last goto / label, so
+                         * the code that follows is entered only by running this
+                         * join (window_cfg.v, `tail_window_sound`). A CLOSED
+                         * window's join is the textual one. */
+                        if (!zer_window_join_releases(osym2->th_window_closed ? 1 : 0,
+                                c->branch_depth, c->cur_once_node != NULL ? 1 : 0,
+                                esc_join_after_jumps(c, (int)node->loc.line) ? 1 : 0)) {
+                            result = ty_void;
+                            typemap_set(c, field_node, result);
+                            break;
+                        }
                         if (osym2->th_live) {
                             osym2->th_live = false;
                             if (c->live_scoped_threads > 0) c->live_scoped_threads--;
@@ -17832,17 +18367,26 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                                 c->once_lent_count = 0;   /* BUG-1276 */
                             }
                         }
+                        /* releases what THIS handle lent, and nothing else */
                         for (int bi = 0; bi < osym2->th_borrow_count; bi++) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrow_names[bi],
                                 osym2->th_borrow_lens[bi]);
-                            if (bv) bv->is_borrowed_by_thread = false;
+                            if (bv) {
+                                bv->lend_live = false;
+                                bv->borrow_latched = false;
+                                bv->is_borrowed_by_thread = false;
+                            }
                         }
                         osym2->th_borrow_count = 0;
                         if (osym2->th_borrows_name) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrows_name, osym2->th_borrows_name_len);
-                            if (bv) bv->is_borrowed_by_thread = false;
+                            if (bv) {
+                                bv->lend_live = false;
+                                bv->borrow_latched = false;
+                                bv->is_borrowed_by_thread = false;
+                            }
                             osym2->th_borrows_name = NULL;
                             osym2->th_borrows_name_len = 0;
                         }
@@ -22706,6 +23250,17 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             if (node->intrinsic.arg_count > 0) {
                 Symbol *acell = atomic_scalar_global_target(c, node->intrinsic.args[0]);
                 if (acell) acell->is_atomic_cell = true;
+                /* BUG-1652: `@atomic_store(&a, g)` leaves a copy of g in a — a
+                 * memory carrier like any other: `g = @atomic_load(&a) + 1;` then
+                 * read-modify-writes g through it. Every value operand counts
+                 * (`@atomic_add(&a, g)` leaves a value derived from g). */
+                if (acell)
+                    for (int vi = 1; vi < node->intrinsic.arg_count; vi++) {
+                        VfSet asrc = {0};
+                        rmw_value_sources(c, c->rmw_taints, c->rmw_taint_count,
+                                          node->intrinsic.args[vi], 0, &asrc);
+                        for (int si = 0; si < asrc.n; si++) mem_edge_add(acell, asrc.v[si]);
+                    }
                 /* BUG-1284: a pointer VALUE operand (`p` aimed at `&g`), or a param
                  * whose caller's argument the post-check resolves. */
                 if (!acell && node->intrinsic.args[0] &&
@@ -23321,6 +23876,11 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@%.*s first argument must be a shared struct variable",
                             (int)nlen, name);
+                    } else if (sst && type_dispatch_kind(sst) == TYPE_STRUCT) {
+                        /* BUG-1661: the struct needs its condition variable. Recorded
+                         * HERE, on the type, because this is the one place every
+                         * condvar intrinsic passes through (types.h, uses_condvar). */
+                        sst->struct_type.uses_condvar = true;
                     }
                 }
             }
@@ -25159,6 +25719,7 @@ static void record_parent_volatile_rmw(Checker *c, Symbol *sym, int line) {
     c->par_vol_rmw[c->par_vol_rmw_n].src = c->source;
     c->par_vol_rmw_n++;
 }
+static bool vol_win_rmw_locked_ok(Symbol *g, int line, const char *file);
 static void check_parent_volatile_rmw(Checker *c) {
     const char *sv_fn = c->file_name, *sv_src = c->source;
     for (int i = 0; i < c->par_vol_rmw_n; i++) {
@@ -25166,6 +25727,9 @@ static void check_parent_volatile_rmw(Checker *c) {
         for (int k = 0; k < c->thr_vol_n && !hit; k++) hit = c->thr_vol[k] == c->par_vol_rmw[i].s;
         if (!hit) continue;
         Symbol *g = c->par_vol_rmw[i].s;
+        /* BUG-1656: under the SAME lock every thread's store of it holds, the
+         * read-modify-write is exact */
+        if (vol_win_rmw_locked_ok(g, c->par_vol_rmw[i].line, c->par_vol_rmw[i].file)) continue;
         c->file_name = c->par_vol_rmw[i].file; c->source = c->par_vol_rmw[i].src;
         checker_error(c, c->par_vol_rmw[i].line,
             "non-atomic read-modify-write of volatile global '%.*s' while a spawned "
@@ -25175,6 +25739,108 @@ static void check_parent_volatile_rmw(Checker *c) {
             (int)g->name_len, g->name);
     }
     c->file_name = sv_fn; c->source = sv_src;
+}
+
+static struct VolStore { Symbol *g, *lock; bool thread; } *_vol_stores = NULL;
+static int _vol_store_n = 0, _vol_store_cap = 0;
+static void vol_store_note(Symbol *g, Symbol *lock, bool thread) {
+    for (int i = 0; i < _vol_store_n; i++)
+        if (_vol_stores[i].g == g && _vol_stores[i].lock == lock &&
+            _vol_stores[i].thread == thread) return;
+    if (_vol_store_n >= _vol_store_cap) {
+        int nc = _vol_store_cap ? _vol_store_cap * 2 : 16;
+        struct VolStore *nb = (struct VolStore *)realloc(_vol_stores, (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        _vol_stores = nb; _vol_store_cap = nc;
+    }
+    _vol_stores[_vol_store_n].g = g; _vol_stores[_vol_store_n].lock = lock;
+    _vol_stores[_vol_store_n].thread = thread; _vol_store_n++;
+}
+/* BUG-1656: THE SPAWNER'S READ-MODIFY-WRITE UNDER A LOCK. The window rule
+ * (BUG-1591) refused it whenever a thread stores the flag, lock or no lock —
+ * `LOCK; g += 1; UNLOCK;` beside a thread doing `LOCK; g = i; UNLOCK;` is exact
+ * and was an error. Recorded per source line (the key the window rule reports
+ * by): the lock held at every read-modify-write of `g` on that line. One of them
+ * unlocked, or two different locks, and the line is not exempt. */
+static struct VolWinRmw { Symbol *g, *lock; int line; const char *file; bool mixed; }
+    *_vol_win_rmws = NULL;
+static int _vol_win_rmw_n = 0, _vol_win_rmw_cap = 0;
+static bool _vol_win_rmw_lost = false;   /* an entry could not be kept: no exemption */
+static void vol_win_rmw_note(Symbol *g, int line, const char *file, Symbol *lock) {
+    for (int i = 0; i < _vol_win_rmw_n; i++) {
+        struct VolWinRmw *k = &_vol_win_rmws[i];
+        if (k->g != g || k->line != line || k->file != file) continue;
+        if (k->lock != lock) k->mixed = true;
+        return;
+    }
+    if (_vol_win_rmw_n >= _vol_win_rmw_cap) {
+        int nc = _vol_win_rmw_cap ? _vol_win_rmw_cap * 2 : 8;
+        struct VolWinRmw *nb = (struct VolWinRmw *)realloc(_vol_win_rmws, (size_t)nc * sizeof(*nb));
+        if (!nb) { _vol_win_rmw_lost = true; return; }
+        _vol_win_rmws = nb; _vol_win_rmw_cap = nc;
+    }
+    struct VolWinRmw *k = &_vol_win_rmws[_vol_win_rmw_n++];
+    k->g = g; k->lock = lock; k->line = line; k->file = file; k->mixed = false;
+}
+static bool vol_win_rmw_locked_ok(Symbol *g, int line, const char *file) {
+    if (_vol_win_rmw_lost) return false;
+    struct VolWinRmw *k = NULL;
+    for (int i = 0; i < _vol_win_rmw_n && !k; i++)
+        if (_vol_win_rmws[i].g == g && _vol_win_rmws[i].line == line &&
+            _vol_win_rmws[i].file == file) k = &_vol_win_rmws[i];
+    /* not seen by the context walk, unlocked, or under two locks: the strict rule */
+    if (!k || !k->lock || k->mixed) return false;
+    for (int j = 0; j < _vol_store_n; j++)
+        if (_vol_stores[j].thread && _vol_stores[j].g == g && _vol_stores[j].lock != k->lock)
+            return false;   /* a thread stores it outside that lock */
+    return true;
+}
+static struct VolLockedRmw { Symbol *g, *lock; struct SyncSpawnSite *site; } *_vol_locked = NULL;
+static int _vol_locked_n = 0, _vol_locked_cap = 0;
+static bool _vol_locked_lost = false;   /* an entry could not be kept: refuse */
+static void vol_locked_note(Symbol *g, Symbol *lock, struct SyncSpawnSite *site) {
+    for (int i = 0; i < _vol_locked_n; i++)
+        if (_vol_locked[i].g == g && _vol_locked[i].lock == lock &&
+            _vol_locked[i].site == site) return;
+    if (_vol_locked_n >= _vol_locked_cap) {
+        int nc = _vol_locked_cap ? _vol_locked_cap * 2 : 8;
+        struct VolLockedRmw *nb = (struct VolLockedRmw *)realloc(_vol_locked,
+                                      (size_t)nc * sizeof(*nb));
+        if (!nb) { _vol_locked_lost = true; return; }
+        _vol_locked = nb; _vol_locked_cap = nc;
+    }
+    _vol_locked[_vol_locked_n].g = g; _vol_locked[_vol_locked_n].lock = lock;
+    _vol_locked[_vol_locked_n].site = site; _vol_locked_n++;
+}
+/* BUG-1652: a thread's read-modify-write of a volatile flag UNDER A LOCK is exact
+ * only if every other store of that flag holds the same lock — an unlocked
+ * `flag = 1` elsewhere lands between the read and the write-back and is erased. */
+static void check_volatile_locked_rmw(Checker *c) {
+    const char *sv_fn = c->file_name, *sv_src = c->source;
+    for (int i = 0; i < _vol_locked_n; i++) {
+        struct VolLockedRmw *k = &_vol_locked[i];
+        bool bad = _vol_locked_lost;
+        for (int j = 0; j < _vol_store_n && !bad; j++)
+            bad = _vol_stores[j].g == k->g && _vol_stores[j].lock != k->lock;
+        if (!bad || !k->site || !k->site->target) continue;
+        c->file_name = k->site->file; c->source = k->site->source;
+        checker_error(c, k->site->line,
+            "spawn target '%.*s' read-modify-writes volatile global '%.*s' under lock "
+            "'%.*s', but another store of '%.*s' (in a thread, or in the code that "
+            "spawned one) does not hold that lock — it can land between the read and "
+            "the write-back and be erased. Take the same lock at every write, or use "
+            "@atomic_*",
+            (int)k->site->target->name_len, k->site->target->name,
+            (int)k->g->name_len, k->g->name,
+            (int)k->lock->name_len, k->lock->name,
+            (int)k->g->name_len, k->g->name);
+    }
+    c->file_name = sv_fn; c->source = sv_src;
+}
+static void vol_rmw_tables_reset(void) {   /* one program per run (the LSP re-checks) */
+    _vol_rmw_fact_n = 0; _vol_rmw_pfact_n = 0; _vol_store_n = 0; _vol_locked_n = 0;
+    _vol_locked_lost = false;
+    _vol_win_rmw_n = 0; _vol_win_rmw_lost = false;
 }
 
 /* THE exemption set of the spawn race scan: does a non-function global `sym`
@@ -25446,6 +26112,15 @@ typedef struct {
     SyncBind *bind; int nbind, cbind;
     int frame;                /* first binding of the function being walked */
     Node *fnode;              /* the function being walked (indirect callees) */
+    /* BUG-1649: a Handle auto-deref in a body the checker finished AFTER the
+     * spawn site was scanned (`late_seq` >= 0 arms the check). */
+    int late_seq;
+    Symbol *late_alloc;
+    /* BUG-1652: 1 = a spawned thread's body, 2 = a spawner's window (0 = an
+     * interrupt handler's walk: the ISR rules own those). */
+    int rmw_mode;
+    Symbol *vol_rmw;          /* THREAD: a volatile global read-modify-written unlocked */
+    struct SyncSpawnSite *site;
 } SyncWalk;
 typedef struct { Symbol **v; int n, cap; bool direct; } SyncGl;
 static void sync_gl_add(SyncGl *l, Symbol *g) {
@@ -25540,12 +26215,80 @@ static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
      * the access kind is known; a thread that only READS the flag cannot lose
      * the spawner's update (it used to be recorded by the exemption itself,
      * so `vg |= 2` was refused against a reader). */
-    if (w->phase == SW_THREAD && write && g && g->is_volatile && !g->is_function &&
-        g->type && volatile_global_exempt_from_race_check(w->c, g))
+    /* BUG-1652: `rmw_mode != 2` — sync_descend runs a WINDOW walk's callees in
+     * the THREAD phase ("the whole callee runs in the window"), so the phase
+     * alone recorded a store made by the SPAWNER's helper as a thread's, and the
+     * spawner's own read-modify-write of a flag no thread touches was refused
+     * "while a spawned thread may store it". */
+    if (w->phase == SW_THREAD && w->rmw_mode != 2 && write && g && g->is_volatile &&
+        !g->is_function && g->type && volatile_global_exempt_from_race_check(w->c, g))
         record_thread_volatile(w->c, g);
+    /* BUG-1652: every store of such a flag by a thread or in a spawner's window,
+     * with the lock it was made under — what a LOCKED read-modify-write of the
+     * same global has to be checked against. */
+    if (w->rmw_mode && write && g && g->is_volatile && !g->is_function && g->type &&
+        volatile_global_exempt_from_race_check(w->c, g))
+        vol_store_note(g, ctx.lock, w->rmw_mode == 1);
     if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
     SyncAcc a = { g, write, ctx.lock, ctx.acq, ctx.pub };
     sync_acc_add(w->out, a);
+}
+/* A thread read-modify-writes volatile `g`: refused outright, as the spawn scan
+ * always did — unless a lock is held, in which case every OTHER store must hold
+ * it too (check_volatile_locked_rmw). An @once body is never walked. */
+static void sync_vol_rmw_thread_hit(SyncWalk *w, Symbol *g, SyncCtx ctx) {
+    if (!g || g->is_function || !g->is_volatile || g->is_const || global_is_threadlocal(g))
+        return;
+    if (!ctx.lock) { if (!w->vol_rmw) w->vol_rmw = g; }
+    else vol_locked_note(g, ctx.lock, w->site);
+}
+/* BUG-1652: the read-modify-write facts the main checker recorded for statement
+ * `n`, applied in the context this walk is in. */
+static void sync_vol_rmw_facts(SyncWalk *w, Node *n, SyncCtx ctx) {
+    if (!w->rmw_mode) return;
+    if (w->phase != SW_THREAD && w->phase != SW_IN) return;
+    Checker *c = w->c;
+    /* through a parameter: the global is whatever this walk bound the name to */
+    if (w->rmw_mode == 1 && n->kind == NODE_ASSIGN)
+        for (int i = 0; i < _vol_rmw_pfact_n; i++) {
+            if (_vol_rmw_pfacts[i].node != n) continue;
+            Node *r = n->assign.target;
+            int steps = 0;
+            bool star = false;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                         (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+                if (r->kind == NODE_FIELD) r = r->field.object;
+                else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+                else { r = r->unary.operand; star = true; }
+                steps++;
+            }
+            if (!r || r->kind != NODE_IDENT || steps == 0) break;
+            for (int bi = w->nbind - 1; bi >= w->frame; bi--) {
+                SyncBind *b = &w->bind[bi];
+                if (b->len != (uint32_t)r->ident.name_len ||
+                    memcmp(b->name, r->ident.name, b->len) != 0) continue;
+                if (b->g && (b->direct || star || steps >= 2))
+                    sync_vol_rmw_thread_hit(w, b->g, ctx);
+                if (b->decl) break;
+            }
+            break;
+        }
+    for (int i = 0; i < _vol_rmw_fact_n; i++) {
+        struct VolRmwFact *f = &_vol_rmw_facts[i];
+        if (f->node != n) continue;
+        if (w->rmw_mode == 1) {
+            if (f->win_only) continue;
+            if (f->once && once_single_owner(f->g, f->once)) continue;
+            sync_vol_rmw_thread_hit(w, f->g, ctx);
+        } else {
+            /* the spawner's window: an error only if a thread stores it */
+            const char *sf = c->file_name, *ss = c->source;
+            c->file_name = f->file; c->source = f->src;
+            record_parent_volatile_rmw(c, f->g, f->line);
+            vol_win_rmw_note(f->g, f->line, f->file, ctx.lock);   /* BUG-1656 */
+            c->file_name = sf; c->source = ss;
+        }
+    }
 }
 /* BUG-1565 (C2): an access THROUGH a name bound to a global — `*p`, `p.f`,
  * `p[i]`, and for a carrier `*h.p` / `h.p.f` — is an access of that global.
@@ -25572,11 +26315,28 @@ static void sync_record_bound(SyncWalk *w, Node *place, bool write, SyncCtx ctx)
     }
 }
 /* An lvalue: its ROOT is named, not read; its index expressions are read. */
+/* BUG-1649: `h.v` is a call into its Pool / Slab (BUG-1625), named only by the
+ * checker's annotation on the node. The spawn-site scan reads that annotation, so
+ * a target (or a callee of it) whose body was checked AFTER the spawn site showed
+ * it nothing. Seen here, once every body is checked — a read AND an assignment
+ * target (the two walks below). `late_seq` > 0 arms it (thread walks only). */
+static void sync_late_alloc(SyncWalk *w, Node *n) {
+    if (w->late_seq <= 0 || w->phase != SW_THREAD || w->late_alloc) return;
+    if (!n || n->kind != NODE_FIELD || !n->field.handle_alloc) return;
+    if (!w->fnode || w->fnode->kind != NODE_FUNC_DECL) return;
+    int seq = w->fnode->func_decl.body_checked_seq;
+    if (seq != 0 && seq <= w->late_seq - 1) return;   /* the scan saw this body checked */
+    Symbol *as = n->field.handle_alloc;
+    if (as->type && !as->is_function && spawn_global_needs_sync(w->c, as))
+        w->late_alloc = as;
+}
 static void sync_lvalue(SyncWalk *w, Node *t, SyncCtx ctx, int depth) {
     if (!t || depth > ZER_EXPR_WALK_MAX) return;
     switch (t->kind) {
     case NODE_IDENT: return;
-    case NODE_FIELD: sync_lvalue(w, t->field.object, ctx, depth + 1); return;
+    case NODE_FIELD:
+        sync_late_alloc(w, t);   /* BUG-1649 */
+        sync_lvalue(w, t->field.object, ctx, depth + 1); return;
     case NODE_INDEX:
         sync_lvalue(w, t->index_expr.object, ctx, depth + 1);
         sync_walk(w, t->index_expr.index, ctx, depth + 1);
@@ -25663,6 +26423,7 @@ static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCt
         sync_bind_push(w, nb[i].name, nb[i].len, nb[i].g, nb[i].direct, nb[i].decl);
     w->phase = SW_THREAD;   /* the whole callee runs in the window */
     w->fnode = fd;
+    if (w->rmw_mode == 1) (void)func_rmw_param_mask(w->c, fs, 0);   /* BUG-1652: its pfacts */
     DeclModuleSave dm = decl_module_enter(w->c, fs);
     sync_walk(w, fd->func_decl.body, ctx, depth + 1);
     decl_module_leave(w->c, dm);
@@ -25686,6 +26447,7 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         return;
     }
     case NODE_ASSIGN: {
+        sync_vol_rmw_facts(w, n, ctx);   /* BUG-1652 */
         sync_record(w, resolve_write_target_global(c, n->assign.target, 0), true, ctx);
         sync_record_bound(w, n->assign.target, true, ctx);
         sync_lvalue(w, n->assign.target, ctx, depth + 1);
@@ -25710,6 +26472,7 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         SW(n->unary.operand);
         return;
     case NODE_CALL: {
+        sync_vol_rmw_facts(w, n, ctx);   /* BUG-1652 */
         SW(n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++) SW(n->call.args[i]);
         Node *cal = n->call.callee;
@@ -25718,7 +26481,9 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
             cal->field.object && cal->field.object->kind == NODE_IDENT &&
             cal->field.object->ident.name_len == w->handle_len &&
             memcmp(cal->field.object->ident.name, w->handle, w->handle_len) == 0) {
-            w->phase = SW_AFTER;
+            /* BUG-1651: only a CLOSED window ends at its textual join */
+            if (w->spawn && w->spawn->kind == NODE_SPAWN && w->spawn->spawn_stmt.window_closed)
+                w->phase = SW_AFTER;
             return;
         }
         /* BUG-1565 (C1): the call of the function that started a fire-and-
@@ -25837,7 +26602,9 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_ONCE:      return;
     case NODE_AWAIT:     SW(n->await_stmt.cond); return;
     case NODE_BINARY:    SW(n->binary.left); SW(n->binary.right); return;
-    case NODE_FIELD:     sync_record_bound(w, n, false, ctx); SW(n->field.object); return;
+    case NODE_FIELD:
+        sync_late_alloc(w, n);   /* BUG-1649 */
+        sync_record_bound(w, n, false, ctx); SW(n->field.object); return;
     case NODE_INDEX:
         sync_record_bound(w, n, false, ctx);
         SW(n->index_expr.object); SW(n->index_expr.index);
@@ -26035,6 +26802,7 @@ static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line,
     s->downgraded = downgraded;
     s->binds = NULL; s->nbind = 0;
     s->file = c->file_name; s->source = c->source; s->line = line;
+    s->seq = c->body_check_seq;   /* BUG-1649 */
     /* BUG-1565 (C2): what each argument points at, resolved now — the
      * argument's own scope is live here and gone by the post pass. */
     if (!spawn || !target || !target->func_node || target->func_node->kind != NODE_FUNC_DECL)
@@ -26129,6 +26897,7 @@ static void sync_window_callers(Checker *c, SyncCensus *k, Symbol *encl, SyncAcc
                 memset(&w, 0, sizeof(w));
                 w.c = c; w.out = out; w.phase = SW_BEFORE; w.spawn = cs->call;
                 w.fnode = cl->func_node;
+                w.rmw_mode = 2;   /* BUG-1652 */
                 DeclModuleSave dm = decl_module_enter(c, cl);
                 sync_walk(&w, cl->func_node->func_decl.body, none, 0);
                 decl_module_leave(c, dm);
@@ -26194,6 +26963,8 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             SyncWalk tw;
             memset(&tw, 0, sizeof(tw));
             tw.c = c; tw.out = &thr[i]; tw.phase = SW_THREAD; tw.fnode = t->func_node;
+            tw.late_seq = s->seq + 1;   /* BUG-1649 (0 = unarmed) */
+            tw.rmw_mode = 1; tw.site = s;   /* BUG-1652 */
             /* the target's params, bound to what the spawn handed them */
             Node *fd = t->func_node;
             for (int p = 0; p < fd->func_decl.param_count; p++) {
@@ -26211,10 +26982,39 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             DeclModuleSave dm = decl_module_enter(c, t);
             sync_walk(&tw, t->func_node->func_decl.body, none, 0);
             decl_module_leave(c, dm);
+            if (tw.late_alloc) {   /* BUG-1649 */
+                c->file_name = s->file; c->source = s->source;
+                checker_error(c, s->line,
+                    "spawn target '%.*s' accesses non-shared global '%.*s' through a "
+                    "Handle auto-deref (`h.field` is a call into that Pool / Slab) — "
+                    "data race. Wrap the access in a shared struct, or give each "
+                    "thread its own allocator",
+                    (int)t->name_len, t->name,
+                    (int)tw.late_alloc->name_len, tw.late_alloc->name);
+            }
+            if (tw.vol_rmw) {   /* BUG-1652 */
+                c->file_name = s->file; c->source = s->source;
+                checker_error(c, s->line,
+                    "spawn target '%.*s' performs a non-atomic read-modify-write "
+                    "on volatile global '%.*s' — data race. volatile gives NO "
+                    "atomicity, so the read and the write can interleave with "
+                    "another thread; use @atomic_add / @atomic_* or a shared struct",
+                    (int)t->name_len, t->name,
+                    (int)tw.vol_rmw->name_len, tw.vol_rmw->name);
+            }
             sync_walk_free(&tw);
         }
         Symbol *e = s->encl;
         ww[i].c = c; ww[i].out = &win[i]; ww[i].phase = SW_BEFORE; ww[i].spawn = s->spawn;
+        ww[i].rmw_mode = 2;   /* BUG-1652 */
+        /* BUG-1651: under a goto / label the code written before an open (or
+         * unjoinable) spawn can run beside its thread */
+        if (s->spawn && s->spawn->kind == NODE_SPAWN && s->spawn->spawn_stmt.in_jump_fn &&
+            !s->spawn->spawn_stmt.window_closed) {
+            ww[i].phase = SW_IN;
+            ww[i].handle = s->spawn->spawn_stmt.handle_name;
+            ww[i].handle_len = (uint32_t)s->spawn->spawn_stmt.handle_name_len;
+        }
         if (e && e->func_node && e->func_node->kind == NODE_FUNC_DECL) {
             ww[i].fnode = e->func_node;
             DeclModuleSave dm = decl_module_enter(c, e);
@@ -27444,6 +28244,134 @@ static bool static_init_is_wide_int(Type *t) {
     if (t && type_dispatch_kind(t) == TYPE_OPTIONAL)
         t = type_unwrap_distinct(t->optional.inner);
     return t && type_is_integer(t) && type_width(t) > 64;
+}
+
+/* ---- asm text: the ONE reading of what GCC will assemble (BUG-1658) ----------
+ *
+ * The structural asm rules (S2: at most 16 instructions in a block; S3: no label)
+ * are questions about the text THE ASSEMBLER SEES. They were asked of the text
+ * the user TYPED, and only for one of the two asm forms:
+ *
+ *   - they sat inside `if (is_structured)`, so the inline `asm("...")` form had
+ *     neither rule: `asm("spin: jmp spin")` and a 100-instruction string compiled;
+ *   - they looked for the byte 0x0A, but the string reaches GCC verbatim and GCC
+ *     decodes its escapes: `"nop\nspin: jmp spin"`, `\x0a` and `\012` are line
+ *     breaks to the assembler and were none to the rule;
+ *   - a label's name was matched as [A-Za-z0-9_], so `.L1:` and `$x:` (both legal
+ *     assembler symbols) were not labels.
+ *
+ * asm_text_decode returns the text as the assembler receives it: the string
+ * literals' contents (the inline form is a run of adjacent literals, which C
+ * concatenates), with their escapes decoded. ZER's escape rules — `\xHH` is
+ * exactly two hex digits, `\0` is one NUL — because the emitter writes every
+ * asm string through emit_c_string_text, which makes C read the same bytes ZER
+ * does (and keeps a trigraph from forming). The lexer guarantees those rules for
+ * the structured string; the inline form is captured raw by the parser, so the
+ * inline grammar check below refuses any escape outside the set. Both rules then
+ * run on that one decoded text.
+ *
+ * LIMIT, stated so nobody takes these for a control-flow guarantee: they are
+ * AUDIT rules over the block's shape. A jump to a symbol defined elsewhere, a
+ * computed jump, or a directive that defines a symbol without a colon is not
+ * seen — recognising those needs a per-instruction table, which Option E
+ * deliberately delegates to GCC (docs/asm_lang_zer_safe.md). The asm text is
+ * the floor; the Z-rules guard its typed operands. */
+static int asm_hex_val(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* `raw_literals`: src is the inline form's argument — string literals separated
+ * by whitespace, quotes included. Otherwise src is the inside of ONE literal.
+ * The result is never longer than the input. */
+static char *asm_text_decode(Checker *c, const char *src, size_t len,
+                             bool raw_literals, size_t *out_len) {
+    char *out = (char *)arena_alloc(c->arena, len + 1);
+    size_t n = 0;
+    if (!out) { *out_len = 0; return NULL; }
+    bool in_str = !raw_literals;
+    for (size_t i = 0; i < len; i++) {
+        char ch = src[i];
+        if (!in_str) {                      /* between the inline form's literals */
+            if (ch == '"') in_str = true;
+            continue;
+        }
+        if (ch == '"' && raw_literals) { in_str = false; continue; }
+        if (ch != '\\' || i + 1 >= len) { out[n++] = ch; continue; }
+        char e = src[++i];
+        if (e == 'x') {                                       /* \xHH: exactly two */
+            int hi = (i + 1 < len) ? asm_hex_val(src[i + 1]) : -1;
+            int lo = (i + 2 < len) ? asm_hex_val(src[i + 2]) : -1;
+            if (hi >= 0 && lo >= 0) { out[n++] = (char)((hi << 4) | lo); i += 2; }
+            else out[n++] = 'x';
+            continue;
+        }
+        if (e == 'n') out[n++] = '\n';
+        else if (e == 't') out[n++] = '\t';
+        else if (e == 'r') out[n++] = '\r';
+        else if (e == '0') out[n++] = '\0';   /* a NUL: a statement boundary below */
+        else out[n++] = e;                    /* \\ and \" */
+    }
+    out[n] = 0;
+    *out_len = n;
+    return out;
+}
+
+static bool asm_sym_char(char ch) {
+    return ch == '_' || ch == '.' || ch == '$' ||
+           (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9');
+}
+
+/* S2 + S3 over the decoded text. A statement ends at a line break or a `;` (a NUL
+ * is treated as one too: what follows it is judged, never trusted to be cut off);
+ * an empty one (a trailing separator, a blank line) is not an instruction. */
+static void check_asm_text_rules(Checker *c, Node *node, const char *src, size_t len,
+                                 bool raw_literals) {
+    size_t tl = 0;
+    const char *t = asm_text_decode(c, src, len, raw_literals, &tl);
+    if (!t) return;
+    int instr_count = 0;
+    bool label = false;
+    size_t i = 0;
+    while (i < tl) {
+        size_t st = i;                                  /* one statement: [st, en) */
+        while (i < tl && t[i] != '\n' && t[i] != ';' && t[i] != '\0') i++;
+        size_t en = i;
+        if (i < tl) i++;                                /* the separator */
+        while (st < en && (t[st] == ' ' || t[st] == '\t' || t[st] == '\r')) st++;
+        if (st == en) continue;                         /* empty statement */
+        instr_count++;
+        if (label) continue;
+        /* A label is the statement's FIRST token followed by ':' — a symbol, or a
+         * quoted name (the assembler accepts `"any text":`). */
+        size_t j = st;
+        if (t[j] == '"') {
+            j++;
+            while (j < en && t[j] != '"') j++;
+            if (j < en) j++;
+        } else {
+            while (j < en && asm_sym_char(t[j])) j++;
+        }
+        size_t k = j;
+        while (k < en && (t[k] == ' ' || t[k] == '\t')) k++;
+        if (j > st && k < en && t[k] == ':') label = true;
+    }
+    if (instr_count > 16) {
+        checker_error(c, node->loc.line,
+            "asm block has %d instructions; max is 16 (S2 rule). "
+            "Split into multiple asm blocks or use a helper function.",
+            instr_count);
+    }
+    if (label) {
+        checker_error(c, node->loc.line,
+            "asm block contains a label (S3 rule) — "
+            "labels enable jumps that escape ZER's control "
+            "flow analysis. Use multiple asm blocks if you "
+            "need branching, or restructure as ZER if/while.");
+    }
 }
 
 static void check_stmt_impl(Checker *c, Node *node) {
@@ -28857,7 +29785,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
             (subtree_can_detach(c, node->for_stmt.body) ||
              subtree_can_detach(c, node->for_stmt.cond) ||
              subtree_can_detach(c, node->for_stmt.step))) {
-            c->after_spawn_in_func = true;
+            c->after_spawn_in_func = true; esc_note_spawn(c);
             c->unbounded_spawn_in_func = true;
         }
         /* BUG-854: the lowerer runs a for-loop's INIT before installing that loop's
@@ -29219,7 +30147,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
         if (!c->after_spawn_in_func &&
             (subtree_can_detach(c, node->while_stmt.body) ||
              subtree_can_detach(c, node->while_stmt.cond))) {
-            c->after_spawn_in_func = true;
+            c->after_spawn_in_func = true; esc_note_spawn(c);
             c->unbounded_spawn_in_func = true;
         }
         /* BUG-1015 (2026-09-13): the condition is checked AFTER the body's writes
@@ -30040,6 +30968,9 @@ static void check_stmt_impl(Checker *c, Node *node) {
 
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
+            /* BUG-1653 — after the check: the rule reads the expression's type */
+            reject_shared_opaque_leak(c, node->ret.expr, node->loc.line,
+                                      "is returned from a function");
 
             /* Stage 1->2 escape summary accumulator (2026-06-22): classify this
              * valued return's region. STATIC contributes nothing; ARParam(n) adds
@@ -30770,7 +31701,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
         if (!c->after_spawn_in_func && c->current_func_node &&
             c->current_func_node->kind == NODE_FUNC_DECL &&
             subtree_can_detach(c, c->current_func_node->func_decl.body)) {
-            c->after_spawn_in_func = true;
+            c->after_spawn_in_func = true; esc_note_spawn(c);
             c->unbounded_spawn_in_func = true;
         }
         /* BUG-1012 (from qo0mm9 d0e6b116): a label inside a defer body. `goto` is
@@ -30926,7 +31857,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
             if (!c->after_spawn_in_func && c->current_func_node &&
                 c->current_func_node->kind == NODE_FUNC_DECL &&
                 subtree_can_detach(c, c->current_func_node->func_decl.body)) {
-                c->after_spawn_in_func = true;
+                c->after_spawn_in_func = true; esc_note_spawn(c);
                 c->unbounded_spawn_in_func = true;
             }
             check_stmt(c, node->defer.body);
@@ -31097,24 +32028,47 @@ static void check_stmt_impl(Checker *c, Node *node) {
         if (!node->asm_stmt.is_structured && node->asm_stmt.code) {
             const char *q = node->asm_stmt.code;
             const char *qe = q + node->asm_stmt.code_len;
-            bool ext = false;
+            bool ext = false, bad_esc = false;
             while (q < qe && !ext) {
                 if (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') { q++; continue; }
                 if (*q == '"') {
                     q++;
-                    while (q < qe && *q != '"' && *q != '\n') { if (*q == '\\' && q + 1 < qe) q++; q++; }
+                    while (q < qe && *q != '"' && *q != '\n') {
+                        if (*q == '\\' && q + 1 < qe) {
+                            /* BUG-1658: this text is captured raw by the parser —
+                             * only its first literal is ever a lexer token — so the
+                             * escape set is enforced here. Anything else would be
+                             * read by C's rules, not ZER's (`\12` is an octal line
+                             * break to C). */
+                            char ec = q[1];
+                            bool ok_esc = ec == 'n' || ec == 't' || ec == 'r' || ec == '\\' ||
+                                          ec == '"' || ec == '0' ||
+                                          (ec == 'x' && q + 3 < qe && asm_hex_val(q[2]) >= 0 &&
+                                           asm_hex_val(q[3]) >= 0);
+                            if (!ok_esc) bad_esc = true;
+                            q++;
+                        }
+                        q++;
+                    }
                     if (q >= qe || *q != '"') { ext = true; break; }
                     q++;
                     continue;
                 }
                 ext = true;   /* a colon, a comment, a name: not a string literal */
             }
+            if (bad_esc)
+                checker_error(c, node->loc.line,
+                    "invalid escape sequence in an asm string — use \\n, \\t, \\r, "
+                    "\\\\, \\\", \\0 or \\xHH (two hex digits)");
             if (ext)
                 checker_error(c, node->loc.line,
                     "asm operands in the inline asm(\"...\") form are raw text the compiler "
                     "cannot check (race, lock, lifetime and move tracking do not see them) — "
                     "use the structured asm { instructions: ... inputs: { ... } outputs: "
                     "{ ... } safety: ... } form, whose operands are typed ZER expressions");
+            else if (!bad_esc)   /* only literals: the rules read what they concatenate to */
+                check_asm_text_rules(c, node, node->asm_stmt.code,
+                                     node->asm_stmt.code_len, true);
         }
         /* D-Alpha-7.5 H1+H3: structured asm form requires `instructions:` and
          * `safety:` keys; safety string must be >= 30 chars (S4 rule preview).
@@ -31255,68 +32209,11 @@ static void check_stmt_impl(Checker *c, Node *node) {
              * Rules requiring per-arch instruction database (I1-4, E1-4, O3,
              * S5 enforcement) deferred to Sessions C/F. */
 
-            /* S2: Max 16 instructions per asm block. Counts newlines + ';'.
-             * Forces small auditable blocks (audit-trail + maintenance friendly). */
-            {
-                int instr_count = 1; /* at least 1 instruction if string non-empty */
-                if (node->asm_stmt.instructions_len == 0) {
-                    instr_count = 0;
-                } else {
-                    for (size_t i = 0; i < node->asm_stmt.instructions_len; i++) {
-                        char ch = node->asm_stmt.instructions[i];
-                        if (ch == '\n' || ch == ';') instr_count++;
-                    }
-                }
-                if (instr_count > 16) {
-                    checker_error(c, node->loc.line,
-                        "asm block has %d instructions; max is 16 (S2 rule). "
-                        "Split into multiple asm blocks or use a helper function.",
-                        instr_count);
-                }
-            }
-
-            /* S3 (universal): forbid labels in asm. Pattern: word followed by
-             * ':' at the start of line / after ';' / after newline. Labels
-             * enable jumps that escape the block — control flow must stay
-             * inside ZER's control flow analysis. Per-arch jump mnemonic
-             * detection (full S3) deferred to Session F (instruction db). */
-            {
-                const char *s = node->asm_stmt.instructions;
-                size_t len = node->asm_stmt.instructions_len;
-                bool at_line_start = true;
-                for (size_t i = 0; i < len; i++) {
-                    char ch = s[i];
-                    if (ch == '\n' || ch == ';') {
-                        at_line_start = true;
-                        continue;
-                    }
-                    if (ch == ' ' || ch == '\t') continue;
-                    if (at_line_start) {
-                        /* Scan word, then check next non-word for ':'. */
-                        size_t j = i;
-                        while (j < len && (s[j] == '_' ||
-                               (s[j] >= 'a' && s[j] <= 'z') ||
-                               (s[j] >= 'A' && s[j] <= 'Z') ||
-                               (s[j] >= '0' && s[j] <= '9'))) j++;
-                        /* skip whitespace between word and possible ':' */
-                        size_t k = j;
-                        while (k < len && (s[k] == ' ' || s[k] == '\t')) k++;
-                        if (j > i && k < len && s[k] == ':') {
-                            /* But '%0:', '%1:', etc. are NOT labels — they're
-                             * GCC operand references in some asm dialects. Skip
-                             * if word starts with '%' (impossible per scan above
-                             * since we only matched [a-zA-Z0-9_]) so we're safe. */
-                            checker_error(c, node->loc.line,
-                                "asm block contains a label (S3 rule) — "
-                                "labels enable jumps that escape ZER's control "
-                                "flow analysis. Use multiple asm blocks if you "
-                                "need branching, or restructure as ZER if/while.");
-                            break;
-                        }
-                        at_line_start = false;
-                    }
-                }
-            }
+            /* S2 (at most 16 instructions) and S3 (no label): ONE reading of the
+             * text for both asm forms — check_asm_text_rules, BUG-1658. */
+            if (node->asm_stmt.instructions && node->asm_stmt.instructions_len > 0)
+                check_asm_text_rules(c, node, node->asm_stmt.instructions,
+                                     node->asm_stmt.instructions_len, false);
 
             /* Operand reference consistency: %0, %1, ..., %N references in the
              * instructions string must be < (output_count + input_count).
@@ -32180,7 +33077,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
          * So a scoped spawn opens the window too, and the join CLOSES it — but only
          * the last one, and never if a fire-and-forget spawn also ran. */
         if (node->spawn_stmt.handle_name == NULL) {
-            c->after_spawn_in_func = true;
+            c->after_spawn_in_func = true; esc_note_spawn(c);
             c->unbounded_spawn_in_func = true;
         }
         Symbol *func_sym = global_decl_lookup(c,
@@ -32218,8 +33115,12 @@ static void check_stmt_impl(Checker *c, Node *node) {
         bool is_scoped = (node->spawn_stmt.handle_name != NULL);
         /* Check each argument — type-check + pointer safety */
         for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
+            esc_latch_suspend(c, false);   /* BUG-1648 */
             Type *arg_type = check_expr(c, node->spawn_stmt.args[i]);
+            esc_latch_suspend(c, true);
             if (!arg_type) continue;
+            reject_shared_opaque_leak(c, node->spawn_stmt.args[i], node->loc.line,
+                                      "is passed to a spawned thread");   /* BUG-1653 */
             /* BUG-1160: a struct LITERAL has no type of its own (check_expr
              * returns void; the context supplies it). Type it against the
              * target parameter HERE, before the pointer-safety gates below —
@@ -32611,9 +33512,14 @@ static void check_stmt_impl(Checker *c, Node *node) {
                  * conditional-nesting guard needs it whether or not anything was
                  * lent by reference. */
                 sym->th_live = true;
+                sym->th_window_closed = node->spawn_stmt.window_closed;   /* BUG-1651 */
                 sym->th_spawn_branch_depth = c->branch_depth;
-                c->live_scoped_threads++;
+                /* an OPEN window in a latched walk was counted at the entry */
+                if (zer_window_counts_at_spawn(node->spawn_stmt.window_closed ? 1 : 0,
+                                               esc_latched(c) ? 1 : 0))
+                    c->live_scoped_threads++;
                 c->after_spawn_in_func = true;
+                if (!node->spawn_stmt.window_closed) esc_note_open(c, node);
                 typemap_set(c, node, ty_u64);
                 /* Scoped-borrow exclusivity: a non-shared stack local lent via
                  * `&x` to a scoped spawn is exclusively borrowed by the thread
@@ -32820,7 +33726,8 @@ static void check_stmt_impl(Checker *c, Node *node) {
                      * parent-write check cannot see. Reject an already-borrowed
                      * local; join() clears the flag, so sequential borrow (spawn,
                      * join, spawn again) still compiles. */
-                    if (vs->is_borrowed_by_thread) {
+                    if (vs->is_borrowed_by_thread &&
+                        !(vs->borrow_latched && !vs->lend_live)) {   /* BUG-1648: the latch is not a lend */
                         checker_error(c, node->loc.line,
                             "'%.*s' is already borrowed by a live scoped spawn — "
                             "lending it to a second thread is a data race. join() "
@@ -32829,10 +33736,20 @@ static void check_stmt_impl(Checker *c, Node *node) {
                         continue;
                     }
                     vs->is_borrowed_by_thread = true;
+                    vs->lend_live = true;
                     {   /* BUG-1303: a PARAM lent (or a local holding one) */
                         int lp = param_pos_named(c, vn, vl);
                         if (lp < 0 && vs->param_alias_pos1 > 0) lp = vs->param_alias_pos1 - 1;
                         if (lp >= 0 && lp < 64) c->lent_param_live_mask |= (1ULL << lp);
+                        /* BUG-1648: under a goto two spawn sites cannot be ordered */
+                        if (!esc_note_lent(c, vs, lp, vglobal, node,
+                                           node->spawn_stmt.window_closed))
+                            checker_error(c, node->loc.line,
+                                "'%.*s' is lent to a scoped spawn at two places in a "
+                                "function with a goto / label — a jump can run both "
+                                "threads at once (data race). Lend it from one spawn, "
+                                "or move each spawn..join into its own function",
+                                (int)vl, vn);
                     }
                     if (vglobal) {   /* BUG-1125: the parent's CALLEES are checked too */
                         if (c->lent_global_count >= c->lent_global_cap) {
@@ -33251,26 +34168,11 @@ static void register_decl(Checker *c, Node *node) {
                         (int)fd->name_len, fd->name,
                         (int)node->struct_decl.name_len, node->struct_decl.name);
                 }
-                /* BUG-224: reject void fields */
-                if (sf->type && sf->type->kind == TYPE_VOID) {
-                    checker_error(c, node->loc.line,
-                        "struct field '%.*s' cannot have type 'void'",
-                        (int)fd->name_len, fd->name);
-                }
-                /* BUG-287: Pool/Ring/Slab as struct fields not yet supported */
-                /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T02) */
-                /* BUG-1112: Arena too — it was accepted as a field, and then every
-                 * method call on it (`s.a.reset()`, `s.a.alloc(T)`) was emitted as a
-                 * raw C member call GCC refuses; the builtin-method interception
-                 * only recognises a NAMED arena. */
-                if (sf->type && (type_dispatch_kind(sf->type) == TYPE_POOL ||
-                                 type_dispatch_kind(sf->type) == TYPE_RING ||
-                                 type_dispatch_kind(sf->type) == TYPE_SLAB ||
-                                 type_dispatch_kind(sf->type) == TYPE_ARENA) &&
-                    zer_container_position_valid(ZER_DP_FIELD) == 0) {
-                    checker_error(c, node->loc.line,
-                        "Pool/Ring/Slab/Arena cannot be struct fields — must be global or static variables");
-                }
+                /* void / allocator / async-task-by-value: the rules of every
+                 * aggregate member, asked ONCE (check_aggregate_member, BUG-1659). */
+                check_aggregate_member(c, AGG_STRUCT, node->loc.line,
+                                       node->struct_decl.name, node->struct_decl.name_len,
+                                       fd->name, fd->name_len, sf->type);
                 /* BUG-498: synchronization primitives in packed struct → misaligned.
                  * pthread_mutex_t requires natural alignment. Packed structs can place
                  * fields at unaligned offsets → hard fault on ARM/RISC-V.
@@ -33303,14 +34205,6 @@ static void register_decl(Checker *c, Node *node) {
                  * Unwrap arrays AND distinct — S[1] or distinct S contains S by value too. */
                 {
                     Type *inner = byvalue_core_type(sf->type);   /* BUG-1389: peels ?T too */
-                    if (type_is_async_task(sf->type)) {                         /* BUG-1238 */
-                        checker_error(c, node->loc.line,
-                            "field '%.*s' of struct '%.*s' cannot hold an async task by value — "
-                            "a struct is defined before the task's state is known; hold a "
-                            "'*_zer_async_...' pointer to a task declared as a local or global",
-                            (int)sf->name_len, sf->name,
-                            (int)node->struct_decl.name_len, node->struct_decl.name);
-                    }
                     if (inner == t) {
                         checker_error(c, node->loc.line,
                             "struct '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
@@ -33493,31 +34387,13 @@ static void register_decl(Checker *c, Node *node) {
                 sv->type = resolve_type(c, uv->type);
                 reject_const_value_field(c, node->loc.line, uv->type, sv->type,
                                          "union variant", uv->name, uv->name_len);   /* BUG-1547 */
-                /* BUG-224: reject void union variants */
-                if (sv->type && sv->type->kind == TYPE_VOID) {
-                    checker_error(c, node->loc.line,
-                        "union variant '%.*s' cannot have type 'void'",
-                        (int)uv->name_len, uv->name);
-                }
-                /* BUG-386: Pool/Ring/Slab in union not supported (same as BUG-287 for structs) */
-                /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T03) */
-                if (sv->type && (type_dispatch_kind(sv->type) == TYPE_POOL ||
-                                 type_dispatch_kind(sv->type) == TYPE_RING ||
-                                 type_dispatch_kind(sv->type) == TYPE_SLAB ||
-                                 type_dispatch_kind(sv->type) == TYPE_ARENA) &&   /* BUG-1112 */
-                    zer_container_position_valid(ZER_DP_VARIANT) == 0) {
-                    checker_error(c, node->loc.line,
-                        "Pool/Ring/Slab/Arena cannot be union variants — must be global or static variables");
-                }
+                /* The rules of every aggregate member (check_aggregate_member). */
+                check_aggregate_member(c, AGG_UNION, node->loc.line,
+                                       node->union_decl.name, node->union_decl.name_len,
+                                       uv->name, uv->name_len, sv->type);
                 /* BUG-265/314: reject recursive union by value (incomplete type in C) */
                 {
                     Type *inner = byvalue_core_type(sv->type);   /* BUG-1389: peels ?T too */
-                    if (type_is_async_task(sv->type)) {                         /* BUG-1238 */
-                        checker_error(c, node->loc.line,
-                            "union '%.*s' cannot hold an async task by value — hold a "
-                            "'*_zer_async_...' pointer instead",
-                            (int)node->union_decl.name_len, node->union_decl.name);
-                    }
                     if (inner == t) {
                         checker_error(c, node->loc.line,
                             "union '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
@@ -33971,10 +34847,23 @@ static void register_decl(Checker *c, Node *node) {
         /* BUG-1553: a container's field names reach C in every stamped struct,
          * exactly like a struct's — the BUG-1446 reserved-name check never saw them
          * (`container B(T) { T __LINE__; }` reached GCC). */
-        for (int fi = 0; fi < node->container_decl.field_count; fi++)
-            check_c_reserved_ident(c, node->container_decl.fields[fi].name,
-                                   (uint32_t)node->container_decl.fields[fi].name_len,
+        for (int fi = 0; fi < node->container_decl.field_count; fi++) {
+            FieldDecl *cf = &node->container_decl.fields[fi];
+            check_c_reserved_ident(c, cf->name, (uint32_t)cf->name_len,
                                    node->loc.line, CRUSE_FIELD, "container field");
+            /* BUG-1659: a duplicate field name is a property of the TEMPLATE, so
+             * it is reported here, once, whether or not the template is ever
+             * stamped (the struct and union sites report theirs the same way). */
+            for (int fj = 0; fj < fi; fj++) {
+                FieldDecl *pf = &node->container_decl.fields[fj];
+                if (pf->name_len == cf->name_len &&
+                    memcmp(pf->name, cf->name, cf->name_len) == 0)
+                    checker_error(c, node->loc.line,
+                        "duplicate field '%.*s' in container '%.*s'",
+                        (int)cf->name_len, cf->name,
+                        (int)node->container_decl.name_len, node->container_decl.name);
+            }
+        }
         break;
     }
 
@@ -34682,13 +35571,15 @@ static bool all_paths_return(Node *node) {
  * The final walk does not repeat a diagnostic the first one already printed.
  * A function in which no such taint appears — nearly all of them — is walked once.
  * ================================================================ */
-enum { ESC_LOCAL = 1, ESC_ARENA = 2, ESC_FROM_ARENA = 4, ESC_NONKEEP = 8, ESC_KEEPD = 16 };
+enum { ESC_LOCAL = 1, ESC_ARENA = 2, ESC_FROM_ARENA = 4, ESC_NONKEEP = 8, ESC_KEEPD = 16,
+       ESC_LENT = 32 /* BUG-1648: lent to a scoped spawn somewhere in the function */ };
 typedef struct EscFact {
     const void *loop;        /* the loop node, or NULL = "ever, anywhere in the function" */
     const char *key;         /* the declaration's name pointer: one per declaration */
     uint32_t bits;
     uint64_t nk_mask;
     int nk_root;
+    const void *lend_site;   /* BUG-1648: the one spawn that lends this declaration */
 } EscFact;
 struct EscState {
     EscFact *facts; int n, cap;
@@ -34699,6 +35590,19 @@ struct EscState {
     int dedupe_from, dedupe_to;   /* the final walk does not repeat these diagnostics */
     uint64_t growth;    /* monotone count of fact bits, to detect the fixpoint */
     bool saturate;      /* BUG-1489: no convergence within the cap — apply the union */
+    /* BUG-1648: the scoped-spawn window in a function with a label / goto. */
+    bool has_spawn;     /* the function spawns (any kind) */
+    bool latch;         /* this walk holds the window open from the function's entry */
+    int last_jump_line; /* line of the textually last goto / label */
+    int jump_total;     /* BUG-1651: goto / label statements in the body ... */
+    int jump_seen;      /* ... and how many this walk has passed (text order) */
+    uint64_t lent_params;            /* params lent to a scoped spawn, by position */
+    Symbol **lent_glob; int lent_glob_n, lent_glob_cap;   /* globals lent */
+    Node **open_sites; int open_n, open_cap;   /* BUG-1651: scoped spawns with an OPEN window */
+    /* BUG-1650: the value-taint (BUG-1010) an outer local holds at the END of a
+     * loop body reaches the top on the back edge — `g = x + 1; x = g;`. */
+    struct EscRmw { const void *loop; const char *name; uint32_t len; Symbol *g; } *rmw;
+    int rmw_n, rmw_cap;
 };
 
 static bool esc_fn_is_sticky(Checker *c) {
@@ -34753,6 +35657,7 @@ static bool esc_fact_or(struct EscState *e, const void *loop, const char *key,
         }
         f = &e->facts[e->n++];
         f->loop = loop; f->key = key; f->bits = 0; f->nk_mask = 0; f->nk_root = root;
+        f->lend_site = NULL;
     }
     uint32_t nb = f->bits | bits;
     uint64_t nm = f->nk_mask | mask;
@@ -34795,21 +35700,185 @@ static void esc_apply_fact(Checker *c, const void *loop, Symbol *s) {
         } \
 } while (0)
 
+/* ---- BUG-1648: the scoped-spawn window in a function with a label / goto ----
+ * The borrow of a variable lent to a scoped spawn, and the function's concurrent
+ * window (`after_spawn_in_func`, the lent-param mask, the lent globals), are
+ * facts set at the spawn and cleared at the join IN TEXT ORDER. A goto runs code
+ * written BEFORE the spawn inside the window, and code written after the join
+ * before it:
+ *     goto S;  W: x = 3; goto J;  S: th = spawn w(&x); goto W;  J: th.join();
+ * wrote `x` while the thread held it (TSan). In a function with a jump the window
+ * is therefore LATCHED: every declaration some spawn lends is borrowed from its
+ * declaration on (a param / global from the function's entry), the window flags
+ * are on from the entry, and the textual join releases nothing. What does
+ * release is the TAIL JOIN of that handle (BUG-1651): a join written after the
+ * last jump and outside any conditional body — the code after it is entered
+ * only by running that join, so its thread is dead there. It releases only what
+ * ITS handle lent; the function's window flags fall when every open handle has
+ * had its tail join. One declaration may be lent by ONE spawn site only: the
+ * textual double-lend check cannot order two sites under a goto.
+ * Certified by proofs/operational/lambda_zer_concurrency/window_cfg.v (the
+ * `tail_window_sound` instance; the CLOSED window is `closed_window_sound`).
+ * Facts ride the escape fixpoint: the first walk records them and raises an
+ * event, the re-walks apply them. */
+static bool esc_lent_fact(Checker *c, const Symbol *s) {
+    EscFact *f = esc_fact_find(c->esc, NULL, s->name);
+    return f && (f->bits & ESC_LENT);
+}
+static void lent_global_push(Checker *c, Symbol *vs) {
+    for (int i = 0; i < c->lent_global_count; i++)
+        if (c->lent_globals[i] == vs) return;
+    if (c->lent_global_count >= c->lent_global_cap) {
+        int nc = c->lent_global_cap ? c->lent_global_cap * 2 : 8;
+        Symbol **nl = (Symbol **)arena_alloc(c->arena, (size_t)nc * sizeof(Symbol *));
+        if (!nl) return;
+        if (c->lent_global_count)
+            memcpy(nl, c->lent_globals, (size_t)c->lent_global_count * sizeof(Symbol *));
+        c->lent_globals = nl;
+        c->lent_global_cap = nc;
+    }
+    c->lent_globals[c->lent_global_count++] = vs;
+}
+static void esc_note_spawn(Checker *c) {
+    if (!esc_on(c) || !c->esc->sticky || c->esc->has_spawn) return;
+    c->esc->has_spawn = true;
+    c->esc->growth++;
+    c->esc->event = true;
+}
+/* Record that `site` lends `vs`. False when ANOTHER spawn site already lends it. */
+static bool esc_note_lent(Checker *c, Symbol *vs, int param_pos, bool is_global,
+                          const void *site, bool closed) {
+    if (!esc_on(c) || !c->esc->sticky) return true;
+    struct EscState *e = c->esc;
+    if (closed) {   /* records nothing; must not meet an OPEN window's lend */
+        EscFact *cf = esc_fact_find(e, NULL, vs->name);
+        return !(cf && (cf->bits & ESC_LENT) && cf->lend_site != site);
+    }
+    if (esc_fact_or(e, NULL, vs->name, ESC_LENT, 0, 0)) e->event = true;
+    EscFact *f = esc_fact_find(e, NULL, vs->name);
+    bool one_site = true;
+    if (f) {
+        if (!f->lend_site) f->lend_site = site;
+        else if (f->lend_site != site) one_site = false;
+    }
+    if (param_pos >= 0 && param_pos < 64 && !(e->lent_params & (1ULL << param_pos))) {
+        e->lent_params |= (1ULL << param_pos);
+        e->growth++; e->event = true;
+    }
+    if (is_global) {
+        bool have = false;
+        for (int i = 0; i < e->lent_glob_n; i++) if (e->lent_glob[i] == vs) have = true;
+        if (!have) {
+            if (e->lent_glob_n >= e->lent_glob_cap) {
+                int nc = e->lent_glob_cap ? e->lent_glob_cap * 2 : 8;
+                Symbol **nl = (Symbol **)realloc(e->lent_glob, (size_t)nc * sizeof(Symbol *));
+                if (!nl) return one_site;
+                e->lent_glob = nl; e->lent_glob_cap = nc;
+            }
+            e->lent_glob[e->lent_glob_n++] = vs;
+            e->growth++; e->event = true;
+        }
+    }
+    return one_site;
+}
+/* A scoped spawn whose window is OPEN (BUG-1651). */
+static void esc_note_open(Checker *c, Node *spawn) {
+    if (!esc_on(c) || !c->esc->sticky) return;
+    struct EscState *e = c->esc;
+    for (int i = 0; i < e->open_n; i++) if (e->open_sites[i] == spawn) return;
+    if (e->open_n >= e->open_cap) {
+        int nc = e->open_cap ? e->open_cap * 2 : 8;
+        Node **nb = (Node **)realloc(e->open_sites, (size_t)nc * sizeof(Node *));
+        if (!nb) { e->has_spawn = true; e->growth++; e->event = true; return; }   /* cannot count it: never released */
+        e->open_sites = nb; e->open_cap = nc;
+    }
+    e->open_sites[e->open_n++] = spawn;
+    e->growth++;
+    e->event = true;
+}
+/* Function entry (params are in scope): open the latched window. Every OPEN
+ * scoped spawn is counted live from here (its own tail join takes it off); an
+ * unjoinable spawn (`has_spawn`) keeps the window open for good. */
+static void esc_latch_enter(Checker *c) {
+    if (!esc_on(c)) return;
+    struct EscState *e = c->esc;
+    e->jump_seen = 0;   /* a fresh walk of the body */
+    e->latch = e->sticky && (e->has_spawn || e->open_n > 0);
+    if (!e->latch) return;
+    c->after_spawn_in_func = true;
+    if (e->has_spawn) c->unbounded_spawn_in_func = true;
+    c->live_scoped_threads += e->open_n;
+    c->lent_param_live_mask |= e->lent_params;
+    ESC_FOR_LOCAL_SYMS(c, s, {
+        if (esc_lent_fact(c, s)) { s->is_borrowed_by_thread = true; s->borrow_latched = true; }
+    });
+    for (int i = 0; i < e->lent_glob_n; i++) {
+        e->lent_glob[i]->is_borrowed_by_thread = true;
+        e->lent_glob[i]->borrow_latched = true;
+        lent_global_push(c, e->lent_glob[i]);
+    }
+}
+static bool esc_latched(Checker *c) { return esc_on(c) && c->esc->latch; }
+/* Is the statement being checked written after EVERY goto / label of the
+ * function? Counted, not compared by line: `done: th.join();` puts the label
+ * and the join on one line. A jump the walk never passes keeps the count short,
+ * which is the conservative answer. */
+static bool esc_join_after_jumps(Checker *c, int line) {
+    (void)line;
+    if (!esc_on(c)) return false;   /* no jump census: the conservative answer */
+    return !c->esc->sticky || c->esc->jump_seen >= c->esc->jump_total;
+}
+/* Function exit: a global's flags outlive the walk — put them back. */
+static void esc_latch_leave(Checker *c) {
+    if (!esc_on(c) || !c->esc->sticky) return;
+    struct EscState *e = c->esc;
+    for (int i = 0; i < e->lent_glob_n; i++) {
+        e->lent_glob[i]->is_borrowed_by_thread = false;
+        e->lent_glob[i]->borrow_latched = false;
+        e->lent_glob[i]->lend_live = false;
+    }
+    e->latch = false;
+}
+/* A local declaration some spawn lends: borrowed from here on. */
+static void esc_latch_decl(Checker *c, Symbol *s) {
+    if (!esc_on(c) || !c->esc->latch || !s) return;
+    if (esc_lent_fact(c, s)) { s->is_borrowed_by_thread = true; s->borrow_latched = true; }
+}
+/* A spawn's ARGUMENTS are evaluated before its thread exists, and name the very
+ * variables it lends: the latch (not a live textual lend) is lifted around them. */
+static void esc_latch_suspend(Checker *c, bool resume) {
+    if (!esc_on(c) || !c->esc->latch) return;
+    struct EscState *e = c->esc;
+    ESC_FOR_LOCAL_SYMS(c, s, {
+        if (s->borrow_latched && !s->lend_live) s->is_borrowed_by_thread = resume;
+    });
+    for (int i = 0; i < e->lent_glob_n; i++)
+        if (e->lent_glob[i]->borrow_latched && !e->lent_glob[i]->lend_live)
+            e->lent_glob[i]->is_borrowed_by_thread = resume;
+}
+
 /* Does this function body contain a label or a goto — in a statement, or in an
  * orelse block reached through an expression? Exhaustive; the conservative
  * direction (sticky) is "yes". */
+static int _esc_jump_last_line;   /* BUG-1648: max line of a goto / label seen by the walk */
+static int _esc_jump_count;       /* BUG-1651: how many the walk saw */
 static bool esc_has_jump(Checker *c, Node *n, int depth);
 static bool esc_has_jump_ob(Checker *c, Node *blk, void *ud) {
     return esc_has_jump(c, blk, *(int *)ud + 1);
 }
 static bool esc_has_jump(Checker *c, Node *n, int depth) {
     if (!n) return false;
-    if (depth > ZER_EXPR_WALK_MAX) return true;
+    if (depth > ZER_EXPR_WALK_MAX) { _esc_jump_last_line = 0x7fffffff; return true; }
     int d = depth;
     if (for_each_orelse_block(c, n, esc_has_jump_ob, &d, 0)) return true;
     #define EHJ(x) do { if (esc_has_jump(c, (x), depth + 1)) return true; } while (0)
     switch (n->kind) {
-    case NODE_GOTO: case NODE_LABEL: return true;
+    /* BUG-1648: the walk no longer stops at the first jump — it records the LAST
+     * one's line (the caller reads `_esc_jump_last_line > 0` as "has a jump"). */
+    case NODE_GOTO: case NODE_LABEL:
+        if ((int)n->loc.line > _esc_jump_last_line) _esc_jump_last_line = (int)n->loc.line;
+        _esc_jump_count++;
+        return false;
     case NODE_BLOCK: for (int i = 0; i < n->block.stmt_count; i++) EHJ(n->block.stmts[i]); return false;
     case NODE_IF: EHJ(n->if_stmt.then_body); EHJ(n->if_stmt.else_body); return false;
     case NODE_FOR: EHJ(n->for_stmt.init); EHJ(n->for_stmt.body); return false;
@@ -34890,7 +35959,36 @@ static void esc_check_loop(Checker *c, Node *node) {
         ent[cnt].m = s->is_nonkeep_derived ? s->nonkeep_root_mask : 0;
         cnt++;
     });
+    for (int i = 0; i < e->rmw_n; i++)   /* BUG-1650: the back edge's value taints */
+        if (e->rmw[i].loop == node)
+            rmw_tab_add(&c->rmw_taints, &c->rmw_taint_count, &c->rmw_taint_capacity,
+                        e->rmw[i].name, e->rmw[i].len, e->rmw[i].g);
     check_stmt_impl(c, node);
+    for (int i = 0; i < cnt; i++) {   /* BUG-1650: record what the body left */
+        Symbol *s = ent[i].s;
+        for (int r = 0; r < c->rmw_taint_count; r++) {
+            RmwTaintEnt *t = &c->rmw_taints[r];
+            if (!t->global || t->name_len != s->name_len ||
+                memcmp(t->name, s->name, s->name_len) != 0) continue;
+            bool have = false;
+            for (int k = 0; k < e->rmw_n; k++)
+                if (e->rmw[k].loop == node && e->rmw[k].g == t->global &&
+                    e->rmw[k].len == s->name_len &&
+                    memcmp(e->rmw[k].name, s->name, s->name_len) == 0) { have = true; break; }
+            if (have) continue;
+            if (e->rmw_n >= e->rmw_cap) {
+                int nc = e->rmw_cap ? e->rmw_cap * 2 : 8;
+                struct EscRmw *nb = (struct EscRmw *)realloc(e->rmw, (size_t)nc * sizeof(*nb));
+                if (!nb) break;
+                e->rmw = nb; e->rmw_cap = nc;
+            }
+            e->rmw[e->rmw_n].loop = node; e->rmw[e->rmw_n].name = s->name;
+            e->rmw[e->rmw_n].len = s->name_len; e->rmw[e->rmw_n].g = t->global;
+            e->rmw_n++;
+            e->growth++;
+            e->event = true;
+        }
+    }
     for (int i = 0; i < cnt; i++) {
         Symbol *s = ent[i].s;
         uint32_t gain = esc_bits(s) & ~ent[i].b;
@@ -34903,8 +36001,171 @@ static void esc_check_loop(Checker *c, Node *node) {
     if (ent != stk) free(ent);
 }
 
+/* ---- BUG-1648 / BUG-1651: CLOSED and OPEN spawn windows --------------------
+ * `ThreadHandle th = spawn f(..); <interior>; th.join();` in ONE statement list
+ * is a CLOSED window when no path can leave the interior with the thread still
+ * running: no `return`, no `goto`, no `break` / `continue` out of it, none of
+ * the `orelse return / break / continue` spellings — unless a `th.join()` earlier
+ * in the SAME statement list has already ended the thread on that path
+ * (`if (err) { th.join(); return; }`). Then the thread is live exactly on the
+ * text between the spawn and the join, and the plain textual rule is exact
+ * (window_cfg.v, `closed_window_sound`). A label inside is an ENTRY, which is
+ * harmless: the thread is not running where the jump comes from.
+ *
+ * Anything else is an OPEN window: the textual join proves nothing, because a
+ * path left the window with the thread running —
+ *     for (..) { th = spawn w(&x); if (c) { break; } th.join(); }
+ *     for (;;) { x += 1; }              // the break path: w is still running
+ * was accepted (TSan), and the function-exit join check never fires on a path
+ * that does not reach the exit. An open window is released only by its handle's
+ * TAIL JOIN (see the join handler). */
+static bool esc_stmt_has_jump(Checker *c, Node *n) {
+    int sv = _esc_jump_last_line;
+    _esc_jump_last_line = 0;
+    bool r = esc_has_jump(c, n, 0) || _esc_jump_last_line > 0;
+    _esc_jump_last_line = sv;
+    return r;
+}
+static bool esc_is_join_of(Node *st, const char *h, size_t hl) {
+    if (!st || st->kind != NODE_EXPR_STMT) return false;
+    Node *e = st->expr_stmt.expr;
+    if (!e || e->kind != NODE_CALL || !e->call.callee ||
+        e->call.callee->kind != NODE_FIELD) return false;
+    Node *f = e->call.callee;
+    if (f->field.field_name_len != 4 || memcmp(f->field.field_name, "join", 4) != 0)
+        return false;
+    Node *o = f->field.object;
+    return o && o->kind == NODE_IDENT && (size_t)o->ident.name_len == hl &&
+           memcmp(o->ident.name, h, hl) == 0;
+}
+/* Can executing `n` leave the window of handle `h` with its thread running?
+ * `loopd`: loops entered since the window's own statement list (a break /
+ * continue below one of them stays inside). Feeds a RELAXATION (closed = the
+ * textual join releases), so everything unknown answers YES. No `default:`. */
+static bool win_exits_live(Checker *c, Node *n, const char *h, size_t hl, int loopd, int depth) {
+    if (!n) return false;
+    if (depth > 4 * ZER_STMT_NEST_MAX) return true;
+    #define WX(x) win_exits_live(c, (x), h, hl, loopd, depth + 1)
+    #define WXL(x) win_exits_live(c, (x), h, hl, loopd + 1, depth + 1)
+    switch (n->kind) {
+    case NODE_RETURN: case NODE_GOTO: return zer_window_stmt_leaves(1, 0, loopd) != 0;
+    /* a suspend hands control to the poller (spawn is banned in async anyway) */
+    case NODE_YIELD: case NODE_AWAIT: return true;
+    case NODE_BREAK: case NODE_CONTINUE: return zer_window_stmt_leaves(0, 1, loopd) != 0;
+    case NODE_LABEL: return false;   /* an entry; the list walk below resets on it */
+    case NODE_BLOCK: {
+        /* a `h.join()` in THIS list ends the thread for what follows it here —
+         * until a label (or a statement holding one) lets control in again */
+        bool joined = false;
+        for (int i = 0; i < n->block.stmt_count; i++) {
+            Node *st = n->block.stmts[i];
+            if (!st) continue;
+            if (st->kind == NODE_LABEL) { joined = false; continue; }
+            if (esc_is_join_of(st, h, hl)) { joined = true; continue; }
+            if (joined && !esc_stmt_has_jump(c, st)) continue;
+            joined = false;
+            if (WX(st)) return true;
+        }
+        return false;
+    }
+    case NODE_IF:
+        return WX(n->if_stmt.cond) || WX(n->if_stmt.then_body) || WX(n->if_stmt.else_body);
+    case NODE_FOR:
+        return WX(n->for_stmt.init) || WXL(n->for_stmt.cond) || WXL(n->for_stmt.step) ||
+               WXL(n->for_stmt.body);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        return WXL(n->while_stmt.cond) || WXL(n->while_stmt.body);
+    case NODE_SWITCH:
+        if (WX(n->switch_stmt.expr)) return true;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            for (int j = 0; j < n->switch_stmt.arms[i].value_count; j++)
+                if (WX(n->switch_stmt.arms[i].values[j])) return true;
+            if (WX(n->switch_stmt.arms[i].body)) return true;
+        }
+        return false;
+    case NODE_DEFER:    return WX(n->defer.body);
+    case NODE_CRITICAL: return WX(n->critical.body);
+    case NODE_ONCE:     return WX(n->once.body);
+    case NODE_SPAWN:
+        /* a nested handle of the SAME name shadows `h`: its join is not ours */
+        if (n->spawn_stmt.handle_name && n->spawn_stmt.handle_name_len == hl &&
+            memcmp(n->spawn_stmt.handle_name, h, hl) == 0) return true;
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            if (WX(n->spawn_stmt.args[i])) return true;
+        return false;
+    case NODE_VAR_DECL:  return WX(n->var_decl.init);
+    case NODE_EXPR_STMT: return WX(n->expr_stmt.expr);
+    case NODE_ORELSE:
+        if (zer_window_stmt_leaves(n->orelse.fallback_is_return ? 1 : 0,
+                (n->orelse.fallback_is_break || n->orelse.fallback_is_continue) ? 1 : 0,
+                loopd))
+            return true;
+        return WX(n->orelse.expr) || WX(n->orelse.fallback);
+    case NODE_ASSIGN:   return WX(n->assign.target) || WX(n->assign.value);
+    case NODE_BINARY:   return WX(n->binary.left) || WX(n->binary.right);
+    case NODE_UNARY:    return WX(n->unary.operand);
+    case NODE_TYPECAST: return WX(n->typecast.expr);
+    case NODE_FIELD:    return WX(n->field.object);
+    case NODE_INDEX:    return WX(n->index_expr.object) || WX(n->index_expr.index);
+    case NODE_SLICE:
+        return WX(n->slice.object) || WX(n->slice.start) || WX(n->slice.end);
+    case NODE_CALL:
+        for (int i = 0; i < n->call.arg_count; i++) if (WX(n->call.args[i])) return true;
+        return WX(n->call.callee);
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (WX(n->intrinsic.args[i])) return true;
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (WX(n->struct_init.fields[i].value)) return true;
+        return false;
+    /* leaves: no control flow inside */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_SIZEOF:
+    case NODE_CAST:
+        return false;
+    /* operand / condition expressions: an `orelse return` may sit in one */
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++)
+            if (WX(n->asm_stmt.inputs[i].expr)) return true;
+        for (int i = 0; i < n->asm_stmt.output_count; i++)
+            if (WX(n->asm_stmt.outputs[i].expr)) return true;
+        return false;
+    case NODE_STATIC_ASSERT: return WX(n->static_assert_stmt.cond);
+    /* declarations cannot appear inside a body */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return true;
+    }
+    #undef WX
+    #undef WXL
+    return true;
+}
+static void esc_mark_closed_spawns(Checker *c, Node *blk) {
+    bool sticky = c->esc && c->esc->sticky;
+    for (int i = 0; i < blk->block.stmt_count; i++) {
+        Node *st = blk->block.stmts[i];
+        if (!st || st->kind != NODE_SPAWN) continue;
+        st->spawn_stmt.in_jump_fn = sticky;
+        st->spawn_stmt.window_closed = false;
+        if (!st->spawn_stmt.handle_name) continue;
+        const char *h = st->spawn_stmt.handle_name;
+        size_t hl = st->spawn_stmt.handle_name_len;
+        for (int j = i + 1; j < blk->block.stmt_count; j++) {
+            Node *nx = blk->block.stmts[j];
+            if (esc_is_join_of(nx, h, hl)) { st->spawn_stmt.window_closed = true; break; }
+            if (nx && nx->kind == NODE_LABEL) continue;   /* an entry, not an exit */
+            if (win_exits_live(c, nx, h, hl, 0, 0)) break;
+        }
+    }
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node || !esc_on(c)) { check_stmt_impl(c, node); return; }
+    if (node->kind == NODE_BLOCK) esc_mark_closed_spawns(c, node);   /* BUG-1648 / BUG-1651 */
+    if (node->kind == NODE_GOTO || node->kind == NODE_LABEL) c->esc->jump_seen++;
     switch (node->kind) {
     case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
         esc_check_loop(c, node);
@@ -34916,6 +36177,7 @@ static void check_stmt(Checker *c, Node *node) {
         if (s) {
             esc_note_ever(c, s);
             if (c->esc->sticky) esc_apply_fact(c, NULL, s);
+            esc_latch_decl(c, s);   /* BUG-1648 */
         }
         return;
     }
@@ -35040,7 +36302,15 @@ static void check_func_body(Checker *c, Node *node) {
     struct EscState *e = c->esc;
     e->n = 0; e->growth = 0; e->event = false; e->defers_seen = 0; e->saturate = false;
     e->dedupe_from = e->dedupe_to = 0;
-    e->sticky = esc_has_jump(c, body, 0);
+    _esc_jump_last_line = 0;
+    _esc_jump_count = 0;
+    e->sticky = esc_has_jump(c, body, 0) || _esc_jump_last_line > 0;
+    e->last_jump_line = _esc_jump_last_line;
+    e->jump_total = _esc_jump_count;
+    e->jump_seen = 0;
+    e->has_spawn = false; e->latch = false; e->lent_params = 0; e->lent_glob_n = 0;
+    e->open_n = 0;
+    e->rmw_n = 0;
     Checker *snap = (Checker *)malloc(sizeof(Checker));
     if (!snap) { check_func_body_once(c, node); return; }
     *snap = *c;
@@ -35075,9 +36345,12 @@ static void check_func_body(Checker *c, Node *node) {
     e->active = false;
     e->saturate = false;
     free(snap);
+    if (node->kind == NODE_FUNC_DECL)   /* BUG-1649 */
+        node->func_decl.body_checked_seq = ++c->body_check_seq;
 }
 
 static void check_func_body_once(Checker *c, Node *node) {
+    if (c->esc && c->esc->active) c->esc->jump_seen = 0;   /* BUG-1651: a fresh walk */
     /* BUG-1483: an async function's state struct, _init and _poll are generated
      * FROM ITS BODY, so a bodyless `async void f();` with no definition anywhere
      * has nothing to generate — the checker accepted it and the emitted C named
@@ -35323,7 +36596,9 @@ static void check_func_body_once(Checker *c, Node *node) {
         c->var_range_count = 0;
         c->rmw_taint_count = 0;   /* BUG-1010: per-function, same lifetime as VarRange */
         c->rmw_ptr_carrier_count = 0;   /* BUG-1046 */
+        esc_latch_enter(c);   /* BUG-1648 */
         check_stmt(c, node->func_decl.body);
+        esc_latch_leave(c);
         /* NOT DONE — the mirror of ISR-TRANS (a transitive global-access walk over
          * every REGULAR function body, so an RMW reached from main through a
          * helper is attributed to main) was implemented and REVERTED: with the
@@ -37969,6 +39244,13 @@ static int param_alias_of_value(Checker *c, Node *e) {
 /* BUG-1303: the object a pointer / slice ARGUMENT designates, by name — `&v`,
  * `&v.f`, `v[..]` name v; a pointer local names what it was bound to
  * (borrow_root_name), else itself. NULL when unknown. */
+/* BUG-1654: a pointer / slice argument whose object the checker CANNOT name — a
+ * call result (`id(&v)`, `getg()`), a pointer read out of a field with no
+ * recorded root. It was NULL, and NULL meant "not the same object as anything",
+ * so `f(&v, id(&v))`, `f(&v, h.p)` and `f(&g, getg())` passed one object twice
+ * to a function that lends one parameter to a thread and writes through the
+ * other (TSan: data race). Unknown must mean "may be the same as any other". */
+static const char _alias_unknown_root[] = "";
 static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
     a = unwrap_ptr_launder(a);
     if (!a) return NULL;
@@ -37980,6 +39262,19 @@ static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
         if (s && s->borrow_root_name) { *len = s->borrow_root_len; return s->borrow_root_name; }
         *len = (uint32_t)a->ident.name_len;
         return a->ident.name;
+    } else if (a->kind == NODE_FIELD || a->kind == NODE_INDEX) {
+        /* a pointer READ out of a carrier (`h.p` after `h.p = &v`): the carrier's
+         * recorded root is the object */
+        Node *r = a;
+        for (int d = 0; r && d <= ZER_EXPR_WALK_MAX &&
+                        (r->kind == NODE_FIELD || r->kind == NODE_INDEX); d++)
+            r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+        if (r && r->kind == NODE_IDENT) {
+            Symbol *s = scope_lookup(c->current_scope, r->ident.name,
+                                     (uint32_t)r->ident.name_len);
+            if (s && s->borrow_root_name) { *len = s->borrow_root_len; return s->borrow_root_name; }
+        }
+        return NULL;
     } else return NULL;
     for (int d = 0; a && d <= ZER_EXPR_WALK_MAX; d++) {
         if (a->kind == NODE_FIELD) a = a->field.object;
@@ -38024,12 +39319,17 @@ static void alias_call_record(Checker *c, Node *call) {
         TypeKind k = type_dispatch_kind(at);
         if (k != TYPE_POINTER && k != TYPE_SLICE) continue;
         roots[i] = alias_arg_root(c, call->call.args[i], &lens[i]);
-        for (int j = 0; roots[i] && j < i; j++)
-            if (roots[j] && lens[j] == lens[i] && memcmp(roots[j], roots[i], lens[i]) == 0)
+        if (!roots[i]) {   /* BUG-1654: unknown — it may be any other argument's object, or a global */
+            roots[i] = _alias_unknown_root; lens[i] = 0;
+            dup = true;
+        }
+        for (int j = 0; j < i; j++)
+            if (roots[j] && roots[j] != _alias_unknown_root && roots[i] != _alias_unknown_root &&
+                lens[j] == lens[i] && memcmp(roots[j], roots[i], lens[i]) == 0)
                 dup = true;
         /* BUG-1645: an argument rooted at a GLOBAL is recorded too (the lend-vs-global
          * check compares its root with the callee's lent_globals once bodies are known) */
-        if (roots[i]) {
+        if (roots[i] != _alias_unknown_root) {
             Symbol *rs = scope_lookup(c->current_scope, roots[i], lens[i]);
             Symbol *rg = global_decl_lookup(c, roots[i], lens[i]);
             if (rg && rs == rg && !rg->is_function) dup = true;
@@ -38155,6 +39455,18 @@ static void check_alias_spawn_calls(Checker *c) {
             int i = r->callee->lent_globals[q].param;
             Symbol *lg = r->callee->lent_globals[q].g;
             if (i >= r->argc || !r->roots[i]) continue;
+            if (r->roots[i] == _alias_unknown_root) {   /* BUG-1654 */
+                checker_error(c, r->line,
+                    "argument %d cannot be resolved to the object it points at (a call "
+                    "result, or a pointer read out of a field), and '%.*s' lends that "
+                    "parameter to a scoped spawn while it touches '%.*s' by name before "
+                    "the join — if the argument points at '%.*s' the thread and the "
+                    "function both access one object (data race). Pass `&x` or a local "
+                    "bound to `&x`, so the object is known",
+                    i + 1, (int)r->callee->name_len, r->callee->name,
+                    (int)lg->name_len, lg->name, (int)lg->name_len, lg->name);
+                break;
+            }
             if (r->root_lens[i] != lg->name_len ||
                 memcmp(r->roots[i], lg->name, lg->name_len) != 0) continue;
             /* the argument's root names the GLOBAL itself, not a local shadowing it */
@@ -38173,6 +39485,19 @@ static void check_alias_spawn_calls(Checker *c) {
             if (!r->roots[i]) continue;
             for (int j = 0; j < r->argc && j < 64 && !done; j++) {
                 if (j == i || !r->roots[j] || !alias_pair_has(r->callee, i, j)) continue;
+                if (r->roots[i] == _alias_unknown_root || r->roots[j] == _alias_unknown_root) {
+                    int u = r->roots[i] == _alias_unknown_root ? i : j;   /* BUG-1654 */
+                    checker_error(c, r->line,
+                        "argument %d cannot be resolved to the object it points at (a "
+                        "call result, or a pointer read out of a field), and '%.*s' lends "
+                        "argument %d to a scoped spawn while it uses argument %d before "
+                        "the join — if both reach one object that is two accesses from "
+                        "two threads (data race). Pass `&x` or a local bound to `&x`, so "
+                        "the checker can tell the objects apart",
+                        u + 1, (int)r->callee->name_len, r->callee->name, i + 1, j + 1);
+                    done = true;
+                    continue;
+                }
                 if (r->root_lens[j] != r->root_lens[i] ||
                     memcmp(r->roots[j], r->roots[i], r->root_lens[i]) != 0) continue;
                 checker_error(c, r->line,
@@ -41020,6 +42345,7 @@ void check_keep_inference(Checker *c) {
         }
         checker_error(c, e->line, msg, e->arg_pos, (int)e->arg_name_len, e->arg_name);
     }
+    check_shared_opaque_passes(c);   /* BUG-1657: after the keep fixpoint above */
 }
 
 /* Register builtin carry-op result struct types so `AddCarry64 r = @addc(...)`
@@ -42811,6 +44137,7 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
 
     /* Interrupt safety — validate shared globals (global state, collected while
      * every body was checked) */
+    check_mem_split_rmw(c);   /* BUG-1650: before the rule reads the RMW flags */
     if (c->isr_global_count > 0 || c->mmio_access_count > 0) {   /* BUG-1480 */
         check_interrupt_safety(c);
     }
@@ -42819,7 +44146,9 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
     check_alias_spawn_calls(c);   /* BUG-1303 */
     check_async_frame_cycles(c);  /* BUG-1559 */
     check_sync_spawn_writers(c, files, count);  /* BUG-1562/1563 */
+    check_volatile_locked_rmw(c);               /* BUG-1652 */
     check_parent_volatile_rmw(c);               /* BUG-1591 */
+    vol_rmw_tables_reset();
     check_c_extern_signatures(c, files, count); /* BUG-1606 */
     unprefix_c_externs(c);                      /* BUG-1593 */
 

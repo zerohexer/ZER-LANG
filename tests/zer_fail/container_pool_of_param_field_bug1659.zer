@@ -1,0 +1,7 @@
+// expect-error: cannot be container fields
+// BUG-1659: `Pool(T, 4)` used to be reported as "undefined type T" — a message
+// about a name declared on the same line. The restriction is named instead.
+struct Task { u32 id; }
+container Sched(T) { Pool(T, 4) tasks; u32 n; }
+Sched(Task) g;
+u32 main() { return 0; }

@@ -1,0 +1,17 @@
+// expect-error: lent to a scoped spawn at two places
+// BUG-1648: two spawn sites lending one local cannot be ordered under a goto
+void w(*u32 p) { for (u32 i = 0; i < 1000; i += 1) { *p += 1; } }
+u32 main() {
+    u32 x = 0;
+    goto S;
+A:
+    ThreadHandle t2 = spawn w(&x);
+    t2.join();
+    goto E;
+S:
+    ThreadHandle t1 = spawn w(&x);
+    goto A;
+E:
+    t1.join();
+    return 0;
+}

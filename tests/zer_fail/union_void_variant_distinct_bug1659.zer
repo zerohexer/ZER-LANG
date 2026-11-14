@@ -1,0 +1,6 @@
+// expect-error: cannot have type 'void'
+// BUG-1659: the void-member rule compared the raw type kind, so a distinct typedef
+// of void slipped past it in a union variant (and a struct field).
+distinct typedef void Nothing;
+union U { Nothing n; u32 x; }
+u32 main() { return 0; }

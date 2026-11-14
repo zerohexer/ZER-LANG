@@ -1,0 +1,16 @@
+// expect-error: while a spawned thread may store it
+// BUG-1652: the spawner's window rule (BUG-1591) recognised the COMPOUND
+// operator alone. `g = g + 1` is the same read, add, write-back — and erases
+// the thread's store exactly as `g += 1` does.
+volatile u32 g;
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) { g = i; }
+}
+u32 main() {
+    ThreadHandle a = spawn w();
+    for (u32 i = 0; i < 1000; i += 1) {
+        g = g + 1;
+    }
+    a.join();
+    return 0;
+}

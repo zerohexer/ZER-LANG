@@ -1,0 +1,9 @@
+// expect-error: max is 16
+// BUG-1658: the same seventeen instructions, the line break spelled \x0a.
+naked void sled() {
+    asm {
+        instructions: "nop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop\x0anop"
+        safety: "structural asm rule test: the text here is never meant to be assembled"
+    }
+}
+u32 main() { return 0; }

@@ -1,0 +1,17 @@
+// expect-error: cannot write to 'g' while it is borrowed
+// BUG-1648: a goto runs a write of a lent GLOBAL inside the window
+u32 g;
+void w(*u32 p) { *p = 5; }
+u32 main() {
+    goto S;
+W:
+    g = 3;
+    goto J;
+S:
+    ThreadHandle th = spawn w(&g);
+    goto W;
+J:
+    th.join();
+    return 0;
+}
+u32 later() { return g; }

@@ -1,0 +1,20 @@
+// expect-error: performs a non-atomic read-modify-write on volatile global
+// BUG-1652: the read-modify-write of a volatile flag split through ANOTHER
+// global. The spawn scan kept its own value-taint table, which held named
+// locals only, so `vm = g; g = vm + 1;` was two plain stores to it — while the
+// main checker had known this spelling since BUG-1650. Two threads lose updates.
+volatile u32 g;
+volatile u32 vm;
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) {
+        vm = g;
+        g = vm + 1;
+    }
+}
+u32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join();
+    b.join();
+    return 0;
+}

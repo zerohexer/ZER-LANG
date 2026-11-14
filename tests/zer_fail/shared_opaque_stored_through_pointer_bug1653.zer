@@ -1,0 +1,26 @@
+// expect-error: is stored where it outlives the function
+// BUG-1653: the handle written into the caller's struct through a pointer; the
+// caller casts the field back, unlocked.
+struct Box { *opaque h; }
+struct Dev { u32 v; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+void fill(*Box b) { b.h = r.handle; }
+void w() {
+    Box bx;
+    fill(&bx);
+    for (u32 i = 0; i < 1000; i += 1) {
+        *Dev d = (*Dev)bx.h;
+        d.v += 1;
+    }
+}
+u32 main() {
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join();
+    b.join();
+    return 0;
+}

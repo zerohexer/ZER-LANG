@@ -321,6 +321,251 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   assignment, and an aggregate name (struct / union / array) is walked with it. Test:
   `lent_global_via_global_struct_ptr_field_bug1647`.
 
+- **BUG-1648 — the scoped-spawn window was a text-order fact; a `goto` reorders it.**
+  `goto S; W: x = 3; goto J; S: th = spawn w(&x); goto W; J: th.join();` wrote `x` while the
+  thread held it (TSan); the same held for a lent global, a lent-param pair, a plain access to
+  an atomic cell, and two spawn sites lending one local. In a function with a jump an OPEN
+  window is now LATCHED (riding the escape fixpoint: `ESC_LENT` facts, `EscState.has_spawn`,
+  `esc_latch_*`): borrowed from the declaration / function entry, released only by a join
+  after the last jump at branch depth 0; one variable, one lend site. A CLOSED pair
+  (`spawn_stmt.window_closed`, set by `esc_mark_closed_spawns`) keeps the textual rule —
+  found by the corpus sweep, which the first draft over-rejected twice. `Symbol.lend_live`
+  is the textual lend the double-lend check reads. Tests: six `goto_*_bug1648` negatives,
+  positive `goto_then_spawn_join_tail_ok_bug1648`; conc-matrix "jump x spawn-window" grid.
+- **BUG-1649 — a spawn target declared AFTER its spawn site hid Handle auto-derefs from the
+  race scan.** The scan reads the checker's `field.handle_alloc` annotation (BUG-1625), which
+  an unchecked body does not have yet. `func_decl.body_checked_seq` orders body completion;
+  the `check_sync_spawn_writers` post-pass (`sync_late_alloc`) reports a Pool / Slab reached
+  through `h.field` in any body finished after the site (target or callee, read or write).
+  Tests: `spawn_handle_autoderef_late_{target,callee}_bug1649`, positive
+  `spawn_late_target_no_handle_ok_bug1649`; conc-matrix late-target cells.
+- **BUG-1650 — a read-modify-write of a volatile global split THROUGH MEMORY.** `mem = g;
+  g = mem + 1;` (a global carrier, in one function or two, in either order), `*p = g;
+  g = *p + 1;` / `g = m + 1` (a local behind a pointer), `st(&m); g = m + 1;` (a callee's
+  out-parameter, any number of hops) and `g = x + 1; x = g;` in a loop were plain stores to
+  the ISR/main rule — the BUG-1010 taint table held named locals in text order only. Four
+  additions: a whole-program memory relation (`mem_edge_add` / `mem_cand_add`, resolved by
+  `check_mem_split_rmw` before `check_interrupt_safety`); `rmw_taint_maintain` taints a local
+  pointer and its borrow root on a write through it; `VfSummary.gin[j]` (globals stored into
+  argument j's pointee) applied by `main_call_gin`; the loop back edge joins value taints in
+  `esc_check_loop` (`EscState.rmw`). Gate: hw-matrix "RMW split through memory" (9 negative
+  cells, all false negatives on the pre-fix build; 6 boundary positives).
+
+- **BUG-1651 — the spawn..join window let a path LEAVE it with the thread running; and one
+  handle's join released another handle's variable.** Three accepted, TSan-confirmed races,
+  all found while writing the soundness proof for BUG-1648 (the proof needed a hypothesis no
+  check provided): (1) `for (..) { th = spawn w(&x); if (c) { break; } th.join(); }
+  for (;;) { x += 1; }` — the break path never reaches the function exit, so the
+  "joined before exit" check never fires, and the textual join had released `x` (no goto
+  involved; predates this session); (2) the same break-out with a `goto` back to a later
+  join, so every path joins — accepted by BUG-1648's own closed-window shortcut; (3) in a
+  labelled function the last join in the text (of `h`) released `y`, lent by `h2`, whose
+  thread was still running. Fix: a window is CLOSED only when no statement can leave its
+  interior with the thread running (`win_exits_live`: return / goto / break / continue /
+  the `orelse` exits, unless a `th.join()` earlier in the same statement list ended the
+  thread); an OPEN window is released only by its own handle's TAIL JOIN, and releases only
+  what that handle lent (`Symbol.th_window_closed`, `EscState.open_sites` counted live from
+  the entry of a labelled function). The join is ordered against jumps by COUNT
+  (`jump_seen` / `jump_total`), not by line (`done: th.join();`). The atomic-downgrade
+  window follows (`sync_walk`: only a closed window reaches SW_AFTER). Oracle:
+  `lambda_zer_concurrency/window_cfg.v` (`window_sound`, `closed_window_ok`,
+  `tail_window_ok`, `break_exit_rejected`); decisions extracted to
+  `src/safety/concurrency_rules.c` (`zer_window_*`). Tests: four
+  `window_*_bug1651` negatives, positive `window_exit_after_join_closed_ok_bug1651`;
+  conc-matrix open-window cells (3 false negatives on the previous build).
+
+- **BUG-1652 — "is this a read-modify-write of volatile `g`?" had three answers, and the two
+  THREAD sinks had the weak ones.** The main checker's sink knew every spelling (compound,
+  written out, split through a local / pointer / out-parameter / callee / memory) but fed only
+  the interrupt rule. (a) The spawn scan re-derived a subset with its own taint table and no
+  scopes: a thread's `vm = g; g = vm + 1;` through any global carrier (volatile, threadlocal,
+  a shared struct, an atomic cell), `rd(&t); g = t + 1;` and `*p = g; g = t + 1;` were plain
+  stores. (b) An unrelated `@atomic_*` anywhere in the spawn target downgraded the scan's
+  finding to a WARNING — including `g += 1` on a volatile flag from two threads. (c) The
+  spawner's window rule (BUG-1591) recognised the compound operator alone: `g = g + 1`, the
+  split forms, a helper doing `g += 1`, `wr(rd() + 1)` and `bump(&g)` all erased a thread's
+  store unseen. Fix: the main checker records each finding as a FACT keyed by the statement
+  node (`vol_rmw_fact_add`; through-parameter statements by `vol_rmw_pfact_add`), and the
+  walk that already knows which code runs in a thread and which in a spawner's window
+  (`sync_walk`) reads the facts at the nodes it visits (`sync_vol_rmw_facts`). A thread's
+  read-modify-write is refused unless it is under a CAS lock, and then every other store of
+  the flag must hold that lock (`check_volatile_locked_rmw`). Also closed on the way: a
+  read-modify-write through a PARAMETER split through a global
+  (`void f(*u32 p){ vm = *p; *p = vm + 1; }`) at all three sinks, the interrupt rule
+  included (`main_call_gin` now records the candidate and the `ptd_dest` edge); an atomic
+  cell as a carrier (`@atomic_store(&a, g)` is an edge). Two over-rejections removed: a
+  `threadlocal volatile` counter in a thread, and the spawner's own read-modify-write of a
+  flag no thread stores when one of ITS helpers stores it (`sync_descend` runs a window
+  walk's callees in the thread phase, so the phase alone recorded the helper's store as a
+  thread's). Tests: seven `*_bug1652` negatives, positive
+  `volatile_rmw_thread_sinks_ok_bug1652` (refused before); hw-matrix "volatile RMW at the
+  thread sinks" (30 cells) + one ISR cell — 23 cells fail on the previous build.
+
+- **BUG-1653 — a shared struct's `*opaque` handle could leave its lock by being handed on.**
+  The lock is held for the STATEMENT that reads the field. BUG-1299 refused turning the
+  value back into a ZER pointer where it could see the value came from a shared struct (the
+  field, a local, a capture); every way of passing it on made that invisible:
+  `*opaque h = r.handle; use(h);` (`use` casts its parameter), `*opaque get() { return
+  r.handle; }` (the caller casts the result), `void fill(*Box b) { b.h = r.handle; }` (the
+  caller casts the field), a global stash — each TSan-confirmed, two threads writing the
+  object with no lock. Also `Box b; b.h = r.handle;` / `Box b = { .h = r.handle };` followed
+  by `(*Dev)b.h` walked past the cast rule itself, which looked at bare locals. A ZER pointer
+  field is refused in a shared struct outright, so the `*opaque` field is the one door, and
+  the rule is the one its diagnostic always stated: the value may sit in a local (or a part
+  of a local aggregate — both carry the fact) and may be passed to a C function; it may not
+  be passed to a ZER function or through a function pointer, to a thread, returned, or
+  stored in a global / through a pointer (`reject_shared_opaque_leak`,
+  `check_shared_opaque_store`; `opaque_read_from_shared` now reads a local aggregate's fact
+  and a struct literal's fields). Gated on the value's TYPE carrying a pointer, so scalar
+  fields of a shared struct flow freely. Corpus cost measured by compiling it: 0 verdict
+  changes. Tests: five `shared_opaque_*_bug1653` negatives, positive
+  `shared_opaque_handle_to_c_ok_bug1653` (runs); conc-matrix "shared *opaque handle leaves
+  the lock" (20 cells, 11 false negatives on the previous build).
+
+- **BUG-1654 — one object passed as two arguments, under a spelling with no name.** A
+  function that lends one pointer parameter to a scoped spawn and writes through another
+  before the join is refused when a call passes one object as both (BUG-1303). "The same
+  object" was decided by NAME (`alias_arg_root`), and a spelling without a name returned
+  NULL, which compared unequal to everything: `f(&v, id(&v))` (a call result), `f(&v, h.p)`
+  after `h.p = &v` (a pointer read out of a field), `f(&g, getg())` (a getter of a global's
+  address) — each accepted, each a TSan-confirmed race. Fix: an unresolvable pointer / slice
+  argument is a sentinel root that may alias ANY other pointer argument and any global the
+  callee lends by name (its own wording: "cannot be resolved to the object it points at");
+  a field / element read of a carrier resolves through the carrier's recorded
+  `borrow_root_name`, so `h.p` is reported precisely ("both reach 'v'") and a carrier of a
+  DIFFERENT object stays accepted. The error still needs the callee to have a (lent, used)
+  pair for those positions, so ordinary calls are untouched: 0 verdict changes over the
+  corpus. Tests: three `alias_spawn_arg_*_bug1654` negatives, positive
+  `alias_spawn_distinct_objects_ok_bug1654` (runs); conc-matrix "one object as two arguments
+  of a lending function" (10 cells; 4 false negatives on the previous build).
+
+- **BUG-1655 — a cast left inside an assignment was rendered by an emitter that knew only
+  the plain C cast.** Three emitters render `(T)x`: `emit_expr` (global initializers),
+  `IR_CAST` (a cast lowered to its own instruction) and `emit_rewritten_node` (a cast kept
+  inside a passthrough expression — the value of `x.f = (T)e`, an element or global store,
+  a defer body). The first two each listed the special shapes; the third said "should be
+  handled by IR_CAST" and emitted `((T)e)`. So `s.b = (bool)n;` stored 5 into a bool and
+  `s.b == true` was FALSE (silent, exit 1); `r.h = (*opaque)&d;` was a cast to a struct
+  (GCC: "conversion to non-scalar type"); `h.d = (*Dev)op;` was a cast from one (GCC, and
+  no type-id check). Fix: ONE classifier `typecast_shape` (+ `typecast_pointee_tid`) read
+  by all three emitters, so the arm set cannot drift. Tests:
+  `typecast_bool_into_field_bug1655` (exit 1 before), `typecast_shapes_all_positions_bug1655`
+  (cast kind x position, runtime-checked).
+- **BUG-1656 — the spawner's read-modify-write of a volatile flag under a lock was refused.**
+  The window rule (BUG-1591) fired whenever a thread stores the flag, lock or no lock.
+  It is now exempt when every read-modify-write of the flag on that source line holds ONE
+  CAS lock and every THREAD store of the flag holds the same lock (`vol_win_rmw_note` /
+  `vol_win_rmw_locked_ok`; stores carry `thread`). Not exempt: the thread's store unlocked,
+  two different locks, a locked and an unlocked one on the same line, one extra unlocked
+  thread store. TSan clean on the accepted form. Tests: positive
+  `window_volatile_rmw_same_lock_ok_bug1656` (2000 increments, none lost; refused before),
+  negative `window_volatile_rmw_other_lock_bug1656`; six hw-matrix cells.
+- **BUG-1657 — a helper may use a shared struct's handle during the call that read it.**
+  BUG-1653 refused every hand-on to a ZER function. `use(r.handle);` reads the field in the
+  statement that makes the call, so the struct's lock is held until `use` returns (TSan:
+  clean; through a local it races and stays refused). What remained to prove — that the
+  helper does not let the value outlive the call — is what keep inference and the return
+  summary already decide for every pointer parameter, so the call is recorded and judged at
+  the end of `check_keep_inference` (`shared_opaque_pass_defer` /
+  `check_shared_opaque_passes`): refused if the parameter is `keep` (stored in a global, a
+  static, another parameter's field — directly, as the pointer it was cast to, or by a
+  callee) or returned. Tests: positive `shared_opaque_helper_uses_ok_bug1657` (two threads,
+  2000 increments through the helper, none lost; refused before), negatives
+  `shared_opaque_helper_{keeps,returns}_bug1657`; ten conc-matrix cells.
+
+**Found by re-measuring the legacy ledger (2026-11-14)**
+- **BUG-1658 — asm text reached the generated C verbatim, and its rules read one of the two
+  asm forms as typed.** One root (user text copied into C unescaped, and judged as source
+  bytes), three defects. **(1) Unchecked C in the emitted program.** The mandatory
+  `safety:` string is written into a C block comment and went out verbatim: a string
+  containing the comment terminator closed it, and the rest of the string was compiled as C
+  no analysis saw (`safety: "... (close) g = 99; (open) ..."` ran the assignment). Breaking
+  the terminator was not enough: the driver builds with `-std=c99`, where the trigraph
+  `??/` is a backslash and a backslash-newline is removed BEFORE comments are recognised,
+  so `*??/` + line break + `/` spelled it again (measured: the statement still ran). And
+  the asm strings had the same disease in a different construct — `instructions:`, a
+  clobber name, a `section("...")` name and the inline `asm("...")` literals were copied
+  between C quotes verbatim, so `"nop # safe??/"` ended in a backslash that escaped the
+  closing quote and the C string ran on into the next user string (BUG-1350 fixed this for
+  ordinary string literals only). The class of BUG-1297 / BUG-1580. Fix: comment text goes
+  through `emit_comment_text` (terminator broken, no line break emitted); every string
+  goes through the existing escaper via `emit_c_string_lit` / `emit_inline_asm`. **(2)**
+  The structural rules S2 (at most 16 instructions) and S3 (no label) sat inside
+  `if (is_structured)`: the inline form had neither. **(3)** Both looked at source bytes:
+  an escaped line break (`\n`, `\x0a`) was invisible to them, and a label name was
+  matched as `[A-Za-z0-9_]`, so `.L1:` and `$x:` were not labels. Fix: `asm_text_decode`
+  returns the text as the assembler receives it — the literals' contents concatenated,
+  escapes decoded by ZER's rules, which the escaper now makes C's reading too — and
+  `check_asm_text_rules` asks S2 and S3 of that text for BOTH forms. The inline form,
+  captured raw by the parser, refuses an escape outside ZER's set (`\1` would be C's
+  octal); a NUL is a statement boundary, so what follows one is judged. An empty statement
+  (trailing separator, blank line) is no longer counted as an instruction. LIMIT, unchanged
+  and now written at the rule: audit rules over a block's shape, not a control-flow
+  guarantee. Tests: `asm_safety_text_cannot_close_comment_bug1658` (three cells: the
+  terminator, the trigraph line splice, the string; `zerc --run` exit 1 before),
+  `asm_sixteen_instructions_ok_bug1658` (refused before: a trailing separator counted),
+  seven negatives `asm_*_bug1658`. Gate: `test_asm_matrix` grew from 11 to 59 cells — form
+  x separator spelling x rule, label spellings, non-labels, five emitted-C assertions,
+  three text negatives — and every NEG cell now states its reason (the grid used to accept
+  any stderr containing "naked", which every naked function's warning does). 30 cells are
+  red on the previous compiler.
+- **BUG-1659 — a container template's fields were checked by none of the rules a struct's
+  are.** A struct field, a union variant and a field of a stamped container are one thing
+  to the emitter; the three declaring sites each carried their own copy of the member rules
+  and the container stamp carried none. `container C(T) { Ring(u8, 8) r; T x; }`, an
+  `Arena` field, a `void` field, a duplicate field name and an async task held by value all
+  passed the checker and reached GCC as C it refuses (loud, never silent). And template
+  substitution skipped two kinds that DO carry an inner type: `Pool(T, 4)` / `Ring(T, n)` /
+  `Slab(T)` were therefore reported as "undefined type 'T'" (the legacy ledger's entry),
+  and a function-pointer field over the parameter — `*(T) -> u32 cb;` — could not be
+  declared at all (an over-rejection nobody had recorded). Fix: ONE rule,
+  `check_aggregate_member` (void, allocator position through the VST-verified
+  `zer_container_position_valid`, async task by value), called from the struct, union and
+  container-stamp sites; duplicate names reported at the container DECLARATION;
+  `subst_typenode` is total (Pool / Ring / Slab element, function-pointer return and
+  parameters). The void rule now asks `type_dispatch_kind`, so a `distinct typedef void`
+  member is refused too. Tests: positive `container_funcptr_field_over_param_bug1659`
+  ("undefined type 'T'" before; runs, exit 0), seven negatives `container_*_bug1659` /
+  `union_void_variant_distinct_bug1659` (six ACCEPTED before, one refused for the wrong
+  reason). Corpus: 0 verdict changes over 4009 files.
+- **BUG-1660 — a name a `defer` body declares itself was read as a same-named OUTER local
+  (silent miscompile).** `u32 z = 9; { u32 z = 1; defer { u32 z = 5; g = z; } z += 1; }` set
+  `g` to 2. Whenever a function held two locals of one name (so one carries a suffixed C
+  name) and a defer body inside the inner one's scope declared a third — by a var-decl, a
+  for-init, an if-unwrap or switch capture — every use of the body's own name was bound to
+  the enclosing local: a wrong value; with two pointer types, `*B z = &gb; z.x = 77;`
+  wrote through the enclosing `*A z` (the wrong object); with handles, a valid program was
+  refused with "use after free: 'h_3'" about a variable the body never touches. Root cause:
+  `rewrite_defer_body_idents`, a leftover from when a defer body was replayed as raw AST. It
+  renamed every identifier in the WHOLE body, at the `defer` statement, to the local visible
+  there — before any of the body's own declarations had a local. Since BUG-959 the body is
+  lowered at registration, and lowering renames each statement's identifiers as it reaches
+  them, in the body's own scopes, into the same AST nodes the later consumers read: the
+  pre-pass was redundant where it was right and wrong where it differed. Fix: the pre-pass
+  is DELETED (function, forward declaration, 28 walker-baseline rows). Name resolution has
+  one owner. Found by running `loving-davinci-ii7a90`'s own test file, which that branch
+  had fixed and main never adopted. Tests: `defer_body_own_decl_shadow_bug1660` (nine
+  cells, one per way a body can declare a name; exit 2 before),
+  `defer_body_own_handle_shadow_bug1660` (refused before), regression pin
+  `zer_fail/defer_body_own_handle_leak_bug1660`. Measured: 0 verdict changes over the
+  corpus, and 0 run-time differences over the 237 tests that use `defer`.
+- **BUG-1661 — a shared struct was emitted without its condition variable** (loud: GCC,
+  "has no member named '_zer_cond'"). Which shared structs need a `pthread_cond_t` was
+  rediscovered by an emitter prescan that matched a `@cond_*` intrinsic only as the WHOLE of
+  an expression statement, one module at a time. So (a) `@cond_timedwait` — the one condvar
+  intrinsic that returns a value — was invisible in every natural position (`?void r = …`,
+  `if (…)`, `orelse`, `return`, an argument, an assignment) unless the same type also had a
+  statement-level `@cond_wait` / `@cond_signal` to mask it; and (b) a struct declared in
+  one module and waited on only in another never got the member, even for the statement
+  forms. Fix: the fact is recorded where it is true — the checker sets
+  `struct_type.uses_condvar` at the one place every condvar intrinsic is checked, on the
+  type itself (monotone, so the escape fixpoint's re-walk cannot lose it) — and the emitter
+  reads it; the prescan arm, `register_condvar_type` / `is_condvar_type` and the Emitter's
+  registry are deleted. Tests: `cond_timedwait_every_position_bug1661` (seven shared
+  struct types, one per position, so no position can mask another — all seven lacked the
+  member before), `test_modules/cond_user` + `cond_mod` (GCC error before; wired into
+  `run_tests.sh`). `vigilant-tesla-ef9cao` had fixed half of (a).
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

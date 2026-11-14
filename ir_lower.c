@@ -386,7 +386,6 @@ static void collect_labels(LowerCtx *ctx, Node *node) {
 /* Forward declarations */
 static void lower_stmt(LowerCtx *ctx, Node *node);
 static void rewrite_idents(LowerCtx *ctx, Node *expr);
-static void rewrite_defer_body_idents(LowerCtx *ctx, Node *stmt);
 /* Targeted rewrite: walk AST and rewrite every NODE_IDENT matching
  * `from_name` to `to_name`. Used by switch arm lowering to scope captures —
  * arm captures get unique C names so they don't shadow same-named captures
@@ -2169,82 +2168,6 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
     case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
     case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
     case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
-        break;
-    }
-}
-
-/* Walk a statement AST (defer body) and call rewrite_idents on every
- * contained expression. Ensures identifiers inside defer bodies resolve
- * to the correct (scope-suffixed) IR locals. Without this, a defer
- * body declared in an inner scope that references a shadowed name
- * (`defer pool.free(h);` where `h` shadows outer `h`) would lookup by
- * the raw name and potentially resolve to the outer local, causing
- * defer-free tracking to miss the inner handle. */
-static void rewrite_defer_body_idents(LowerCtx *ctx, Node *stmt) {
-    if (!stmt) return;
-    switch (stmt->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < stmt->block.stmt_count; i++)
-            rewrite_defer_body_idents(ctx, stmt->block.stmts[i]);
-        break;
-    case NODE_EXPR_STMT:
-        rewrite_idents(ctx, stmt->expr_stmt.expr);
-        break;
-    case NODE_VAR_DECL:
-        rewrite_idents(ctx, stmt->var_decl.init);
-        break;
-    case NODE_RETURN:
-        rewrite_idents(ctx, stmt->ret.expr);
-        break;
-    case NODE_IF:
-        rewrite_idents(ctx, stmt->if_stmt.cond);
-        rewrite_defer_body_idents(ctx, stmt->if_stmt.then_body);
-        rewrite_defer_body_idents(ctx, stmt->if_stmt.else_body);
-        break;
-    case NODE_FOR:
-        rewrite_defer_body_idents(ctx, stmt->for_stmt.init);
-        rewrite_idents(ctx, stmt->for_stmt.cond);
-        rewrite_idents(ctx, stmt->for_stmt.step);
-        rewrite_defer_body_idents(ctx, stmt->for_stmt.body);
-        break;
-    case NODE_WHILE:
-    case NODE_DO_WHILE:
-        rewrite_idents(ctx, stmt->while_stmt.cond);
-        rewrite_defer_body_idents(ctx, stmt->while_stmt.body);
-        break;
-    case NODE_SWITCH:
-        rewrite_idents(ctx, stmt->switch_stmt.expr);
-        for (int i = 0; i < stmt->switch_stmt.arm_count; i++)
-            rewrite_defer_body_idents(ctx, stmt->switch_stmt.arms[i].body);
-        break;
-    case NODE_CRITICAL:
-        rewrite_defer_body_idents(ctx, stmt->critical.body);
-        break;
-    case NODE_ONCE:
-        rewrite_defer_body_idents(ctx, stmt->once.body);
-        break;
-    case NODE_DEFER:
-        /* nested defer — rare, handle transitively */
-        rewrite_defer_body_idents(ctx, stmt->defer.body);
-        break;
-    /* Stage 2 Part B (2026-04-28): exhaustive — kinds without an init
-     * expression or scannable body for ident rewriting. Top-level decls
-     * shouldn't appear in defer bodies; expression nodes shouldn't be
-     * direct children of defer body (they appear via NODE_EXPR_STMT). */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
         break;
     }
 }
@@ -5120,7 +5043,24 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Rewrite idents in the defer body so references to scope-
          * shadowed names (`h` → `h_17`) resolve correctly when the
          * defer body is consumed later (emitter or zercheck_ir). */
-        rewrite_defer_body_idents(ctx, node->defer.body);
+        /* BUG-1660: NO identifier pre-rewrite of the body here. There used to be
+         * one (`rewrite_defer_body_idents`): it walked the WHOLE body at this
+         * point and renamed every identifier to the scope-suffixed local visible
+         * at the `defer` statement, for the consumers that replayed the raw AST
+         * later. It ran before any of the body's OWN declarations had a local, so
+         * a name the body declares itself — a var-decl, a for-init, an if-unwrap
+         * or switch capture — was bound to a same-named OUTER local whenever that
+         * outer local carried a suffixed C name:
+         *
+         *     u32 z = 9; { u32 z = 1; defer { u32 z = 5; g = z; } }   // g == 2
+         *
+         * a silent wrong value, and with two pointer types a write through the
+         * wrong one. Since BUG-959 the body is lowered right below, at
+         * registration, and lowering renames each statement's identifiers AS IT
+         * REACHES THEM — in the body's own scopes — writing the result into the
+         * same AST nodes the later consumers read. So the pre-pass was redundant
+         * where it was right and wrong where it differed. Do not reintroduce a
+         * whole-body rename: name resolution has ONE owner, the lowering. */
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
         push.defer_body = node->defer.body;
         /* BUG-1298: filled below once the template is lowered. */

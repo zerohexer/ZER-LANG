@@ -1,0 +1,15 @@
+// expect-error: while a spawned thread may store it
+// BUG-1652: the split spelling in the spawner's window.
+volatile u32 g;
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) { g = i; }
+}
+u32 main() {
+    ThreadHandle a = spawn w();
+    for (u32 i = 0; i < 1000; i += 1) {
+        u32 t = g;
+        g = t + 1;
+    }
+    a.join();
+    return 0;
+}

@@ -1,4 +1,5 @@
-// GAP (2026-11-13 audit, docs/limitations.md): a goto runs a write of a lent local inside the spawn..join window (the borrow rule is textual; TSan)
+// expect-error: cannot write to 'x' while it is borrowed
+// BUG-1648: a goto runs a write of a lent local inside the spawn..join window (the borrow rule was textual; TSan)
 void w(*u32 p) { *p = 5; }
 u32 main() {
     u32 x = 0;

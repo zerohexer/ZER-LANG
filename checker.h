@@ -541,7 +541,9 @@ typedef struct {
         int nbind;
         const char *file; const char *source;
         int line;
+        int seq;              /* BUG-1649: Checker.body_check_seq at the spawn */
     } *sync_spawns;
+    int body_check_seq;       /* BUG-1649: function bodies fully checked so far */
     int sync_spawn_count;
     int sync_spawn_capacity;
 

@@ -1,0 +1,21 @@
+// BUG-1657: the helper form that is exact. `bump(r.handle);` reads the field in the
+// statement that makes the call, so the struct's lock is held until `bump`
+// returns; two threads cannot interleave inside it. 2000 increments, none lost.
+struct Dev { u32 v; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+void bump(*opaque h) { *Dev d = (*Dev)h; d.v += 1; }
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) { bump(r.handle); }
+}
+u32 main() {
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join();
+    b.join();
+    if (gd.v != 2000) { return 1; }
+    return 0;
+}

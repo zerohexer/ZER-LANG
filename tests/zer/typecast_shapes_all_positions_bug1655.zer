@@ -1,0 +1,70 @@
+// BUG-1655: one cast, three emitters. A cast left inside a passthrough expression
+// (the value of a field / element / global assignment, a defer body) was rendered
+// by a path that knew only the plain C cast:
+//   s.b = (bool)n;        stored 5 into a bool — `s.b == true` was FALSE (silent)
+//   r.h = (*opaque)&d;    GCC: conversion to non-scalar type
+//   h.d = (*Dev)op;       GCC: cannot convert to a pointer type
+// CAST KIND x POSITION: every kind must give the same answer wherever it is written.
+struct Dev { u32 v; }
+struct Holder { bool b; *opaque h; ?*Dev d; u3 small; }
+Holder gh;
+bool gb;
+bool[2] barr;
+Dev gd;
+u32 five() { return 5; }
+u32 big() { return 300; }
+bool ret_bool(u32 n) { return (bool)n; }
+u32 take_bool(bool b) { if (b == true) { return 1; } return 0; }
+
+void in_defer(u32 n) {
+    defer { gh.b = (bool)n; }
+}
+
+u32 main() {
+    u32 n = five();
+
+    /* to bool: must be exactly `true` */
+    bool lb = (bool)n;                       /* var-decl init */
+    if (lb != true) { return 1; }
+    bool lb2 = false;
+    lb2 = (bool)n;                           /* plain local assignment */
+    if (lb2 != true) { return 2; }
+    Holder ho;
+    ho.b = (bool)n;                          /* field of a local */
+    if (ho.b != true) { return 3; }
+    gh.b = (bool)n;                          /* field of a global */
+    if (gh.b != true) { return 4; }
+    gb = (bool)n;                            /* global */
+    if (gb != true) { return 5; }
+    barr[1] = (bool)n;                       /* array element */
+    if (barr[1] != true) { return 6; }
+    if (ret_bool(n) != true) { return 7; }   /* return */
+    if (take_bool((bool)n) != 1) { return 8; }   /* call argument */
+    gh.b = false;
+    in_defer(n);                             /* defer body */
+    if (gh.b != true) { return 9; }
+
+    /* to *opaque and back, through a field */
+    gd.v = 7;
+    ho.h = (*opaque)&gd;                     /* wrap, field of a local */
+    gh.h = (*opaque)&gd;                     /* wrap, field of a global */
+    *opaque lo = (*opaque)&gd;               /* wrap, var-decl */
+    ho.d = (*Dev)lo;                         /* unwrap, field of a local */
+    gh.d = (*Dev)lo;                         /* unwrap, field of a global */
+    *Dev back = (*Dev)lo;                    /* unwrap, var-decl */
+    if (back.v != 7) { return 10; }
+    *Dev d1 = ho.d orelse return;
+    *Dev d2 = gh.d orelse return;
+    if (d1.v != 7) { return 11; }
+    if (d2.v != 7) { return 12; }
+
+    /* to an odd-width integer: wraps at 2^3 */
+    u32 w = big();
+    u3 s1 = (u3)w;                           /* var-decl */
+    ho.small = (u3)w;                        /* field of a local */
+    gh.small = (u3)w;                        /* field of a global */
+    if ((u32)s1 != 4) { return 13; }
+    if ((u32)ho.small != 4) { return 14; }
+    if ((u32)gh.small != 4) { return 15; }
+    return 0;
+}

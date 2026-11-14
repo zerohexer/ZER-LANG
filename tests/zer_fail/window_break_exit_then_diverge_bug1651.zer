@@ -1,0 +1,14 @@
+// expect-error: cannot write to 'x' while it is borrowed
+// BUG-1651: a break leaves the spawn..join window with the thread running; the code after never reaches the function exit (TSan)
+void w(*u32 p) { for (u32 i = 0; i < 50000; i += 1) { *p += 1; } }
+u32 cnd;
+void f() {
+    u32 x = 0;
+    for (u32 i = 0; i < 2; i += 1) {
+        ThreadHandle th = spawn w(&x);
+        if (cnd == 0) { break; }
+        th.join();
+    }
+    for (;;) { x += 1; if (x > 300000) { @trap(); } }
+}
+u32 main() { f(); return 0; }

@@ -1384,6 +1384,193 @@ int main(void) {
                 }
     }
 
+    /* ---- jump x spawn-window grid (BUG-1648) + late spawn target (BUG-1649) ----
+     * The spawn..join window was a TEXT-ORDER fact: a goto runs code written
+     * before the spawn inside it, and code written after the join before it. Each
+     * negative crosses one window fact (lent local / global / param pair /
+     * atomic cell / two lend sites) with a jump; the positives pin the boundary —
+     * a CLOSED spawn..join pair (no jump between) keeps the plain rule. */
+    fprintf(stderr, "\n  -- jump x spawn-window grid --\n");
+    {
+        #define JW "void w(*u32 p) { *p = 5; }\n"
+        static const struct { const char *name; int neg; const char *code; } jc[] = {
+            { "write lent local before spawn", 1, JW
+              "u32 main() { u32 x = 0; goto S;\nW: x = 3; goto J;\nS: ThreadHandle th = spawn w(&x); goto W;\nJ: th.join(); return 0; }\n" },
+            { "label after the join", 1, JW
+              "u32 main() { u32 x = 0; ThreadHandle th = spawn w(&x); goto P;\nJ: th.join(); return 0;\nP: x = 3; goto J; }\n" },
+            { "write lent global", 1, "u32 g;\n" JW
+              "u32 main() { goto S;\nW: g = 3; goto J;\nS: ThreadHandle th = spawn w(&g); goto W;\nJ: th.join(); return 0; }\n" },
+            { "param pair", 1, JW
+              "void f(*u32 p, *u32 q) { goto S;\nW: *q = 3; goto J;\nS: ThreadHandle th = spawn w(p); goto W;\nJ: th.join(); }\n"
+              "u32 main() { u32 x = 0; f(&x, &x); return 0; }\n" },
+            { "plain atomic cell", 1, "u32 cell;\nvoid wa() { @atomic_add(&cell, 1); }\n"
+              "u32 main() { goto S;\nW: cell = 3; goto J;\nS: ThreadHandle th = spawn wa(); goto W;\nJ: th.join(); return 0; }\n" },
+            { "two lend sites", 1, JW
+              "u32 main() { u32 x = 0; goto S;\nA: ThreadHandle t2 = spawn w(&x); t2.join(); goto E;\n"
+              "S: ThreadHandle t1 = spawn w(&x); goto A;\nE: t1.join(); return 0; }\n" },
+            { "ok: closed pair after a loop label", 0, JW
+              "u32 main() { u32 x = 0; u32 n = 0;\nagain: n += 1; if (n < 3) { goto again; }\n"
+              "ThreadHandle th = spawn w(&x); th.join(); if (x != 5) { return 1; } return 0; }\n" },
+            { "ok: closed pair inside a goto loop", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 v = 0; u32 i = 0;\nagain: ThreadHandle t2 = spawn wi(&v); t2.join(); i += 1;\n"
+              "if (i < 3) { goto again; } if (v != 3) { return 1; } return 0; }\n" },
+            { "ok: two closed pairs, one local", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 v = 0; for (u32 k = 0; k < 2; k += 1) { ThreadHandle th = spawn wi(&v); th.join(); }\n"
+              "u32 i = 0;\nagain: ThreadHandle t2 = spawn wi(&v); t2.join(); i += 1; if (i < 2) { goto again; }\n"
+              "if (v != 4) { return 1; } return 0; }\n" },
+            /* BUG-1651: OPEN windows — a path leaves the window with the thread
+             * running, so the textual join proves nothing (window_cfg.v) */
+            { "break out, then never exit", 1, "void wl2(*u32 p) { *p += 1; }\nu32 cnd;\n"
+              "void f() { u32 x = 0; for (u32 i = 0; i < 2; i += 1) { ThreadHandle th = spawn wl2(&x);\n"
+              "if (cnd == 0) { break; } th.join(); }\nfor (;;) { x += 1; if (x > 9) { @trap(); } } }\n"
+              "u32 main() { f(); return 0; }\n" },
+            { "orelse break out of window", 1, "void wl2(*u32 p) { *p += 1; }\n"
+              "?u32 mb(u32 v) { if (v == 0) { return null; } return v; }\nu32 cnd;\n"
+              "void f() { u32 x = 0; for (u32 i = 0; i < 2; i += 1) { ThreadHandle th = spawn wl2(&x);\n"
+              "u32 q = mb(cnd) orelse break; th.join(); if (q == 77) { return; } }\n"
+              "for (;;) { x += 1; if (x > 9) { @trap(); } } }\nu32 main() { f(); return 0; }\n" },
+            { "break out, goto back to a join", 1, "void wl2(*u32 p) { *p += 1; }\nu32 cnd;\n"
+              "void f() { u32 x = 0; for (u32 i = 0; i < 2; i += 1) {\nLS: ThreadHandle th = spawn wl2(&x);\n"
+              "if (cnd == 0) { break; } th.join(); continue;\nL2: th.join(); return; }\n"
+              "x += 1; goto L2; }\nu32 main() { f(); return 0; }\n" },
+            { "tail join of another handle", 1, JW
+              "u32 main() { u32 x = 0; u32 y = 0; ThreadHandle h2 = spawn w(&y); goto A;\n"
+              "B: h2.join(); return 0;\nA: ThreadHandle h = spawn w(&x); h.join(); y += 1; h2.join(); return 0; }\n" },
+            { "ok: exit after a join in the list", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 f(u32 err) { u32 x = 0; x = 5; ThreadHandle th = spawn wi(&x);\n"
+              "if (err != 0) { th.join(); return 1; } th.join(); return x; }\n"
+              "u32 main() { if (f(0) != 6) { return 1; } if (f(1) != 1) { return 2; } return 0; }\n" },
+            { "ok: joined break, use after loop", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 x = 0; for (u32 i = 0; i < 3; i += 1) { ThreadHandle th = spawn wi(&x);\n"
+              "if (i == 1) { th.join(); break; } th.join(); }\nx += 1; if (x != 3) { return 1; } return 0; }\n" },
+            { "ok: open window, own tail join", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 x = 0; ThreadHandle th = spawn wi(&x); goto A;\n"
+              "A: th.join(); x += 1; if (x != 2) { return 1; } return 0; }\n" },
+            { "ok: inner-loop break stays inside", 0, "void wi(*u32 p) { *p += 1; }\n"
+              "u32 main() { u32 x = 0; u32 n = 0; ThreadHandle th = spawn wi(&x);\n"
+              "for (u32 k = 0; k < 4; k += 1) { if (k == 2) { break; } n += 1; }\n"
+              "th.join(); if (x + n != 3) { return 1; } return 0; }\n" },
+            { "late target: Handle auto-deref", 1,
+              "struct T { u32 v; }\nPool(T, 4) pl;\nshared struct Reg { Handle(T) h; }\nReg reg;\n"
+              "u32 main() { Handle(T) h = pl.alloc() orelse return; reg.h = h;\n"
+              "ThreadHandle th = spawn wl(); h.v += 1; th.join(); return 0; }\n"
+              "void wl() { Handle(T) h = reg.h; h.v += 1; }\n" },
+            { "late callee: Handle auto-deref", 1,
+              "struct T { u32 v; }\nSlab(T) sl;\nshared struct Reg { Handle(T) h; }\nReg reg;\n"
+              "void wl() { bump(); }\n"
+              "u32 main() { Handle(T) h = sl.alloc() orelse return; reg.h = h;\n"
+              "ThreadHandle th = spawn wl(); h.v += 1; th.join(); return 0; }\n"
+              "void bump() { Handle(T) h = reg.h; h.v += 1; }\n" },
+            { "ok: late target, no allocator", 0,
+              "u32 main() { ThreadHandle th = spawn wl(3); th.join(); return 0; }\n"
+              "void wl(u32 x) { u32 y = x + 1; if (y == 0) { return; } }\n" },
+        };
+        #undef JW
+        for (size_t ji = 0; ji < sizeof(jc) / sizeof(jc[0]); ji++) {
+            valid_cells++;
+            char nm[160];
+            snprintf(nm, sizeof(nm), "jump-window/%s", jc[ji].name);
+            int ok = jc[ji].neg ? run_neg(nm, jc[ji].code) : run_pos(nm, jc[ji].code);
+            fprintf(stderr, "  [%-36s][%-3s] %s\n", jc[ji].name, jc[ji].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
+    /* ---- a shared struct's *opaque handle leaving its lock (BUG-1299 / BUG-1653) ----
+     * The lock is held for the STATEMENT that reads the field. SINK x CARRIER: the
+     * value turned back into a ZER pointer at the field / a local / a local struct
+     * (the cast sink, BUG-1299), or handed on to where the fact is invisible — a ZER
+     * function, a return, non-local storage, a thread (BUG-1653). The `ok:` cells
+     * are the idiom the field exists for: the handle goes to C. */
+    fprintf(stderr, "\n  -- shared *opaque handle leaves the lock --\n");
+    {
+        #define OP "struct Dev { u32 v; }\nshared struct Reg { *opaque handle; u32 n; }\nReg r;\n" \
+                   "struct Box { *opaque h; u32 n; }\ni32 memcmp(*opaque a, *opaque b, usize n);\n"
+        #define OM "\nu32 main(){ return 0; }\n"
+        static const struct { const char *name; int neg; const char *code; } oc[] = {
+            { "cast/field", 1, OP "void w(){ *Dev d = (*Dev)r.handle; d.v = 1; }" OM },
+            { "cast/local", 1, OP "void w(){ *opaque h = r.handle; *Dev d = (*Dev)h; d.v = 1; }" OM },
+            { "cast/local struct field", 1, OP "void w(){ Box b; b.h = r.handle; *Dev d = (*Dev)b.h; d.v = 1; }" OM },
+            { "cast/struct literal", 1, OP "void w(){ Box b = { .h = r.handle }; *Dev d = (*Dev)b.h; d.v = 1; }" OM },
+            { "call/local to ZER fn", 1, OP "void use(*opaque h){ *Dev d = (*Dev)h; d.v = 1; }\n"
+                                         "void w(){ *opaque h = r.handle; use(h); }" OM },
+            /* BUG-1657: read in the calling statement, so the lock is held across
+             * the call — exact unless the helper keeps or returns the value */
+            { "ok: field to a helper that uses it", 0, OP "void use(*opaque h){ *Dev d = (*Dev)h; d.v += 1; }\nvoid w(){ use(r.handle); }" OM },
+            { "ok: helper hands it to C", 0, OP "Dev gd;\nvoid use(*opaque h){ i32 k = memcmp(h, (*opaque)&gd, 4); }\nvoid w(){ use(r.handle); }" OM },
+            { "ok: helper forwards to a helper", 0, OP "void in2(*opaque h){ *Dev d = (*Dev)h; d.v += 1; }\nvoid use(*opaque h){ in2(h); }\nvoid w(){ use(r.handle); }" OM },
+            { "call/helper stores it", 1, OP "?*opaque gh = null;\nvoid use(*opaque h){ gh = h; }\nvoid w(){ use(r.handle); }" OM },
+            { "call/helper stores the cast", 1, OP "?*Dev gdp = null;\nvoid use(*opaque h){ *Dev d = (*Dev)h; gdp = d; }\nvoid w(){ use(r.handle); }" OM },
+            { "call/helper returns it", 1, OP "*opaque use(*opaque h){ return h; }\nvoid w(){ *opaque x = use(r.handle); }" OM },
+            { "call/helper returns the cast", 1, OP "*Dev use(*opaque h){ *Dev d = (*Dev)h; return d; }\nvoid w(){ *Dev x = use(r.handle); x.v = 1; }" OM },
+            { "call/helper's helper stores it", 1, OP "?*opaque gh = null;\nvoid in2(*opaque h){ gh = h; }\nvoid use(*opaque h){ in2(h); }\nvoid w(){ use(r.handle); }" OM },
+            { "call/helper stores via out-param", 1, OP "void use(*opaque h, *Box o){ o.h = h; }\nvoid w(){ Box b; use(r.handle, &b); }" OM },
+            { "call/helper stores in a static", 1, OP "void use(*opaque h){ static ?*opaque k = null; k = h; }\nvoid w(){ use(r.handle); }" OM },
+            { "call/struct carrier", 1, OP "void take(Box b){ }\nvoid w(){ Box b; b.h = r.handle; take(b); }" OM },
+            { "call/funcptr", 1, OP "void use(*opaque h){ }\nvoid w(){ *(*opaque) fp = use; *opaque h = r.handle; fp(h); }" OM },
+            { "return/field", 1, OP "*opaque get(){ return r.handle; }" OM },
+            { "return/local", 1, OP "*opaque get(){ *opaque h = r.handle; return h; }" OM },
+            { "store/global", 1, OP "?*opaque gh = null;\nvoid w(){ gh = r.handle; }" OM },
+            { "store/through pointer", 1, OP "void fill(*Box b){ b.h = r.handle; }" OM },
+            { "store/global struct field", 1, OP "Box gb;\nvoid w(){ gb.h = r.handle; }" OM },
+            { "spawn/arg", 1, OP "void t(*opaque h){ }\nvoid w(){ *opaque h = r.handle; spawn t(h); }" OM },
+            { "ok: field to C", 0, OP "Dev gd;\nvoid w(){ i32 k = memcmp(r.handle, (*opaque)&gd, 4); }" OM },
+            { "ok: local to C", 0, OP "Dev gd;\nvoid w(){ *opaque h = r.handle; i32 k = memcmp(h, (*opaque)&gd, 4); }" OM },
+            { "ok: local struct to C", 0, OP "Dev gd;\nvoid w(){ Box b; b.h = r.handle; i32 k = memcmp(b.h, (*opaque)&gd, 4); }" OM },
+            { "ok: scalar field via ZER fns", 0, OP "u32 getn(){ return r.n; }\nvoid setn(u32 v){ r.n = v; }\nvoid w(){ setn(getn() + 1); }" OM },
+            { "ok: scalar of a carrier", 0, OP "void use(u32 v){ }\nvoid w(){ Box b; b.h = r.handle; b.n = 3; use(b.n); }" OM },
+            { "ok: stays in the struct", 0, OP "void w(){ r.handle = r.handle; }" OM },
+        };
+        #undef OP
+        #undef OM
+        for (size_t oi = 0; oi < sizeof(oc) / sizeof(oc[0]); oi++) {
+            valid_cells++;
+            char nm[160];
+            snprintf(nm, sizeof(nm), "opaque-leak/%s", oc[oi].name);
+            int ok = oc[oi].neg ? run_neg(nm, oc[oi].code) : run_pos(nm, oc[oi].code);
+            fprintf(stderr, "  [%-30s][%s] %s\n", oc[oi].name, oc[oi].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
+    /* ---- one object passed as TWO arguments to a function that lends one of them
+     * to a thread (BUG-1303 / 1645 / 1646 / 1654) ----
+     * `f` spawns with its first parameter and writes through its second before the
+     * join. "The same object" was decided by NAME, so every spelling without a
+     * name — a call result, a pointer read out of a field — was a different object
+     * from everything. SPELLING of the second argument x {same object, distinct}. */
+    fprintf(stderr, "\n  -- one object as two arguments of a lending function --\n");
+    {
+        #define AF "void w(*u32 a){ for (u32 i = 0; i < 4; i += 1) { *a += 1; } }\n" \
+                   "void f(*u32 p, *u32 q){ ThreadHandle th = spawn w(p); *q += 1; th.join(); }\n" \
+                   "*u32 id(*u32 x){ return x; }\nstruct H { *u32 p; }\nu32 g;\n*u32 getg(){ return &g; }\n" \
+                   "void plain(*u32 p, *u32 q){ *p += 1; *q += 1; }\n"
+        static const struct { const char *name; int neg; const char *code; } ac[] = {
+            { "same name twice", 1, AF "u32 main(){ u32 v = 0; f(&v, &v); return 0; }\n" },
+            { "pointer local alias", 1, AF "u32 main(){ u32 v = 0; *u32 q = &v; f(&v, q); return 0; }\n" },
+            { "local bound to a call result", 1, AF "u32 main(){ u32 v = 0; *u32 q = id(&v); f(&v, q); return 0; }\n" },
+            { "nested call result", 1, AF "u32 main(){ u32 v = 0; f(&v, id(&v)); return 0; }\n" },
+            { "call result first", 1, AF "u32 main(){ u32 v = 0; f(id(&v), &v); return 0; }\n" },
+            { "carrier field", 1, AF "u32 main(){ u32 v = 0; H h; h.p = &v; f(&v, h.p); return 0; }\n" },
+            { "getter of a global", 1, AF "u32 main(){ f(&g, getg()); return 0; }\n" },
+            { "ok: two names", 0, AF "u32 main(){ u32 a = 0; u32 b = 0; f(&a, &b); return 0; }\n" },
+            { "ok: carrier of another object", 0, AF "u32 main(){ u32 a = 0; u32 b = 0; H h; h.p = &b; f(&a, h.p); return 0; }\n" },
+            { "ok: unknown, callee lends nothing", 0, AF "u32 main(){ u32 a = 0; plain(&a, id(&a)); return 0; }\n" },
+        };
+        #undef AF
+        for (size_t ai = 0; ai < sizeof(ac) / sizeof(ac[0]); ai++) {
+            valid_cells++;
+            char nm[160];
+            snprintf(nm, sizeof(nm), "alias-args/%s", ac[ai].name);
+            int ok = ac[ai].neg ? run_neg(nm, ac[ai].code) : run_pos(nm, ac[ai].code);
+            fprintf(stderr, "  [%-34s][%s] %s\n", ac[ai].name, ac[ai].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);
     fprintf(stderr, "    false negatives: %d | invalid probes: %d | over-rejections: %d\n",
             false_neg, invalid_probe, over_reject);

@@ -1,0 +1,51 @@
+// BUG-1659: a function-pointer field that mentions the container's type
+// parameter. Template substitution listed TYNODE_FUNC_PTR with the leaf kinds, so
+// `*(T) -> u32 cb;` was reported as "undefined type 'T'" and a callback over the
+// payload type could not be declared in a container at all. Substitution is now
+// total: return type and every parameter, at any depth (`*T`, `?*(...)`).
+container Handler(T) {
+    *(T) -> u32 cb;
+    ?*(*T, u32) -> void fix;
+    *(u32) -> T make;
+    T payload;
+    u32 calls;
+}
+struct Reading { u32 raw; u32 scale; }
+
+u32 scaled(Reading r) { return r.raw * r.scale; }
+void bump(*Reading r, u32 by) { r.raw += by; }
+Reading fresh(u32 seed) { Reading r; r.raw = seed; r.scale = 2; return r; }
+u32 twice(u32 v) { return v * 2; }
+u32 ident(u32 v) { return v; }
+
+// A handler is a global: a pointer handed to a function-pointer call may be
+// kept by a callee the compiler cannot see, so it must outlive the call.
+Handler(Reading) g_h;
+Handler(u32) g_n;
+
+u32 fire() {
+    g_h.calls += 1;
+    if (g_h.fix) |f| { f(&g_h.payload, 3); }
+    return g_h.cb(g_h.payload);
+}
+
+u32 main() {
+    g_h.cb = scaled;
+    g_h.fix = bump;
+    g_h.make = fresh;
+    g_h.payload.raw = 4;
+    g_h.payload.scale = 10;
+    if (fire() != 70) { return 1; }        // (4+3)*10
+    if (fire() != 100) { return 2; }       // (7+3)*10
+    if (g_h.calls != 2) { return 3; }
+    g_h.payload = g_h.make(9);
+    if (g_h.cb(g_h.payload) != 18) { return 4; }
+
+    g_n.cb = twice;
+    g_n.fix = null;
+    g_n.make = ident;
+    g_n.payload = g_n.make(21);
+    if (g_n.cb(g_n.payload) != 42) { return 5; }
+    if (g_n.fix) |f| { return 6; }
+    return 0;
+}

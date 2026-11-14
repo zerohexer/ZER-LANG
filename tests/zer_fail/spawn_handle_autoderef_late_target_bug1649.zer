@@ -1,0 +1,16 @@
+// expect-error: spawn target 'w' accesses non-shared global 'pl'
+// BUG-1649: the spawn target is declared AFTER the spawn site, so its Handle
+// auto-deref carried no allocator annotation when the spawn-site scan ran.
+struct T { u32 v; }
+Pool(T, 4) pl;
+shared struct Reg { Handle(T) h; }
+Reg reg;
+u32 main() {
+    Handle(T) h = pl.alloc() orelse return;
+    reg.h = h;
+    ThreadHandle th = spawn w();
+    for (u32 i = 0; i < 100000; i += 1) { h.v += 1; }
+    th.join();
+    return 0;
+}
+void w() { for (u32 i = 0; i < 100000; i += 1) { Handle(T) h = reg.h; h.v += 1; } }

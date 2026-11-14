@@ -1,0 +1,17 @@
+// expect-error: cannot be resolved to the object it points at
+// BUG-1654: `f` lends its first parameter to a thread and writes through the
+// second before the join. "Same object" was decided by NAME, and a call result
+// has no name — so it was treated as a different object from everything. Here it
+// is the same one (TSan: data race).
+void w(*u32 a) { for (u32 i = 0; i < 1000; i += 1) { *a += 1; } }
+void f(*u32 p, *u32 q) {
+    ThreadHandle th = spawn w(p);
+    for (u32 i = 0; i < 1000; i += 1) { *q += 1; }
+    th.join();
+}
+*u32 id(*u32 x) { return x; }
+u32 main() {
+    u32 v = 0;
+    f(&v, id(&v));
+    return 0;
+}

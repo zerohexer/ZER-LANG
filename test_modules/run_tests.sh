@@ -102,6 +102,7 @@ fi
 
 # Multi-module: shared struct + spawn across modules (BUG-472 + BUG-473 fixed)
 run_test shared_user 0
+run_test cond_user 0
 # BUG-865: spawn of an IMPORTED function emitted the unmangled name (link failure)
 run_test spawn_user 0
 # BUG-866/867: async and container(T) across a module boundary (both emitted names

@@ -1,0 +1,59 @@
+// BUG-1661: which shared structs carry a condition variable was discovered by an
+// emitter prescan that saw a `@cond_*` intrinsic only when it was the WHOLE of an
+// expression statement. @cond_timedwait is the one condvar intrinsic that returns
+// a value (?void), so every natural use of it was invisible and the struct was
+// emitted without its `_zer_cond` member — GCC: "has no member named '_zer_cond'",
+// naming something the user never wrote.
+//
+// ONE SHARED STRUCT TYPE PER POSITION, on purpose: any single visible use
+// registers the type and masks every other position (which is how the defect
+// survived — a program that also calls @cond_signal on the same type works).
+shared struct InDecl   { u32 n; }
+shared struct InIf     { u32 n; }
+shared struct InOrelse { u32 n; }
+shared struct InReturn { u32 n; }
+shared struct InAssign { u32 n; }
+shared struct InArg    { u32 n; }
+shared struct InWhile  { u32 n; }
+InDecl g_decl;
+InIf g_if;
+InOrelse g_orelse;
+InReturn g_return;
+InAssign g_assign;
+InArg g_arg;
+InWhile g_while;
+
+?void as_return() { return @cond_timedwait(g_return, g_return.n > 0, 1); }
+u32 took(?void r) { if (r) { return 1; } return 0; }
+
+u32 main() {
+    // predicate false -> each wait must TIME OUT (null); 1 ms keeps the suite fast
+    ?void a = @cond_timedwait(g_decl, g_decl.n > 0, 1);
+    if (a) { return 1; }
+
+    if (@cond_timedwait(g_if, g_if.n > 0, 1)) { return 2; }
+
+    u32 hit = 1;
+    @cond_timedwait(g_orelse, g_orelse.n > 0, 1) orelse { hit = 0; };
+    if (hit != 0) { return 3; }
+
+    if (as_return()) { return 4; }
+
+    ?void b = null;
+    b = @cond_timedwait(g_assign, g_assign.n > 0, 1);
+    if (b) { return 5; }
+
+    if (took(@cond_timedwait(g_arg, g_arg.n > 0, 1)) != 0) { return 6; }
+
+    // inside a loop body and a nested block (the prescan did descend these, but
+    // only as far as an expression STATEMENT)
+    for (u32 i = 0; i < 2; i += 1) {
+        { ?void w = @cond_timedwait(g_while, g_while.n > 0, 1); if (w) { return 7; } }
+    }
+
+    // predicate true -> immediate success
+    g_decl.n = 1;
+    ?void c = @cond_timedwait(g_decl, g_decl.n > 0, 1);
+    if (c) { return 0; }
+    return 8;
+}

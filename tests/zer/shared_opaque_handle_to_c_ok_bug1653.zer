@@ -1,0 +1,30 @@
+// BUG-1653 boundary: the idiom the `*opaque` field of a shared struct exists for.
+// The handle goes to C — directly, through a local, through a field of a local
+// struct — and scalar fields of the same struct flow through ZER functions freely.
+struct Dev { u32 v; }
+struct Box { *opaque h; u32 n; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+Dev ge;
+i32 memcmp(*opaque a, *opaque b, usize n);
+
+u32 getn() { return r.n; }
+void setn(u32 v) { r.n = v; }
+
+u32 main() {
+    gd.v = 7;
+    ge.v = 7;
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    if (memcmp(r.handle, (*opaque)&ge, 4) != 0) { return 1; }      /* field to C */
+    *opaque h = r.handle;
+    if (memcmp(h, (*opaque)&ge, 4) != 0) { return 2; }             /* local to C */
+    Box b;
+    b.h = r.handle;
+    b.n = 3;
+    if (memcmp(b.h, (*opaque)&ge, 4) != 0) { return 3; }           /* local struct to C */
+    setn(getn() + b.n);                                             /* scalars are free */
+    if (getn() != 3) { return 4; }
+    return 0;
+}

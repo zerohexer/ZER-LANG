@@ -1,0 +1,18 @@
+// expect-error: cannot write to 'y' while it is borrowed
+// BUG-1651: the last join in the text joined ANOTHER handle; the thread lent y was still running (TSan)
+void w(*u32 p) { for (u32 i = 0; i < 50000; i += 1) { *p += 1; } }
+u32 main() {
+    u32 x = 0;
+    u32 y = 0;
+    ThreadHandle h2 = spawn w(&y);
+    goto A;
+B:
+    h2.join();
+    return 0;
+A:
+    ThreadHandle h = spawn w(&x);
+    h.join();
+    for (u32 k = 0; k < 50000; k += 1) { y += 1; }
+    h2.join();
+    return 0;
+}

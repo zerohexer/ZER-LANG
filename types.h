@@ -114,6 +114,15 @@ struct Type {
             bool is_packed;
             bool is_shared;
             bool is_shared_rw;      /* shared(rw) — reader-writer lock */
+            bool uses_condvar;      /* BUG-1661: some `@cond_*` intrinsic names a value
+                                     * of this type, so the emitted struct carries a
+                                     * `pthread_cond_t`. Written by the CHECKER at the
+                                     * one place every condvar intrinsic is checked —
+                                     * wherever it sits in an expression, in whichever
+                                     * module — and only ever set, never cleared. The
+                                     * emitter READS it; it used to rediscover the fact
+                                     * with a statement-level prescan that missed any
+                                     * `@cond_timedwait` whose result is used */
             bool is_move;           /* move struct — ownership transfer on pass/assign */
             bool is_async_state;    /* BUG-1177: `_zer_async_NAME` coroutine state — a
                                      * promoted local may be pointed at by another
@@ -302,6 +311,15 @@ struct Symbol {
      * after the branch, on paths that never joined. `th_spawn_branch_depth`
      * below is the guard that makes the branch case genuinely conservative. */
     bool is_borrowed_by_thread;
+    /* BUG-1648: in a function with a label / goto the borrow is LATCHED — held from
+     * the declaration (control may reach any point from the spawn), released only
+     * by a join after the last jump. `lend_live` is the textual spawn..join fact
+     * the double-lend check reads, which the latch must not trip. */
+    bool borrow_latched;
+    bool lend_live;
+    /* BUG-1651: on a ThreadHandle — its spawn's window is CLOSED (see
+     * spawn_stmt.window_closed); only then does the textual join release. */
+    bool th_window_closed;
     const char *th_borrows_name;
     uint32_t th_borrows_name_len;
     /* 2026-08-03: Checker.branch_depth at the SPAWN. A join is only allowed to

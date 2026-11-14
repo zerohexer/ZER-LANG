@@ -1,0 +1,5 @@
+// expect-error: duplicate field 'a'
+// BUG-1659: a duplicate field name in a container template reached GCC. It is a
+// property of the template, so it is reported even when nothing stamps it.
+container Pair(T) { T a; u32 a; }
+u32 main() { return 0; }

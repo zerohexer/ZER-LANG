@@ -1,0 +1,16 @@
+// expect-error: which stores it
+// BUG-1657: a helper may USE a shared struct's handle during the call that read it
+// (the lock is held until the call returns). It may not keep it: parked in a
+// global, the handle is cast back later with no lock held.
+struct Dev { u32 v; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+?*opaque gh = null;
+void use(*opaque h) { gh = h; }
+u32 main() {
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    use(r.handle);
+    return 0;
+}

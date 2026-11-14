@@ -1,0 +1,17 @@
+// expect-error: both reach 'v'
+// BUG-1654: the pointer read back out of a struct field. The carrier's recorded
+// root (`h.p = &v`) was consulted for a bare name only, not for `h.p`.
+struct H { *u32 p; }
+void w(*u32 a) { for (u32 i = 0; i < 1000; i += 1) { *a += 1; } }
+void f(*u32 p, *u32 q) {
+    ThreadHandle th = spawn w(p);
+    for (u32 i = 0; i < 1000; i += 1) { *q += 1; }
+    th.join();
+}
+u32 main() {
+    u32 v = 0;
+    H h;
+    h.p = &v;
+    f(&v, h.p);
+    return 0;
+}

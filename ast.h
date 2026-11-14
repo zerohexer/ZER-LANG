@@ -332,6 +332,10 @@ struct Node {
             bool is_variadic;       /* C-interop varargs (...) — bodyless extern decls only */
             const char *section;    /* section(".text.startup") or NULL */
             size_t section_len;
+            /* BUG-1649: order in which the checker FINISHED this body (0 = not
+             * yet) — a scan that ran earlier saw the body without the checker's
+             * node annotations (Handle auto-deref allocator). */
+            int body_checked_seq;
         } func_decl;
 
         /* NODE_STRUCT_DECL: struct Task { ... } or packed struct { ... } */
@@ -554,6 +558,13 @@ struct Node {
             /* scoped spawn: ThreadHandle capture */
             const char *handle_name;    /* NULL for fire-and-forget */
             size_t handle_name_len;
+            /* BUG-1648: its `handle.join();` follows in the SAME statement list
+             * with no goto / label between — the window cannot be entered or
+             * left by a jump (set by the checker, in a function with a jump) */
+            bool window_closed;
+            /* BUG-1651: the enclosing function has a goto / label, so text order
+             * is not execution order around this spawn */
+            bool in_jump_fn;
         } spawn_stmt;
 
         /* NODE_INT_LIT: 42, 0xFF, 0b1010, 1_000_000 */

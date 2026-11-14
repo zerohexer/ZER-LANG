@@ -1,0 +1,19 @@
+// expect-error: performs a non-atomic read-modify-write on volatile global
+// BUG-1652: the read half done by a callee through an out-parameter. The spawn
+// scan walks a callee without its scopes, so it could not follow `rd(&t)`.
+volatile u32 g;
+void rd(*u32 o) { *o = g; }
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) {
+        u32 t = 0;
+        rd(&t);
+        g = t + 1;
+    }
+}
+u32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join();
+    b.join();
+    return 0;
+}

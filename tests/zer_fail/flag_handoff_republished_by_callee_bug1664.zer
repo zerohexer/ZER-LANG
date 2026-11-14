@@ -1,5 +1,5 @@
-// GAP (2026-11-14, docs/limitations.md section B): the same republication, through a callee
-// called in a loop (ThreadSanitizer: data race). Compile-clean IS the gap.
+// expect-error: does not hold the flag
+// BUG-1664: the publication sits in a callee that is called twice: the same store, made twice without a wait in between. (Was a recorded gap; ThreadSanitizer: data race.)
 u32 data;
 u32 ready;
 u32 sink;

@@ -117,3 +117,37 @@ Definition zer_lock_acquire_agrees_coq (first same_free : Z) : Z :=
 Definition zer_lock_covers_defer_coq (opened_here release_deferred : Z) : Z :=
   if Z.eq_dec opened_here 0 then 1
   else (if Z.eq_dec release_deferred 0 then 0 else 1).
+
+(* ---- flag HAND-OFF decisions (BUG-1664; meaning lemmas: flag_handoff.v) ---- *)
+
+(* What a comparison of an atomic load with a literal tells its thread on the
+   branch taken: 1 = it holds the literal, 2 = it holds the other value of a
+   two-valued flag, 0 = nothing. *)
+Definition zer_flag_obs_coq (agrees two_valued : Z) : Z :=
+  if Z.eq_dec agrees 0 then
+    (if Z.eq_dec two_valued 0 then 0 else 2)
+  else 1.
+
+(* Under which held value a store is made: 1 = an observed one, 2 = the initial
+   one (the thread's first store, made once), 0 = none. *)
+Definition zer_flag_store_from_coq
+    (holds_explicit entry_fn in_loop in_jump_fn stored_before : Z) : Z :=
+  if Z.eq_dec holds_explicit 0 then
+    (if Z.eq_dec entry_fn 0 then 0
+     else (if Z.eq_dec in_loop 0 then
+             (if Z.eq_dec in_jump_fn 0 then
+                (if Z.eq_dec stored_before 0 then 2 else 0)
+              else 0)
+           else 0))
+  else 1.
+
+(* A value that is stored FROM has one claiming thread, running once. *)
+Definition zer_flag_claim_unique_coq (single_thread repeated : Z) : Z :=
+  if Z.eq_dec single_thread 0 then 0
+  else (if Z.eq_dec repeated 0 then 1 else 0).
+
+(* Two accesses are ordered by a flag iff it keeps the discipline and they are
+   made under two different held values. *)
+Definition zer_flag_orders_coq (flag_valid values_differ : Z) : Z :=
+  if Z.eq_dec flag_valid 0 then 0
+  else (if Z.eq_dec values_differ 0 then 0 else 1).

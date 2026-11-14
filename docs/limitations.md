@@ -211,27 +211,21 @@ each a missing SUMMARY fact, not a missing key:
    **Residual (precision, loud):** that late check does not apply the `@once`
    single-owner exemption — declare the spawn target above its spawn site.
 
-9. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; predates this
-   session): the flag HAND-OFF idiom has no model, and trusts more than it checks.**
-   `data = v; @atomic_store(&ready, 1);` is accepted as "published through `ready`" and a
-   reader that "waited on `ready`" as ordered after it (`SyncCtx.pub` / `.acq`,
-   `sync_ordered`). Neither half is checked to be what it is taken for:
-   - *the publication may run again.* A writer that does it in a loop, or through a callee
-     called twice, writes `data` while the reader reads it
-     (`tests/zer_gaps/publish_flag_republished_in_loop.zer`, `…_by_callee.zer`);
-   - *the "wait" may not wait.* ANY loop that reads the flag atomically counts: one that
-     spins while the flag is NON-zero and so exits at once
-     (`…/publish_flag_wait_wrong_polarity.zer`), or one that reads it in its body and
-     leaves for another reason (`…/publish_flag_loop_is_not_a_wait.zer`). Nothing relates
-     the value waited for to the value published, or either to the flag's initial value.
-   What IS checked: a write after the store in the same statement list, and a flag another
-   instance sets without having waited on it (`sync_flag_forged`). The single publication
-   with a `== 0` wait is TSan-clean. Not fixed with BUG-1663: "no loop" is the wrong rule —
-   a ping-pong hand-off (each side waits for its own value, then stores the other's) is
-   correct and loops. The idiom needs its own oracle, ownership of the data by the flag's
-   VALUE, exactly as the spin lock got one; its hypotheses will be the probe list. Until
-   then guard such data with a spin lock or a `shared struct`. Reproducers are executed
-   with the expectation inverted (compile-clean IS the gap).
+9. [residual of: the flag HAND-OFF idiom has no model — closed by BUG-1664]
+   **Residuals (over-rejections, loud — a warning at the store or the generic "no flag
+   ordering them" error):** a wait made in a CALLEE (`wait_ready(); use(data);` — the
+   hold is the callee's; write the wait where the access is); a first, unwaited store in
+   a callee, a loop, a function with a label, or a function that runs more than once; a
+   store by the MAIN thread anywhere but in the spawning function, between the spawn and
+   the join, outside every loop (so main cannot be a looping ping-pong player — give both
+   sides a thread); a flag with three or more values under an `== V` wait or a `!= V`
+   branch (only a two-valued flag has "the other value" — wait with `!= W`); a wait
+   condition that is not `@atomic_load(&F) ==/!= literal` alone (a mask, `<`, a local
+   copy of the load, a second conjunct); a counter hand-off (`@atomic_add`); two flags
+   held at once (the walk keeps one explicit hold); a `defer` body (it never holds); a
+   reader that keeps reading after it reset the flag, even when the writer is finished.
+   **Not derived:** that the lexical tags are right on every execution — argued at the
+   checks and gated by the "hand-off" grid.
 
 10. [residual of: the spin-lock region was read off one statement list — closed by BUG-1663]
    **Residuals (over-rejections, loud — each has a warning or an error naming it):**
@@ -251,6 +245,41 @@ each a missing SUMMARY fact, not a missing key:
    after `defer @atomic_store(&L, 0);`).
    **Not derived:** that the list of statements which sit lexically in a region and do
    not run in it (a `defer` body, the spin body) is complete — it was found by probing.
+
+11. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; every baseline
+   accepts it): a write through a pointer the context walk cannot NAME.** When a thread
+   uses any `@atomic_*` / `@barrier`, the spawn scan's "touches a non-shared global"
+   finding is a warning and the context walk judges each access against the other
+   threads'. The walk attributes an access to a global through its name, `&g`, a slice, a
+   struct literal, a pointer name's declaration and reassignments, and parameters. It
+   attributes NOTHING to an access through
+   - a pointer loaded out of memory and bound to a new name — `if (h.p) |q| { *q += 1; }`
+     with `h.p = &g;` done at run time (`tests/zer_gaps/spawn_race_through_loaded_pointer.zer`);
+   - a pointer a call returned — `*getp() += 1`, `*u32 q = getp(); *q += 1;`
+     (`tests/zer_gaps/spawn_race_through_returned_pointer.zer`);
+   and it keys an access through a global pointer or Handle whose target it cannot
+   resolve by that pointer's NAME, so TWO NAMES FOR ONE OBJECT do not meet: `p1 = n;
+   p2 = n;` (one heap object, a thread on each pointer), `h2 = h1;` (one pool slot, a
+   thread on each Handle), `gp = getp();` against `g` by name — all measured, all racing.
+   Two threads doing any of these compile with two warnings. (A global pointer
+   used by name — `*gp += 1`, `**gpp`, a view slice, a struct with a static pointer
+   initializer — IS attributed: measured.) Fix sketch, not built — the walk has three
+   answers for a pointer and uses two: KNOWN globals (recorded), a STACK address of the
+   thread's own (private), and UNKNOWN, which it treats as private. (i) Record an access
+   through an unknown pointer as an access to "some object of type T", carrying its lock
+   / flag tags like any other; it conflicts with another thread's access to any memory
+   that may hold a T (ZER has no pointer arithmetic and casts are provenance-checked, so
+   the type is a sound key), unless a common lock or a hand-off orders them. (ii) Sharpen
+   UNKNOWN where the answer exists: the targets ever stored into a pointer field, the
+   addresses a function returns (`for_each_value_pointee` is the one query to extend).
+   (iii) The open design question, and why this is not a one-line "refuse the unknown":
+   a thread's own fresh allocation is private only until its pointer escapes, so (i)
+   alone refuses two workers that each use their own heap object — it needs the keep /
+   escape queries to say "never published". An unresolvable case must end as an
+   INCOMPLETE set, as the depth cap does (BUG-1665): an incomplete set orders
+   nothing. Until then: reach shared data by name or by index, not through a pointer
+   fetched at run time, or keep it in a `shared struct`. Reproducers are executed with the
+   expectation inverted (compile-clean IS the gap).
 
 **B2. Proof status of the data-race class (2026-11-14 — read before claiming "proven").**
 What is machine-checked, and where the chain stops:
@@ -278,6 +307,14 @@ What is machine-checked, and where the chain stops:
   `concurrency_decisions.v`; the oracle files prove their meaning lemmas about that file
   and the VST files prove the C equal to that file (the "written twice" residual of
   2026-11-14 is closed).
+- `flag_handoff.v` (plain Coq, zero admits, no axioms; in `make check-proofs`): the flag
+  hand-off RULE — if every store of the flag is made by a thread that holds a value and
+  is that value's one owner, every thread that holds, holds the current value
+  (`holders_agree`), so two accesses under two different held values are never enabled
+  together (`claims_exclusive`). One counterexample trace per hypothesis dropped (a
+  republished flag, a forged store, a second claimant, a wait satisfied by the initial
+  value). `proofs/vst/verif_handoff_rules.v` (in `make check-vst`): the C of the four
+  extracted hand-off decisions equals its `_coq` definition.
 - NOT proven: that `checker.c` discharges each hypothesis of the instances (the syntactic
   walk `win_exits_live`, the branch-depth / jump census at the join; for the lock, that a
   lexical region with no label, no nested release and no out-of-role write IS a dynamic
@@ -285,19 +322,21 @@ What is machine-checked, and where the chain stops:
   carries nothing from an earlier one) — by inspection and the conc-matrix "jump x
   spawn-window" and "lock-region" cells only. NOT modelled at all: the spawn-target race
   scan, the atomic-cell and atomic-downgrade rules, shared-struct locking, the ISR rules,
-  and the flag HAND-OFF idiom (item 9 above is what the absence of that model looks like).
+  (for the hand-off: that an access tagged with a held value is made while its thread
+  holds it). The spin lock and the hand-off each had NO model until 2026-11-14, and each
+  was holed in a dozen shapes the day it got one.
   The Iris subset proves the four-condition closure sufficient; nothing proves the checker
   enforces it on every program form. "100% data-race-free, proven" is therefore NOT a claim
   this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
   proven" is.
-- Accept-unsafe items still recorded as OPEN in this class: ONE as of 2026-11-14 — the
-  flag hand-off idiom (item 9; four reproducers). The lock-region holes (BUG-1663) and the
-  three before them (BUG-1652..1654) are closed. That is a statement about this ledger —
-  what was probed and measured — and not a proof: BUG-1663 was found by writing an
-  oracle's hypotheses down and probing each, HALF of it only when the finished fix was
-  reviewed against the same list, and item 9 by probing the neighbouring idiom the same
-  day. A relaxation without a model has no variable to fail on; an idiom recogniser
-  without one has none either. Recorded and NOT a race
+- Accept-unsafe items still recorded as OPEN in this class: ONE as of 2026-11-14 — a
+  write through a pointer the context walk cannot name (item 11; two reproducers). Closed
+  the same day: the lock regions (BUG-1663), the flag hand-off (BUG-1664), the silent
+  depth cap (BUG-1665); before them BUG-1652..1654. That is a statement about this ledger
+  — what was probed and measured — and NOT a proof, and its record is poor: "none" was
+  written here on 2026-11-13 and four families were found the next day, each by writing
+  down what a rule assumed and trying to break it. What has not had that treatment is the
+  list just above ("NOT modelled at all").
   as far as measured: the handler-side split RMW done in helpers (a handler is not preempted
   by main code). `cinclude` code is a floor.
 
@@ -348,16 +387,13 @@ What is machine-checked, and where the chain stops:
 
 ## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
 
-1. **What the atomic/barrier downgrade check (BUG-1562/1563/1565) still trusts.** The
-   orderings it RECOGNISES are spelled in one statement list: a lock is a spin `while` on
-   `@atomic_cas` / `@atomic_xchg` up to its release; a hand-off is a write followed by a
-   non-load atomic on the flag, and a read after a loop / `if` reading the flag atomically.
-   It does not compare VALUES: a store to the flag after the storer's own wait on it is a
-   relay (allowed), and the publisher's own store BEFORE its write is not distinguished
-   from its publish. Bindings of pointers to globals follow `&g`, a slice, a struct
-   literal, a pointer name's declaration and reassignments, and parameters — not a pointer
-   read back out of memory (`*pp`, a pointer field of a global loaded at run time). A
-   C caller is still invisible beyond "may run more than once".
+1. [residual of: What the atomic/barrier downgrade check still trusts — closed by BUG-1663, BUG-1664]
+   **What the context walk still does not follow.** A pointer read back out of memory
+   or returned by a call: ACCEPT-UNSAFE, section B item 11. A C caller is still invisible
+   beyond "may run more than once".
+   [residual of BUG-1665] A thread whose code is deeper than the walk's cap (about eighty
+   calls on one path) is refused even when every access is locked: shorten the chain or
+   use a `shared struct`.
 2. **The split RMW through CALLS (BUG-1561/1564)** follows returns, stores into globals,
    through pointers (global, local, parameter), forwarding and call cycles. Not followed: a
    value passed back through memory a pointer argument points at (an out-parameter

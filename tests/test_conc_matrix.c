@@ -1721,6 +1721,125 @@ int main(void) {
         #undef ULK
     }
 
+    /* ---- BUG-1664: the flag HAND-OFF grid ---------------------------------------
+     * `data = v; @atomic_store(&ready, 1);` against a wait on `ready` used to be
+     * matched by shape: "some later statement stores a flag" / "some earlier loop
+     * reads a flag". The model (proofs/operational/lambda_zer_concurrency/
+     * flag_handoff.v): the flag is a token, and a thread touches the data only
+     * while it HOLDS a value — the one it waited for, or, for the one thread that
+     * starts, the initial value until its first store, made once. Crossed:
+     *   WHO publishes  a spawned thread | the spawner, in its window
+     *   HOW it does    a publication that runs once, in four spellings — or one
+     *                  that runs again (loop, callee, goto), keeps writing after
+     *                  it, or writes from a `defer`
+     *   HOW the other  a wait / branch that really observes the published value,
+     *     side waits   in six spellings — or one that does not (wrong polarity,
+     *                  a loop that is not a wait, a `break`, a compound
+     *                  condition, the wrong branch, no wait at all)
+     * A cell is positive iff BOTH sides are right; every negative cell is a real
+     * race (ThreadSanitizer on the pure forms). Run against the pre-fix compiler:
+     * most negative cells compile clean. */
+    {
+        typedef enum { HP_THREAD, HP_SPAWNER, HP_COUNT } HandWho;
+        static const struct { const char *nm; int ok; const char *extra; const char *body; } hw[] = {
+            { "one-shot",          1, "", "data = 1; @atomic_store(&ready, 1);" },
+            { "fill-loop",         1, "", "for (u32 i = 0; i < 4; i += 1) { data += i; } @atomic_store(&ready, 1);" },
+            { "callee-fill",       1, "void fill() { data = 1; }\n", "fill(); @atomic_store(&ready, 1);" },
+            { "conditional",       1, "volatile u32 onec = 1;\n", "if (onec == 1) { data = 1; @atomic_store(&ready, 1); }" },
+            { "republish-loop",    0, "", "for (u32 i = 0; i < 4; i += 1) { data = i; @atomic_store(&ready, 1); }" },
+            { "republish-callee",  0, "void pub(u32 v) { data = v; @atomic_store(&ready, 1); }\n", "pub(1); pub(2);" },
+            { "republish-goto",    0, "", "u32 gi = 0;\nagain:\n    data = gi; @atomic_store(&ready, 1); gi += 1; if (gi < 4) { goto again; }" },
+            { "write-after-store", 0, "", "data = 1; @atomic_store(&ready, 1); data = 2;" },
+            { "defer-body",        0, "", "defer { data = 2; } data = 1; @atomic_store(&ready, 1);" },
+        };
+        static const struct { const char *nm; int ok; const char *extra; const char *body; } hr[] = {
+            { "eq-wait",        1, "", "while (@atomic_load(&ready) == 0) { } sink = data;" },
+            { "ne-wait",        1, "", "while (@atomic_load(&ready) != 1) { } sink = data;" },
+            { "do-while-wait",  1, "", "do { } while (@atomic_load(&ready) == 0); sink = data;" },
+            { "if-then",        1, "", "if (@atomic_load(&ready) == 1) { sink = data; }" },
+            { "if-else",        1, "", "if (@atomic_load(&ready) == 0) { sink = 0; } else { sink = data; }" },
+            { "wait-then-call", 1, "void use() { sink = data; }\n", "while (@atomic_load(&ready) == 0) { } use();" },
+            { "wrong-polarity", 0, "", "while (@atomic_load(&ready) != 0) { } sink = data;" },
+            { "not-a-wait",     0, "", "u32 nw = 0; while (nw < 10) { nw += 1; u32 lb = @atomic_load(&ready); } sink = data;" },
+            { "break-in-wait",  0, "", "while (@atomic_load(&ready) == 0) { break; } sink = data;" },
+            { "compound-wait",  0, "", "u32 nc = 0; while (@atomic_load(&ready) == 0 && nc < 5) { nc += 1; } sink = data;" },
+            { "wrong-branch",   0, "", "if (@atomic_load(&ready) == 1) { sink = 0; } else { sink = data; }" },
+            { "no-wait",        0, "", "sink = data;" },
+        };
+        static const char *const who_name[HP_COUNT] = { "thread", "spawner" };
+        int nhw = (int)(sizeof(hw) / sizeof(hw[0])), nhr = (int)(sizeof(hr) / sizeof(hr[0]));
+        for (HandWho who = 0; who < HP_COUNT; who++) {
+            for (int wi = 0; wi < nhw; wi++) {
+                /* a `goto` in the SPAWNING function is the window rules' own subject */
+                if (who == HP_SPAWNER && strcmp(hw[wi].nm, "republish-goto") == 0) continue;
+                for (int ri = 0; ri < nhr; ri++) {
+                    int neg = !(hw[wi].ok && hr[ri].ok);
+                    valid_cells++;
+                    char lb[2400], cn[160];
+                    if (who == HP_THREAD)
+                        snprintf(lb, sizeof(lb),
+                            "u32 ready;\nu32 data;\nu32 sink;\n%s%s"
+                            "void writer() {\n    %s\n}\n"
+                            "void reader() {\n    %s\n}\n"
+                            "u32 main() {\n    ThreadHandle a = spawn writer();\n"
+                            "    ThreadHandle b = spawn reader();\n    a.join(); b.join();\n"
+                            "    return 0;\n}\n",
+                            hw[wi].extra, hr[ri].extra, hw[wi].body, hr[ri].body);
+                    else
+                        snprintf(lb, sizeof(lb),
+                            "u32 ready;\nu32 data;\nu32 sink;\n%s%s"
+                            "void reader() {\n    %s\n}\n"
+                            "u32 main() {\n    ThreadHandle b = spawn reader();\n"
+                            "    %s\n    b.join();\n    return 0;\n}\n",
+                            hw[wi].extra, hr[ri].extra, hr[ri].body, hw[wi].body);
+                    snprintf(cn, sizeof(cn), "hand-off/%s/%s/%s", who_name[who], hw[wi].nm, hr[ri].nm);
+                    int ok = neg ? run_neg(cn, lb) : run_pos_check_only(cn, lb);
+                    fprintf(stderr, "  [%-7s][%-17s][%-14s][%s] %s\n", who_name[who], hw[wi].nm,
+                            hr[ri].nm, neg ? "neg" : "pos", ok ? "ok" : "*** FAIL ***");
+                    if (!ok) grid_ok = 0;
+                }
+            }
+        }
+    }
+
+    /* ---- BUG-1665: an incomplete walk orders nothing ----------------------------
+     * The context walk stops at a depth cap. It used to stop in silence, so an
+     * unlocked access some eighty calls deep was accepted (the spawn scan's own
+     * "too deep" finding had been downgraded to a warning by the @atomic in the
+     * thread). depth x locked: a short chain is judged; a long one is refused. */
+    {
+        static const int depths[] = { 20, 100 };
+        for (int di = 0; di < 2; di++) {
+            for (int locked = 0; locked < 2; locked++) {
+                int dn = depths[di];
+                /* (100, locked) is refused too — the walk cannot see that far — and
+                 * is a recorded over-rejection, not a cell */
+                if (dn == 100 && locked) continue;
+                valid_cells++;
+                size_t cap = (size_t)dn * 64 + 1024, len = 0;
+                char *lb = (char *)malloc(cap);
+                if (!lb) { grid_ok = 0; continue; }
+                len += (size_t)snprintf(lb + len, cap - len,
+                    "u32 lk;\nu32 counter;\nvoid fn_%d() { counter += 1; }\n", dn);
+                for (int fi = dn - 1; fi >= 0; fi--)
+                    len += (size_t)snprintf(lb + len, cap - len, "void fn_%d() { fn_%d(); }\n", fi, fi + 1);
+                len += (size_t)snprintf(lb + len, cap - len,
+                    "void w() {\n    while (!@atomic_cas(&lk, 0, 1)) { }\n    %s\n"
+                    "    @atomic_store(&lk, 0);\n    %s\n}\n"
+                    "u32 main() {\n    ThreadHandle a = spawn w();\n    ThreadHandle b = spawn w();\n"
+                    "    a.join(); b.join();\n    return 0;\n}\n",
+                    locked ? "fn_0();" : "", locked ? "" : "fn_0();");
+                char cn[96];
+                snprintf(cn, sizeof(cn), "deep-chain/%d/%s", dn, locked ? "locked" : "unlocked");
+                int ok = locked ? run_pos_check_only(cn, lb) : run_neg(cn, lb);
+                fprintf(stderr, "  [deep-chain][%3d][%-8s][%s] %s\n", dn, locked ? "locked" : "unlocked",
+                        locked ? "pos" : "neg", ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+                free(lb);
+            }
+        }
+    }
+
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);
     fprintf(stderr, "    false negatives: %d | invalid probes: %d | over-rejections: %d\n",
             false_neg, invalid_probe, over_reject);

@@ -1,0 +1,19 @@
+// GAP (2026-11-14, docs/limitations.md section B): a write through a pointer the context
+// walk cannot name. Both threads only READ the global `h`; the pointer they load from it
+// was aimed at `g` at run time, and `*q += 1` is attributed to nothing. The spawn scan's
+// finding is downgraded to a warning because each thread uses an @atomic, and the walk that
+// should then judge the access does not see it (ThreadSanitizer: data race on `g`).
+// Compile-clean IS the gap.
+u32 flagx;
+u32 g;
+struct H { ?*u32 p; }
+H h;
+void w() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { if (h.p) |q| { *q += 1; } } }
+void w2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { if (h.p) |q| { *q += 1; } } }
+i32 main() {
+    h.p = &g;
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

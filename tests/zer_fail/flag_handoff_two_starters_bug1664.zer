@@ -1,0 +1,16 @@
+// expect-error: two stores are made without a wait
+// BUG-1664: two threads each publish without waiting; only one thread can hold the initial value.
+u32 ready;
+u32 data;
+u32 sink;
+u32 d2;
+void writer() { data = 1; @atomic_store(&ready, 1); }
+void writer2() { d2 = 2; @atomic_store(&ready, 1); }
+void reader() { while (@atomic_load(&ready) == 0) { } sink = data + d2; }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle c = spawn writer2();
+    ThreadHandle b = spawn reader();
+    a.join(); c.join(); b.join();
+    return 0;
+}

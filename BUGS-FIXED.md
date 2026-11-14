@@ -589,6 +589,49 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   CRLF are brought back under budget by the Dockerfile's own `find … sed` line. NOT measured:
   a real Windows checkout (the CRLF path was simulated inside the Linux image).
 
+**The flag hand-off, modelled; and a walk that stopped in silence (2026-11-14)**
+- **BUG-1664 — the flag hand-off was matched by SHAPE.** `data = v; @atomic_store(&ready,
+  1);` against a reader that "waited on `ready`" ordered the two accesses whenever some
+  later statement stored a flag and some earlier loop read one (`SyncCtx.pub` / `.acq`,
+  BUG-1562 / 1563 / 1565). Nothing related the value waited for to the value stored, or
+  either to the flag's initial value, and nothing said the publication runs once. Accepted
+  and racing under ThreadSanitizer: a writer that publishes again in a loop, through a
+  callee called twice, or by `goto`; a wait with the wrong polarity (`!= 0` leaves at
+  once); a loop that reads the flag and leaves for another reason, or has a `break`, or a
+  second conjunct; a `defer` body that writes after the store; a store before any thread
+  exists; a `threadlocal` flag; a non-literal store; a function that stores the flag run
+  by a thread AND by main where nothing is watching. 95 negative cells of the new grid
+  compile clean on the previous compiler.
+  Fix — the oracle first (`flag_handoff.v`): the flag is a TOKEN. A thread HOLDS value V
+  from an atomic load that returned V until its own next store; if every store is made by
+  a thread that holds, and a value that is stored FROM has one owner, every holder holds
+  the CURRENT value — so two accesses under two DIFFERENT held values never run together
+  (`holders_agree`, `claims_exclusive`; one counterexample trace per hypothesis). The
+  checker tags each access with the value its thread holds — EXPLICIT (dominated by an
+  observation `load == V`, no store of the flag by that thread since: a statement or loop
+  that may store it, directly or through a call, ends the hold — `flag_scan`) or IMPLICIT
+  (it precedes the thread's first store, made once: entry function, no loop, no label,
+  `zer_flag_store_from`) — and judges the flag program-wide (`handoff_flag_ok`): one shared
+  word touched only by loads and stores of a literal; every store SITE met by a thread walk,
+  under a tag, in every context, and unable to run where no walk looks; one unwaited site
+  at most; each value stored from, stored from by one thread started once. A claim of a
+  value another thread stores from is simply not a hold (`flag_claim_granted`). The old
+  `acq` / `pub` / `sync_flag_forged` are gone. Four decisions extracted and VST-verified
+  (`verif_handoff_rules.v`). Newly ACCEPTED, each inside the model and TSan-clean: the
+  spawner publishing to two readers, a three-stage relay, the `else` branch, `!= V` waits,
+  a flag that starts at 1. Tests: positive `flag_handoff_shapes_ok_bug1664` (exact results),
+  nineteen negatives `flag_handoff_*_bug1664` (four were the recorded gap files), the
+  conc-matrix "hand-off" grid (who publishes x how x how the other side waits, 204 cells).
+  Corpus: no verdict change but the four gap files.
+- **BUG-1665 — the context walk stopped at its depth cap in silence.** An unlocked access
+  some eighty calls below a thread's entry was accepted: the spawn scan's own "call chain
+  too deep" finding is downgraded to a warning when the thread uses an `@atomic`, and the
+  walk that should then judge the access returned without recording it. Every baseline
+  accepts it. Fix: the cap (and every allocation failure of the walk) marks the access
+  set `lost`; a lost set of a downgraded spawn is an error. Found by asking, for
+  BUG-1664's "a thread-only function is walked whole", whether that is true. Tests:
+  `spawn_race_behind_deep_chain_bug1665`, three grid cells.
+
 **Found by writing the model the lock relaxations never had (2026-11-14)**
 - **BUG-1663 — "the code between a spin acquire and its release holds the lock" was read
   off one statement list.** It is a claim about the whole program, and its operational
@@ -645,8 +688,8 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   Predates the lock rules; ThreadSanitizer-confirmed. Fix: a name the function binds more
   than once only accumulates (`checker_name_bound_once`); the same test decides whether a
   copy may be fresh. Test `volatile_rmw_shadowed_copy_bug1663`.
-  NOT fixed, found by the same probing and recorded as OPEN: the flag HAND-OFF idiom
-  (`docs/limitations.md` section B, four `tests/zer_gaps/publish_flag_*`).
+  (The flag HAND-OFF idiom, found by the same probing, was recorded as open in that
+  commit and closed in the next — BUG-1664, above.)
 
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**

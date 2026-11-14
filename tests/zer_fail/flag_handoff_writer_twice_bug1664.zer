@@ -1,0 +1,14 @@
+// expect-error: does not hold the flag
+// BUG-1664: the writer is started twice: its unwaited store runs twice.
+u32 ready;
+u32 data;
+u32 sink;
+void writer() { data = 1; @atomic_store(&ready, 1); }
+void reader() { while (@atomic_load(&ready) == 0) { } sink = data; }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle c = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); c.join(); b.join();
+    return 0;
+}

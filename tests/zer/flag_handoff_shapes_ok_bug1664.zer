@@ -1,0 +1,83 @@
+// BUG-1664: the hand-offs that ARE ordered, with exact results. The flag is a
+// token: a thread touches the data only while it HOLDS a value — the one it
+// waited for, or (the one thread that starts) the initial value until its
+// first store.
+//   one-shot    the writer starts; two readers wait for 1 and only read
+//   ping-pong   each side waits for its own value and stores the other's
+//   relay       0 -> 1 -> 2 through three threads
+//   forms       `== 0` and `!= 1` waits, the `if` and the `else` branch, a
+//               flag that starts at 1, a fill loop and a callee before the store
+u32 ready;              u32 data;       u32 seen_a;     u32 seen_b;
+u32 turn;               u32 ball;       u32 sum;
+u32 stage;              u32 first;      u32 second;     u32 last;
+u32 go = 1;             u32[32] table;  u32 total;
+u32 polled;             u32 poll_hits;  u32 poll_miss;
+
+void reader_a() { while (@atomic_load(&ready) == 0) { } seen_a = data; }
+void reader_b() { while (@atomic_load(&ready) != 1) { } seen_b = data + 1; }
+
+void ping() {
+    for (u32 i = 1; i <= 2000; i += 1) {
+        while (@atomic_load(&turn) != 0) { }
+        ball = i;
+        @atomic_store(&turn, 1);
+    }
+}
+void pong() {
+    for (u32 i = 1; i <= 2000; i += 1) {
+        while (@atomic_load(&turn) != 1) { }
+        sum += ball;
+        @atomic_store(&turn, 0);
+    }
+}
+
+void stage0() { first = 10; @atomic_store(&stage, 1); }
+void stage1() { while (@atomic_load(&stage) != 1) { } second = first + 5; @atomic_store(&stage, 2); }
+void stage2() { while (@atomic_load(&stage) != 2) { } last = first + second; }
+
+void fill_one(u32 i) { table[i] = i * 2; }
+void filler() {
+    for (u32 i = 0; i < 32; i += 1) { fill_one(i); }      // a loop and a callee, before the store
+    @atomic_store(&go, 0);                                // this flag starts at 1
+}
+void summer() {
+    do { } while (@atomic_load(&go) == 1);
+    u32 s = 0;
+    for (u32 i = 0; i < 32; i += 1) { s += table[i]; }
+    total = s;
+}
+void poller() {
+    for (u32 i = 0; i < 200000; i += 1) {
+        if (@atomic_load(&ready) == 1) { poll_hits = data; }
+        if (@atomic_load(&ready) == 0) { poll_miss += 1; } else { polled = data; }
+    }
+}
+
+u32 main() {
+    ThreadHandle ra = spawn reader_a();
+    ThreadHandle rb = spawn reader_b();
+    ThreadHandle pl = spawn poller();
+    data = 42;                                            // the spawner is the thread that starts
+    @atomic_store(&ready, 1);
+    ra.join(); rb.join(); pl.join();
+    if (seen_a != 42) { return 1; }
+    if (seen_b != 43) { return 2; }
+    if (polled != 42 && polled != 0) { return 3; }
+
+    ThreadHandle p1 = spawn ping();
+    ThreadHandle p2 = spawn pong();
+    p1.join(); p2.join();
+    if (sum != 2001000) { return 4; }
+
+    ThreadHandle s0 = spawn stage0();
+    ThreadHandle s1 = spawn stage1();
+    ThreadHandle s2 = spawn stage2();
+    s0.join(); s1.join(); s2.join();
+    if (last != 25) { return 5; }
+
+    ThreadHandle f = spawn filler();
+    ThreadHandle m = spawn summer();
+    f.join(); m.join();
+    if (total != 992) { return 6; }
+    return 0;
+}

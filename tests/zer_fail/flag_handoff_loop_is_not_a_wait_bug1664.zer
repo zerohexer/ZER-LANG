@@ -1,0 +1,17 @@
+// expect-error: no release/acquire flag ordering them
+// BUG-1664: a loop that reads the flag in its body and leaves after ten turns is not a wait: nothing was observed when the read of `data` runs. (Was a recorded gap; ThreadSanitizer: data race.)
+u32 ready;
+u32 data;
+u32 sink;
+void writer() { data = 42; @atomic_store(&ready, 1); }
+void reader() {
+    u32 n = 0;
+    while (n < 10) { n += 1; u32 b = @atomic_load(&ready); }
+    sink = data;
+}
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

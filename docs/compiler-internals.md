@@ -8812,7 +8812,12 @@ position, list the constructs that run at another time (`defer`, a loop's own co
 and body) before trusting "inside". The same name-resolution trap twice in one fix: a
 post-pass resolves a NAME in the global scope, so a function-local of that name (a
 `static`, an inner shadow) is answered with the global — pass the function node and ask
-`fn_binds_name`.
+`fn_binds_name`. The flag hand-off (BUG-1664) repeated the whole story the same day: shape
+match → token model (`flag_handoff.v`) → 95 red cells. Two things specific to it: a
+verdict that needs every STORE SITE of a word is taken from the census (context-free, sees
+every body) and checked against what the context walks RECORDED — a site no walk met, or
+met without a hold, voids the flag — and "the walk saw everything" was itself false past
+the depth cap (BUG-1665: a bounded walk feeding an ACCEPT must mark its result incomplete).
 
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key

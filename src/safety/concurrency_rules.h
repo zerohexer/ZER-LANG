@@ -82,4 +82,14 @@ int zer_lock_word_ok(int whole_word, int thread_local, int shadowed);
 int zer_lock_acquire_agrees(int first, int same_free);
 int zer_lock_covers_defer(int opened_here, int release_deferred);
 
+/* ---- flag HAND-OFF decisions (BUG-1664) — oracle: flag_handoff.v ----
+ * The flag is a token: its value says which thread may touch the data. An
+ * access is made under the value its thread HOLDS; two accesses under two
+ * different held values of one disciplined flag never run together. */
+int zer_flag_obs(int agrees, int two_valued);
+int zer_flag_store_from(int holds_explicit, int entry_fn, int in_loop, int in_jump_fn,
+                        int stored_before);
+int zer_flag_claim_unique(int single_thread, int repeated);
+int zer_flag_orders(int flag_valid, int values_differ);
+
 #endif

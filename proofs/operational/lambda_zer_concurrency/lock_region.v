@@ -110,8 +110,8 @@
    never released, a release that stores a value other than the free one, an
    acquire that spins for ever) is out of scope — a floor.  (4) The flag
    HAND-OFF idiom the checker also recognises (`data = v; @atomic_store(&F,
-   1);` against a wait on F) is NOT modelled, and has open accept-unsafe
-   shapes: docs/limitations.md, section B.
+   1);` against a wait on F) is a different protocol with its own model:
+   flag_handoff.v (BUG-1664).
    ================================================================ *)
 From Coq Require Import List Bool Arith ZArith Lia.
 Import ListNotations.

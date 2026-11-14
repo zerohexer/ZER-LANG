@@ -1,0 +1,16 @@
+// expect-error: no release/acquire flag ordering them
+// BUG-1664: the relay hands the flag on BEFORE it writes `mid`: the write is made holding nothing.
+u32 ready;
+u32 data;
+u32 sink;
+u32 mid;
+void writer() { data = 1; @atomic_store(&ready, 1); }
+void relay() { while (@atomic_load(&ready) != 1) { } @atomic_store(&ready, 2); mid = data + 1; }
+void reader() { while (@atomic_load(&ready) != 2) { } sink = mid + data; }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle c = spawn relay();
+    ThreadHandle b = spawn reader();
+    a.join(); c.join(); b.join();
+    return 0;
+}

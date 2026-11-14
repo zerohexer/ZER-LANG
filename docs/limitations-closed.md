@@ -8205,3 +8205,52 @@ the same logical path. The entry as it stood in `docs/limitations.md` B2:
   was proved. Fix sketch: `Require` the oracle file from the VST file (stdpp is in the
   `zer-vst` image; qualify the names, `window_cfg.v` exports `step` / `init` / `exec`),
   compile it in `make check-vst`, and delete the copies.
+
+---
+
+## CLOSED 2026-11-14 by BUG-1664 — the flag HAND-OFF idiom had no model
+
+Closed by modelling it (`flag_handoff.v`: the flag is a token; an access is made under the
+value its thread holds) and replacing the shape match with value-tagged accesses and a
+program-wide validity check of the flag. The four reproducers moved from `tests/zer_gaps/`
+to `tests/zer_fail/flag_handoff_*_bug1664.zer`. What it left open is `docs/limitations.md`
+B.9. The entry as it stood (it was opened and closed on the same day):
+
+9. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; predates this
+   session): the flag HAND-OFF idiom has no model, and trusts more than it checks.**
+   `data = v; @atomic_store(&ready, 1);` is accepted as "published through `ready`" and a
+   reader that "waited on `ready`" as ordered after it (`SyncCtx.pub` / `.acq`,
+   `sync_ordered`). Neither half is checked to be what it is taken for:
+   - *the publication may run again.* A writer that does it in a loop, or through a callee
+     called twice, writes `data` while the reader reads it
+     (`tests/zer_gaps/publish_flag_republished_in_loop.zer`, `…_by_callee.zer`);
+   - *the "wait" may not wait.* ANY loop that reads the flag atomically counts: one that
+     spins while the flag is NON-zero and so exits at once
+     (`…/publish_flag_wait_wrong_polarity.zer`), or one that reads it in its body and
+     leaves for another reason (`…/publish_flag_loop_is_not_a_wait.zer`). Nothing relates
+     the value waited for to the value published, or either to the flag's initial value.
+   What IS checked: a write after the store in the same statement list, and a flag another
+   instance sets without having waited on it (`sync_flag_forged`). The single publication
+   with a `== 0` wait is TSan-clean. Not fixed with BUG-1663: "no loop" is the wrong rule —
+   a ping-pong hand-off (each side waits for its own value, then stores the other's) is
+   correct and loops. The idiom needs its own oracle, ownership of the data by the flag's
+   VALUE, exactly as the spin lock got one; its hypotheses will be the probe list. Until
+   then guard such data with a spin lock or a `shared struct`. Reproducers are executed
+   with the expectation inverted (compile-clean IS the gap).
+
+## CLOSED 2026-11-14 by BUG-1663 / BUG-1664 — "what the atomic/barrier downgrade check still trusts"
+
+The lock half was closed by BUG-1663 (the lock discipline), the hand-off half — "it does
+not compare VALUES" — by BUG-1664. The part about pointer bindings and C callers stays
+open as its own entry in `docs/limitations.md`. The entry as it stood:
+
+1. **What the atomic/barrier downgrade check (BUG-1562/1563/1565) still trusts.** The
+   orderings it RECOGNISES are spelled in one statement list: a lock is a spin `while` on
+   `@atomic_cas` / `@atomic_xchg` up to its release; a hand-off is a write followed by a
+   non-load atomic on the flag, and a read after a loop / `if` reading the flag atomically.
+   It does not compare VALUES: a store to the flag after the storer's own wait on it is a
+   relay (allowed), and the publisher's own store BEFORE its write is not distinguished
+   from its publish. Bindings of pointers to globals follow `&g`, a slice, a struct
+   literal, a pointer name's declaration and reassignments, and parameters — not a pointer
+   read back out of memory (`*pp`, a pointer field of a global loaded at run time). A
+   C caller is still invisible beyond "may run more than once".

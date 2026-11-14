@@ -320,3 +320,68 @@ int zer_lock_covers_defer(int opened_here, int release_deferred) {
     }
     return 1;
 }
+
+/* ---- flag HAND-OFF decisions (BUG-1664) ----
+ * Oracle: lambda_zer_concurrency/flag_handoff.v (definitions shared through
+ * concurrency_decisions.v). Flat cascades, VST style. */
+
+/* What a comparison of an atomic load with a literal tells its thread about
+ * the flag on the branch taken: 1 = it holds the literal, 2 = it holds the
+ * OTHER value (only when the flag has exactly two values), 0 = nothing.
+ * `agrees`: the operator's sense matches the branch (`==` taken, `!=` not). */
+int zer_flag_obs(int agrees, int two_valued) {
+    if (agrees != 0) {
+        return 1;
+    }
+    if (two_valued == 0) {
+        return 0;
+    }
+    return 2;
+}
+
+/* Under which held value a store of the flag is made: 1 = the value its thread
+ * observed (and has not stored since), 2 = the INITIAL value — the thread's
+ * first store, made once (in its entry function, outside any loop, in a
+ * function with no label), 0 = none: the thread holds nothing. */
+int zer_flag_store_from(int holds_explicit, int entry_fn, int in_loop, int in_jump_fn,
+                        int stored_before) {
+    if (holds_explicit != 0) {
+        return 1;
+    }
+    if (entry_fn == 0) {
+        return 0;
+    }
+    if (in_loop != 0) {
+        return 0;
+    }
+    if (in_jump_fn != 0) {
+        return 0;
+    }
+    if (stored_before != 0) {
+        return 0;
+    }
+    return 2;
+}
+
+/* A value that is stored FROM must be claimed by one thread, running once. */
+int zer_flag_claim_unique(int single_thread, int repeated) {
+    if (single_thread == 0) {
+        return 0;
+    }
+    if (repeated != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Two accesses are ordered by a flag iff the flag keeps the hand-off
+ * discipline and they are made under two DIFFERENT held values. */
+int zer_flag_orders(int flag_valid, int values_differ) {
+    if (flag_valid == 0) {
+        return 0;
+    }
+    if (values_differ == 0) {
+        return 0;
+    }
+    return 1;
+}

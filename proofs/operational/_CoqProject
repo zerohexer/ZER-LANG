@@ -84,6 +84,7 @@ lambda_zer_concurrency/iris_concurrency_theorems.v
 lambda_zer_concurrency/concurrency_decisions.v
 lambda_zer_concurrency/window_cfg.v
 lambda_zer_concurrency/lock_region.v
+lambda_zer_concurrency/flag_handoff.v
 
 lambda_zer_bounds/bounds_lattice.v
 lambda_zer_qualifier/qualifier_lattice.v

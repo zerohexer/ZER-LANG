@@ -871,8 +871,10 @@ with no syntax). So: (1) write the oracle BEFORE a relaxation or an idiom recogn
 (2) for every field and every event of the model ask "what in the language could make this
 two things, or happen at another time?"; (3) when the model's own types answered a question
 by construction, that is a hypothesis too — say it and probe it. The neighbouring flag
-hand-off idiom, which has no model, was holed in four shapes the same day
-(`docs/limitations.md` B.9).
+hand-off idiom had no model either: it was holed in four shapes the same day, modelled the
+next hour (BUG-1664), and its grid shows 95 accepted races on the compiler before. And
+(4) a rule that says "the walk sees every X" must be checked against the walk's own caps —
+asking that found BUG-1665.
 
 **THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
 precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by

@@ -1,0 +1,12 @@
+// expect-error: does not hold the flag
+// BUG-1664: the writer publishes again on every turn of the loop: its second `data = i` runs after its own first store, while the reader may be reading. A first store made without a wait must run once. (Was a recorded gap; ThreadSanitizer: data race.)
+u32 data;
+u32 ready;
+u32 sink;
+void writer() { for (u32 i = 0; i < 100000; i += 1) { data = i; @atomic_store(&ready, 1); } }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    for (u32 i = 0; i < 100000; i += 1) { if (@atomic_load(&ready) == 1) { sink = data; } }
+    a.join();
+    return 0;
+}

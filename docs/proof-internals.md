@@ -256,6 +256,14 @@ predicate lives in the oracle directory, in a plain-Coq file both sides import
 `-Q ../operational/lambda_zer_concurrency zer_conc`). Do not write a definition out in a
 `verif_*.v` file — two copies drift with both gates green.
 
+**The concurrency oracles (2026-11-14).** `lambda_zer_concurrency/` holds three plain-Coq
+trace models, each with its meaning lemmas over `concurrency_decisions.v` and a VST file:
+`window_cfg.v` (the scoped-spawn window; `verif_window_rules.v`), `lock_region.v` (the spin
+lock: mutual exclusion + exactness of an update; `verif_lock_rules.v`), `flag_handoff.v`
+(the flag as a token: holders agree on the current value; `verif_handoff_rules.v`). Each
+states, in its header, the hypotheses the compiler must establish and which syntactic check
+establishes each — that list is the probe list (playbook, "The oracle's hypothesis list").
+
 **File structure per function verified:**
 ```
 proofs/vst/

@@ -26134,7 +26134,7 @@ static bool sync_spin_body_plain(Node *b) {
  *
  * The proof that these conditions give mutual exclusion, and that each is
  * necessary: proofs/operational/lambda_zer_concurrency/lock_region.v. */
-struct LockSite { Symbol *g; int line; const char *file, *src, *why; uint64_t free_v; };
+struct LockSite { Symbol *g; int line; const char *file, *src, *why; uint64_t free_v; bool noted; };
 static struct LockSite *_lock_broken = NULL, *_lock_acq = NULL;
 static int _lock_broken_n = 0, _lock_broken_cap = 0, _lock_acq_n = 0, _lock_acq_cap = 0;
 static bool _lock_broken_lost = false;   /* could not be recorded: no word is a lock */
@@ -26152,6 +26152,7 @@ static void lock_site_add(struct LockSite **tab, int *n, int *cap, Symbol *g, No
     struct LockSite *e = &(*tab)[(*n)++];
     e->g = g; e->line = at ? (int)at->loc.line : 0;
     e->file = _lock_scan_file; e->src = _lock_scan_src; e->why = why; e->free_v = 0;
+    e->noted = false;
 }
 static void lock_word_break(Symbol *g, Node *at, const char *why) {
     lock_site_add(&_lock_broken, &_lock_broken_n, &_lock_broken_cap, g, at, why,
@@ -26237,102 +26238,220 @@ static Symbol *sync_stmt_acquires(Checker *c, Node *s, Node *fn) {
     return (l && !lock_word_broken(l)) ? l : NULL;
 }
 
-/* A flag word an `@atomic_*` intrinsic other than a load PUBLISHES through
- * (store, exchange, read-modify-write): the statement is a release on it. */
-static Symbol *sync_stmt_release_flag(Checker *c, Node *s, Node *fn) {
-    static const char *const rel[] = {
-        "atomic_store", "atomic_xchg", "atomic_cas", "atomic_add", "atomic_sub",
-        "atomic_or", "atomic_and", "atomic_xor", "atomic_nand", "atomic_add_fetch",
-        "atomic_sub_fetch", "atomic_or_fetch", "atomic_and_fetch", "atomic_xor_fetch", NULL };
-    if (!s) return NULL;
-    Node *e = s->kind == NODE_EXPR_STMT ? s->expr_stmt.expr :
-              s->kind == NODE_VAR_DECL ? s->var_decl.init : NULL;
-    if (e && e->kind == NODE_ASSIGN) e = e->assign.value;
-    return sync_intrinsic_lock(c, e, rel, fn);
+/* ==== BUG-1664: the flag HAND-OFF =================================================
+ *
+ *     writer:  data = 42;  @atomic_store(&ready, 1);
+ *     reader:  while (@atomic_load(&ready) == 0) { }   sink = data;
+ *
+ * The recogniser for this matched SHAPES — an access followed in its block by
+ * "some atomic write of a flag" was `pub`, one preceded by "some loop that reads a
+ * flag" was `acq`, and `pub == acq` ordered the pair. Four programs it accepted
+ * race under ThreadSanitizer: a writer that publishes again in a loop or through
+ * a callee (it writes the data while the reader reads it), a "wait" with the
+ * wrong polarity (`!= 0` leaves at once), a loop that reads the flag in its body
+ * and leaves for another reason.
+ *
+ * The model (proofs/operational/lambda_zer_concurrency/flag_handoff.v): the flag
+ * is a TOKEN. Its current value says which thread may touch the data. A thread
+ * HOLDS value V from the moment an atomic load of the flag returned V until its
+ * own next store of the flag. If every store is made by a thread that holds, and
+ * a value that is stored FROM has one claiming thread, then every thread that
+ * holds, holds the CURRENT value — so two accesses made under two DIFFERENT held
+ * values never run together.
+ *
+ * What is checked, each by syntax:
+ *   EXPLICIT hold  the access is dominated by an observation — after
+ *                  `while (@atomic_load(&F) != V) {}`, inside `if (@atomic_load(&F)
+ *                  == V) { }` (and the `==` / `!=` duals when F has exactly two
+ *                  values) — with no store of F by this thread since: a statement
+ *                  that may store F (itself, or through a call) ends the hold, a
+ *                  loop that may store F is walked without it, a `defer` body
+ *                  never has it.
+ *   IMPLICIT hold  the thread holds the flag's INITIAL value until its first
+ *                  store. An access gets it when it precedes, in one block, the
+ *                  thread's first store of F, and that block runs once: in the
+ *                  instance's entry function, outside every loop, in a function
+ *                  with no label (zer_flag_store_from).
+ *   the flag       ONE shared word (sync_lock_word) whose every atomic use in the
+ *                  program is a load or `@atomic_store(&F, literal)`, whose every
+ *                  plain write stores its initial value (plain writes are outside
+ *                  concurrent contexts: the atomic-cell rule), whose address is
+ *                  never taken; every store SITE of it is seen by a thread walk,
+ *                  under a held value, in every context it is seen in; at most
+ *                  one site is an implicit one; every value stored from is
+ *                  claimed by one thread that runs once (handoff_flag_ok).
+ * A flag that fails is no hand-off flag anywhere, and a warning says why. */
+struct FlagStore {
+    Symbol *f; Node *node; uint64_t val;
+    Symbol *fn;                 /* the function the store is in (NULL: a handler, an initializer) */
+    int line; const char *file, *src;
+};
+static struct FlagStore *_flag_stores = NULL, *_flag_plains = NULL;
+static int _flag_store_n = 0, _flag_store_cap = 0, _flag_plain_n = 0, _flag_plain_cap = 0;
+static struct LockSite *_flag_bad = NULL;
+static int _flag_bad_n = 0, _flag_bad_cap = 0;
+static bool _flag_lost = false;   /* a row could not be recorded: no word is a hand-off flag */
+static void flag_break(Symbol *g, Node *at, const char *why) {
+    lock_site_add(&_flag_bad, &_flag_bad_n, &_flag_bad_cap, g, at, why, &_flag_lost);
 }
-/* The flag an expression READS atomically (any `@atomic_*(&F, ...)` in it). */
-static Symbol *sync_expr_atomic_flag(Checker *c, Node *e, Node *fn, int depth) {
-    static const char *const any[] = {
-        "atomic_load", "atomic_cas", "atomic_xchg", "atomic_add", "atomic_sub",
-        "atomic_or", "atomic_and", "atomic_xor", "atomic_nand", "atomic_add_fetch",
-        "atomic_sub_fetch", "atomic_or_fetch", "atomic_and_fetch", "atomic_xor_fetch", NULL };
-    if (!e || depth > ZER_EXPR_WALK_MAX) return NULL;
-    Symbol *f = sync_intrinsic_lock(c, e, any, fn);
-    if (f) return f;
-    switch (e->kind) {
-    case NODE_UNARY:    return sync_expr_atomic_flag(c, e->unary.operand, fn, depth + 1);
-    case NODE_TYPECAST: return sync_expr_atomic_flag(c, e->typecast.expr, fn, depth + 1);
-    case NODE_ASSIGN:   return sync_expr_atomic_flag(c, e->assign.value, fn, depth + 1);
-    case NODE_BINARY: {
-        f = sync_expr_atomic_flag(c, e->binary.left, fn, depth + 1);
-        return f ? f : sync_expr_atomic_flag(c, e->binary.right, fn, depth + 1);
+static struct LockSite *flag_bad_row(Symbol *g) {
+    for (int i = 0; i < _flag_bad_n; i++) if (_flag_bad[i].g == g) return &_flag_bad[i];
+    return NULL;
+}
+static void flag_store_add(struct FlagStore **tab, int *n, int *cap, Symbol *g, Node *at,
+                           uint64_t val, Symbol *fn) {
+    if (*n >= *cap) {
+        int nc = *cap ? *cap * 2 : 32;
+        struct FlagStore *nb = (struct FlagStore *)realloc(*tab, (size_t)nc * sizeof(*nb));
+        if (!nb) { _flag_lost = true; return; }
+        *tab = nb; *cap = nc;
     }
-    case NODE_EXPR_STMT: return sync_expr_atomic_flag(c, e->expr_stmt.expr, fn, depth + 1);
-    case NODE_VAR_DECL:  return sync_expr_atomic_flag(c, e->var_decl.init, fn, depth + 1);
-    case NODE_BLOCK:
-        for (int i = 0; i < e->block.stmt_count; i++) {
-            f = sync_expr_atomic_flag(c, e->block.stmts[i], fn, depth + 1);
-            if (f) return f;
+    struct FlagStore *e = &(*tab)[(*n)++];
+    e->f = g; e->node = at; e->val = val; e->fn = fn; e->line = at ? (int)at->loc.line : 0;
+    e->file = _lock_scan_file; e->src = _lock_scan_src;
+}
+/* The flag's static initial value; false when it is not a literal. */
+static bool flag_init_value(Symbol *f, uint64_t *out) {
+    Node *d = f ? f->func_node : NULL;
+    *out = 0;
+    if (!d || (d->kind != NODE_GLOBAL_VAR && d->kind != NODE_VAR_DECL)) return false;
+    if (!d->var_decl.init) return true;
+    return sync_lit_value(d->var_decl.init, out);
+}
+/* The distinct values the flag can hold — its initial one and every stored
+ * literal — up to three (the callers ask "exactly two?"). */
+static int flag_values(Symbol *f, uint64_t *vs) {
+    int n = 0;
+    uint64_t u = 0;
+    if (flag_init_value(f, &u)) vs[n++] = u;
+    for (int pass = 0; pass < 2; pass++) {
+        struct FlagStore *t = pass ? _flag_plains : _flag_stores;
+        int tn = pass ? _flag_plain_n : _flag_store_n;
+        for (int i = 0; i < tn && n < 3; i++) {
+            if (t[i].f != f) continue;
+            bool have = false;
+            for (int j = 0; j < n; j++) if (vs[j] == t[i].val) have = true;
+            if (!have) vs[n++] = t[i].val;
         }
-        return NULL;
-    /* Only the spellings a wait loop is written in carry the acquire; any
-     * other kind answers "no flag", which can only refuse more. */
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
-    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_CALL: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_STRUCT_INIT: case NODE_SIZEOF: case NODE_CAST:
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
-    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
-    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
-    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER:
-    case NODE_GOTO: case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
-        return NULL;
     }
-    return NULL;
+    return n;
 }
-/* A WAIT on a flag: a loop whose condition or body reads it atomically
- * (`while (@atomic_load(&F) == 0) {}`, `while (b == 0) { b = @atomic_load(&F); }`).
- * Code after it runs after the flag was seen set. */
-static Symbol *sync_stmt_flag_acquire(Checker *c, Node *s, Node *fn) {
-    if (!s) return NULL;
-    if (s->kind == NODE_WHILE || s->kind == NODE_DO_WHILE) {
-        Symbol *f = sync_expr_atomic_flag(c, s->while_stmt.cond, fn, 0);
-        return f ? f : sync_expr_atomic_flag(c, s->while_stmt.body, fn, 0);
+static bool flag_shape_ok(Symbol *f) {
+    uint64_t u;
+    return f && !_flag_lost && !flag_bad_row(f) && flag_init_value(f, &u);
+}
+/* What the thread has OBSERVED of a flag on the branch where `cond` evaluates to
+ * `holds`: `@atomic_load(&F) == LIT` / `!= LIT`, either operand order. */
+static bool sync_cond_observes(Checker *c, Node *cond, Node *fn, bool holds,
+                               Symbol **flag, uint64_t *val, Symbol **want) {
+    static const char *const ld[] = { "atomic_load", NULL };
+    if (!cond || cond->kind != NODE_BINARY) return false;
+    bool is_eq = cond->binary.op == TOK_EQEQ;
+    if (!is_eq && cond->binary.op != TOK_BANGEQ) return false;
+    Node *i = cond->binary.left, *z = cond->binary.right;
+    uint64_t lit;
+    if (i && i->kind == NODE_INT_LIT) { Node *t = i; i = z; z = t; }
+    if (!sync_lit_value(z, &lit)) return false;
+    Symbol *f = sync_lock_word(c, i, ld, fn);
+    if (!flag_shape_ok(f)) {
+        /* waited on like a flag, and not one: the judgement says why if it matters */
+        Symbol *g0 = sync_intrinsic_lock(c, i, ld, fn);
+        if (want && g0 && flag_bad_row(g0)) *want = g0;
+        return false;
     }
-    return NULL;
+    uint64_t vs[3];
+    int nv = flag_values(f, vs);
+    bool two = nv == 2 && (vs[0] == lit || vs[1] == lit);
+    int r = zer_flag_obs(is_eq == holds ? 1 : 0, two ? 1 : 0);
+    if (r == 0) return false;
+    *flag = f;
+    *val = r == 1 ? lit : (vs[0] == lit ? vs[1] : vs[0]);
+    return true;
+}
+/* A WAIT: a loop that can only be left with its condition false, whose
+ * condition is an observation. Code after it runs holding the value observed. */
+static bool sync_stmt_observes(Checker *c, Node *s, Node *fn, Symbol **flag, uint64_t *val,
+                               Symbol **want) {
+    if (!s || (s->kind != NODE_WHILE && s->kind != NODE_DO_WHILE)) return false;
+    if (!sync_spin_body_plain(s->while_stmt.body)) return false;
+    return sync_cond_observes(c, s->while_stmt.cond, fn, false, flag, val, want);
+}
+/* The flag a statement hands off: `@atomic_store(&F, literal);`. */
+static Symbol *sync_stmt_handoff_store(Checker *c, Node *s, Node *fn, Node **node) {
+    static const char *const st[] = { "atomic_store", NULL };
+    if (!s || s->kind != NODE_EXPR_STMT) return NULL;
+    Node *e = s->expr_stmt.expr;
+    uint64_t v;
+    Symbol *f = sync_lock_word(c, e, st, fn);
+    if (!flag_shape_ok(f) || e->intrinsic.arg_count < 2 ||
+        !sync_lit_value(e->intrinsic.args[1], &v)) return NULL;
+    if (node) *node = e;
+    return f;
 }
 
 /* One plain access of a global by a thread instance, with what orders it:
- *   lock — the lock word held around it (a spin acquire ... its release);
- *   acq  — a flag the code WAITED on before it (the reader side of a release/
- *          acquire hand-off);
- *   pub  — a flag the code RELEASES after it (the writer side). */
-typedef struct { Symbol *g; bool write; Symbol *lock, *acq, *pub; } SyncAcc;
-/* BUG-1565 (C4): a write of flag `f` by an instance, and the flag that
- * instance had WAITED on before it (`acq`). */
-typedef struct { Symbol *f, *acq; } SyncFW;
+ *   lock          — the lock word held around it (a spin acquire ... its release);
+ *   own_f / own_v — the flag value the thread HOLDS explicitly (it observed it,
+ *                   and has not stored the flag since);
+ *   pub           — a flag whose INITIAL value the thread still holds: the access
+ *                   precedes the thread's first, unrepeated store of it. */
+typedef struct { Symbol *g; bool write; Symbol *lock, *own_f; uint64_t own_v; Symbol *pub; } SyncAcc;
+/* BUG-1664: one store of a flag as an instance's walk met it, and the value its
+ * thread held there — `from` is zer_flag_store_from's answer (1 an observed
+ * value `from_v`, 2 the initial value, 0 nothing). */
+typedef struct {
+    Symbol *f; Node *node; int from; uint64_t from_v;
+    bool single;   /* met in the instance's entry function, outside every loop, and
+                    * that function runs once: this site executes ONCE, here */
+} SyncFS;
+enum { SLT_NONE = -3, SLT_AMBIG = -2, SLT_MAIN = -1 };   /* a spawn index is >= 0 */
 typedef struct {
     SyncAcc *v; int n, cap;
-    SyncFW *fw; int nfw, cfw;   /* every flag this instance writes */
+    SyncFS *fs; int nfs, cfs;   /* every flag store this instance makes */
+    Symbol **want; int nwant, cwant;   /* words it waited on like a flag that are not one */
+    bool lost;                  /* BUG-1665: the walk could not record everything —
+                                 * past its depth cap, or out of memory. The set is
+                                 * then INCOMPLETE, and an incomplete set proves no
+                                 * ordering: the judgement refuses it. */
     bool repeated;              /* more than one copy of this instance runs */
+    int lt;                     /* the logical thread that runs it (SLT_*) */
 } SyncAccSet;
-static void sync_fw_add(SyncAccSet *s, Symbol *f, Symbol *acq) {
+static void sync_fs_add(SyncAccSet *s, Symbol *f, Node *node, int from, uint64_t from_v,
+                        bool single) {
     if (!f) return;
-    for (int i = 0; i < s->nfw; i++) if (s->fw[i].f == f && s->fw[i].acq == acq) return;
-    if (s->nfw >= s->cfw) {
-        int nc = s->cfw ? s->cfw * 2 : 8;
-        SyncFW *nb = (SyncFW *)realloc(s->fw, (size_t)nc * sizeof(SyncFW));
-        if (!nb) return;
-        s->fw = nb; s->cfw = nc;
+    for (int i = 0; i < s->nfs; i++)
+        if (s->fs[i].node == node && s->fs[i].f == f && s->fs[i].from == from &&
+            s->fs[i].from_v == from_v && s->fs[i].single == single) return;
+    if (s->nfs >= s->cfs) {
+        int nc = s->cfs ? s->cfs * 2 : 8;
+        SyncFS *nb = (SyncFS *)realloc(s->fs, (size_t)nc * sizeof(SyncFS));
+        if (!nb) { s->lost = true; return; }
+        s->fs = nb; s->cfs = nc;
     }
-    s->fw[s->nfw].f = f; s->fw[s->nfw].acq = acq; s->nfw++;
+    SyncFS r = { f, node, from, from_v, single };
+    s->fs[s->nfs++] = r;
+}
+static void sync_want_add(SyncAccSet *s, Symbol *g) {
+    if (!s || !g) return;
+    for (int i = 0; i < s->nwant; i++) if (s->want[i] == g) return;
+    if (s->nwant >= s->cwant) {
+        int nc = s->cwant ? s->cwant * 2 : 4;
+        Symbol **nb = (Symbol **)realloc(s->want, (size_t)nc * sizeof(Symbol *));
+        if (!nb) return;   /* only an explanation is lost */
+        s->want = nb; s->cwant = nc;
+    }
+    s->want[s->nwant++] = g;
+}
+static bool sync_fs_has_flag(SyncAccSet *s, Symbol *f) {
+    if (s->lost) return true;
+    for (int i = 0; i < s->nfs; i++) if (s->fs[i].f == f) return true;
+    return false;
 }
 static bool sync_acc_has(SyncAccSet *s, SyncAcc a) {
     for (int i = 0; i < s->n; i++)
         if (s->v[i].g == a.g && s->v[i].write == a.write && s->v[i].lock == a.lock &&
-            s->v[i].acq == a.acq && s->v[i].pub == a.pub) return true;
+            s->v[i].own_f == a.own_f && (!a.own_f || s->v[i].own_v == a.own_v) &&
+            s->v[i].pub == a.pub) return true;
     return false;
 }
 static void sync_acc_add(SyncAccSet *s, SyncAcc a) {
@@ -26340,13 +26459,13 @@ static void sync_acc_add(SyncAccSet *s, SyncAcc a) {
     if (s->n >= s->cap) {
         int nc = s->cap ? s->cap * 2 : 8;
         SyncAcc *nb = (SyncAcc *)realloc(s->v, (size_t)nc * sizeof(SyncAcc));
-        if (!nb) return;
+        if (!nb) { s->lost = true; return; }
         s->v = nb; s->cap = nc;
     }
     s->v[s->n++] = a;
 }
 
-typedef struct { Symbol *lock, *acq, *pub; } SyncCtx;
+typedef struct { Symbol *lock, *own_f; uint64_t own_v; Symbol *pub; } SyncCtx;
 /* THREAD: the walk is a thread's body — every access counts. WINDOW: the walk
  * is the function that SPAWNED it, and only the accesses between the spawn and
  * its join count (BEFORE -> IN at the spawn, IN -> AFTER at `handle.join()`). */
@@ -26380,6 +26499,14 @@ typedef struct {
     int rmw_mode;
     Symbol *vol_rmw;          /* THREAD: a volatile global read-modify-written unlocked */
     struct SyncSpawnSite *site;
+    /* BUG-1664, what an IMPLICIT hold needs (zer_flag_store_from): how many
+     * callees deep the walk is, how many loops deep, whether the function
+     * being walked has a label, and the store statement the block walk found
+     * to be the thread's first, unrepeated store. */
+    int fn_depth, loop_depth;
+    bool jump_fn;
+    bool entry_once;          /* the instance's entry function runs at most once */
+    Node *impl_store;
 } SyncWalk;
 typedef struct { Symbol **v; int n, cap; bool direct; } SyncGl;
 static void sync_gl_add(SyncGl *l, Symbol *g) {
@@ -26489,7 +26616,7 @@ static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
         volatile_global_exempt_from_race_check(w->c, g))
         vol_store_note(g, ctx.lock, w->rmw_mode == 1);
     if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
-    SyncAcc a = { g, write, ctx.lock, ctx.acq, ctx.pub };
+    SyncAcc a = { g, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub };
     sync_acc_add(w->out, a);
 }
 /* A thread read-modify-writes volatile `g`: refused outright, as the spawn scan
@@ -26653,14 +26780,150 @@ static int sync_phase_join(int a, int b) {
     return SW_BEFORE;
 }
 static bool sync_seen_same(SyncSeen *a, Symbol *fn, SyncCtx ctx, SyncBind *b, int nb) {
-    if (a->fn != fn || a->nb != nb || a->ctx.lock != ctx.lock || a->ctx.acq != ctx.acq ||
-        a->ctx.pub != ctx.pub) return false;
+    if (a->fn != fn || a->nb != nb || a->ctx.lock != ctx.lock || a->ctx.own_f != ctx.own_f ||
+        (ctx.own_f && a->ctx.own_v != ctx.own_v) || a->ctx.pub != ctx.pub) return false;
     for (int i = 0; i < nb; i++)
         if (a->b[i].g != b[i].g || a->b[i].direct != b[i].direct ||
             a->b[i].decl != b[i].decl || a->b[i].len != b[i].len ||
             memcmp(a->b[i].name, b[i].name, b[i].len) != 0) return false;
     return true;
 }
+/* BUG-1664: may executing this subtree STORE flag `f` — in it, or in a function
+ * it calls? Asked where a hold must end (after a statement, around a loop), so
+ * everything unknown answers YES: the depth cap, a callee on a call cycle, a
+ * function whose body is not ZER. `fn` is the function the subtree is in (it
+ * may bind a name the global scope also has). A `spawn` starts ANOTHER thread:
+ * what that thread stores is its own instance's. Complete — no `default:`. */
+typedef struct { Symbol *fn, *f; int state; } FlagFnMemo;   /* 1 in progress, 2 no, 3 yes */
+static FlagFnMemo *_flag_fn_memo = NULL;
+static int _flag_fn_memo_n = 0, _flag_fn_memo_cap = 0;
+static bool flag_scan(Checker *c, Node *n, Symbol *f, Node *fn, int depth);
+static bool flag_fn_stores(Checker *c, Symbol *fs, Symbol *f, int depth) {
+    if (!fs || !fs->is_function) return true;
+    Node *fd = fs->func_node;
+    if (!fd || fd->kind != NODE_FUNC_DECL) return true;
+    if (!fd->func_decl.body) return false;   /* C: outside the boundary (floor) */
+    for (int i = 0; i < _flag_fn_memo_n; i++)
+        if (_flag_fn_memo[i].fn == fs && _flag_fn_memo[i].f == f)
+            return _flag_fn_memo[i].state != 2;
+    if (_flag_fn_memo_n >= _flag_fn_memo_cap) {
+        int nc = _flag_fn_memo_cap ? _flag_fn_memo_cap * 2 : 32;
+        FlagFnMemo *nb = (FlagFnMemo *)realloc(_flag_fn_memo, (size_t)nc * sizeof(*nb));
+        if (!nb) return true;
+        _flag_fn_memo = nb; _flag_fn_memo_cap = nc;
+    }
+    int at = _flag_fn_memo_n++;
+    _flag_fn_memo[at].fn = fs; _flag_fn_memo[at].f = f; _flag_fn_memo[at].state = 1;
+    DeclModuleSave dm = decl_module_enter(c, fs);
+    bool r = flag_scan(c, fd->func_decl.body, f, fd, depth + 1);
+    decl_module_leave(c, dm);
+    _flag_fn_memo[at].state = r ? 3 : 2;   /* the table may have moved: index, not pointer */
+    return r;
+}
+typedef struct { Symbol *f; int depth; bool hit; } FlagScanUd;
+static bool flag_scan_indirect(Checker *c, Symbol *fn, void *ud) {
+    FlagScanUd *u = (FlagScanUd *)ud;
+    if (flag_fn_stores(c, fn, u->f, u->depth)) u->hit = true;
+    return false;
+}
+static bool flag_scan(Checker *c, Node *n, Symbol *f, Node *fn, int depth) {
+    if (!n) return false;
+    if (depth > 4 * ZER_STMT_NEST_MAX) return true;
+    #define FS(y) flag_scan(c, (y), f, fn, depth + 1)
+    switch (n->kind) {
+    case NODE_INTRINSIC: {
+        static const char *const wr[] = {
+            "atomic_store", "atomic_xchg", "atomic_cas", "atomic_add", "atomic_sub",
+            "atomic_or", "atomic_and", "atomic_xor", "atomic_nand", "atomic_add_fetch",
+            "atomic_sub_fetch", "atomic_or_fetch", "atomic_and_fetch", "atomic_xor_fetch", NULL };
+        if (sync_intrinsic_lock(c, n, wr, fn) == f) return true;
+        for (int i = 0; i < n->intrinsic.arg_count; i++) if (FS(n->intrinsic.args[i])) return true;
+        return false;
+    }
+    case NODE_CALL: {
+        Node *cal = n->call.callee;
+        for (int i = 0; i < n->call.arg_count; i++) if (FS(n->call.args[i])) return true;
+        Symbol *fs = (cal && cal->kind == NODE_IDENT)
+            ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len) : NULL;
+        if (fs && fs->is_function && fn &&
+            fn_binds_name(fn, cal->ident.name, (uint32_t)cal->ident.name_len)) fs = NULL;
+        if (fs && fs->is_function) return flag_fn_stores(c, fs, f, depth);
+        if (!cal) return false;
+        if (FS(cal)) return true;
+        /* an indirect call runs whichever function it designates; a builtin
+         * method designates none */
+        FlagScanUd u = { f, depth, false };
+        indirect_callee_functions_in(c, cal, fn, flag_scan_indirect, &u);
+        return u.hit;
+    }
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++) if (FS(n->block.stmts[i])) return true;
+        return false;
+    case NODE_IF:
+        return FS(n->if_stmt.cond) || FS(n->if_stmt.then_body) || FS(n->if_stmt.else_body);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        return FS(n->while_stmt.cond) || FS(n->while_stmt.body);
+    case NODE_FOR:
+        return FS(n->for_stmt.init) || FS(n->for_stmt.cond) || FS(n->for_stmt.step) ||
+               FS(n->for_stmt.body);
+    case NODE_SWITCH:
+        if (FS(n->switch_stmt.expr)) return true;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (FS(n->switch_stmt.arms[i].body)) return true;
+        return false;
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) if (FS(n->spawn_stmt.args[i])) return true;
+        return false;
+    case NODE_VAR_DECL:  return FS(n->var_decl.init);
+    case NODE_EXPR_STMT: return FS(n->expr_stmt.expr);
+    case NODE_RETURN:    return FS(n->ret.expr);
+    case NODE_CRITICAL:  return FS(n->critical.body);
+    case NODE_DEFER:     return FS(n->defer.body);
+    case NODE_ONCE:      return FS(n->once.body);
+    case NODE_AWAIT:     return FS(n->await_stmt.cond);
+    case NODE_ASSIGN:    return FS(n->assign.target) || FS(n->assign.value);
+    case NODE_BINARY:    return FS(n->binary.left) || FS(n->binary.right);
+    case NODE_UNARY:     return FS(n->unary.operand);
+    case NODE_FIELD:     return FS(n->field.object);
+    case NODE_INDEX:     return FS(n->index_expr.object) || FS(n->index_expr.index);
+    case NODE_SLICE:     return FS(n->slice.object) || FS(n->slice.start) || FS(n->slice.end);
+    case NODE_ORELSE:    return FS(n->orelse.expr) || FS(n->orelse.fallback);
+    case NODE_TYPECAST:  return FS(n->typecast.expr);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (FS(n->struct_init.fields[i].value)) return true;
+        return false;
+    /* raw asm names no ZER global's atomic cell, but its operands are ZER
+     * expressions */
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++)
+            if (FS(n->asm_stmt.inputs[i].expr)) return true;
+        for (int i = 0; i < n->asm_stmt.output_count; i++)
+            if (FS(n->asm_stmt.outputs[i].expr)) return true;
+        return false;
+    case NODE_STATIC_ASSERT: return FS(n->static_assert_stmt.cond);
+    /* declarations never sit inside a body; descended all the same, so the
+     * answer does not depend on that */
+    case NODE_FILE:
+        for (int i = 0; i < n->file.decl_count; i++) if (FS(n->file.decls[i])) return true;
+        return false;
+    case NODE_FUNC_DECL:  return FS(n->func_decl.body);
+    case NODE_INTERRUPT:  return FS(n->interrupt.body);
+    case NODE_GLOBAL_VAR: return FS(n->var_decl.init);
+    /* nothing below these can store: a jump, a leaf, a type declaration */
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD:
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_MMIO: case NODE_CONTAINER_DECL:
+        return false;
+    }
+    #undef FS
+    return true;
+}
+static bool esc_stmt_has_jump(Checker *c, Node *n);   /* a label / goto anywhere in the body */
 /* Walk callee `fs` as part of this instance, its parameters bound to what the
  * arguments point at (BUG-1565 C2). Each (callee, context, bindings) once. */
 static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCtx ctx,
@@ -26680,7 +26943,7 @@ static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCt
             if (nn >= cn) {
                 int nc = cn ? cn * 2 : 8;
                 SyncBind *x = (SyncBind *)realloc(nb, (size_t)nc * sizeof(SyncBind));
-                if (!x) break;
+                if (!x) { if (w->out) w->out->lost = true; break; }
                 nb = x; cn = nc;
             }
             SyncBind b = { pd->name, (uint32_t)pd->name_len, gl.n ? gl.v[j] : NULL, direct, j == 0 };
@@ -26693,13 +26956,19 @@ static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCt
     if (w->nseen >= w->cseen) {
         int nc = w->cseen ? w->cseen * 2 : 8;
         SyncSeen *x = (SyncSeen *)realloc(w->seen, (size_t)nc * sizeof(SyncSeen));
-        if (!x) { free(nb); return; }
+        if (!x) { free(nb); if (w->out) w->out->lost = true; return; }
         w->seen = x; w->cseen = nc;
     }
     SyncSeen sn = { fs, ctx, nb, nn };
     w->seen[w->nseen++] = sn;   /* owns nb */
     int sv_frame = w->frame, sv_n = w->nbind, sv_phase = w->phase;
     Node *sv_fn = w->fnode;
+    /* BUG-1664: a callee is not the instance's entry function, and has its own
+     * labels; an implicit store is the entry function's (the IMPLICIT hold) */
+    bool sv_jump = w->jump_fn;
+    Node *sv_impl = w->impl_store;
+    w->fn_depth++; w->impl_store = NULL;
+    w->jump_fn = esc_stmt_has_jump(w->c, fd->func_decl.body);
     w->frame = w->nbind;
     for (int i = 0; i < nn; i++)
         sync_bind_push(w, nb[i].name, nb[i].len, nb[i].g, nb[i].direct, nb[i].decl);
@@ -26710,6 +26979,7 @@ static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCt
     sync_walk(w, fd->func_decl.body, ctx, depth + 1);
     decl_module_leave(w->c, dm);
     w->frame = sv_frame; w->nbind = sv_n; w->phase = sv_phase; w->fnode = sv_fn;
+    w->fn_depth--; w->jump_fn = sv_jump; w->impl_store = sv_impl;
 }
 typedef struct { SyncWalk *w; Node **args; int nargs; SyncCtx ctx; int depth; } SyncIndUd;
 static bool sync_indirect_visit(Checker *c, Symbol *fn, void *ud) {
@@ -26719,7 +26989,13 @@ static bool sync_indirect_visit(Checker *c, Symbol *fn, void *ud) {
     return false;
 }
 static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
-    if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
+    if (!n) return;
+    /* BUG-1665: past the cap the walk records nothing more. It used to return in
+     * silence — a race behind a call chain some eighty functions deep was
+     * accepted (the spawn scan's own "too deep" finding had been downgraded to a
+     * warning because the thread uses an @atomic). A bounded walk that feeds an
+     * ACCEPT must say it stopped. */
+    if (depth > 4 * ZER_STMT_NEST_MAX) { if (w->out) w->out->lost = true; return; }
     Checker *c = w->c;
     #define SW(y) sync_walk(w, (y), ctx, depth + 1)
     switch (n->kind) {
@@ -26831,44 +27107,89 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
              * region fires inside it: `held` is this block's own.) */
             if (st && st->kind == NODE_DEFER &&
                 !zer_lock_covers_defer(held ? 1 : 0, deferred ? 1 : 0)) sc.lock = ctx.lock;
-            for (int j = i + 1; j < n->block.stmt_count; j++) {
-                Symbol *f = sync_stmt_release_flag(c, n->block.stmts[j], w->fnode);
-                if (f) { sc.pub = f; break; }
+            /* BUG-1664, the IMPLICIT hold: this statement precedes, in this
+             * block, the thread's first store of a flag — and the block runs
+             * once. The store statement itself is marked for the intrinsic arm. */
+            Node *sv_impl = w->impl_store;
+            for (int j = i; j < n->block.stmt_count; j++) {
+                Node *sn = NULL;
+                Symbol *f = sync_stmt_handoff_store(c, n->block.stmts[j], w->fnode, &sn);
+                if (!f) continue;
+                if (zer_flag_store_from(0, (w->fn_depth == 0 && w->entry_once) ? 1 : 0,
+                                        w->loop_depth ? 1 : 0,
+                                        w->jump_fn ? 1 : 0,
+                                        sync_fs_has_flag(w->out, f) ? 1 : 0) == 2) {
+                    if (j == i) w->impl_store = sn;
+                    else if (!sc.pub) sc.pub = f;   /* an enclosing block's stands */
+                }
+                break;
             }
+            /* a `defer` body runs at the block's exit — after whatever this
+             * thread stores in between: it holds nothing the walk can vouch for */
+            if (st && st->kind == NODE_DEFER) { sc.own_f = NULL; sc.pub = NULL; }
             sync_walk(w, st, sc, depth + 1);
-            Symbol *af = sync_stmt_flag_acquire(c, st, w->fnode);
-            if (af) cur.acq = af;
+            w->impl_store = sv_impl;
+            /* the EXPLICIT hold: a wait begins one; a statement that may store
+             * the flag held ends it */
+            Symbol *of = NULL, *wf = NULL; uint64_t ov = 0;
+            if (!w->jump_fn && sync_stmt_observes(c, st, w->fnode, &of, &ov, &wf)) {
+                cur.own_f = of; cur.own_v = ov;
+            } else if (cur.own_f && flag_scan(c, st, cur.own_f, w->fnode, 0)) {
+                cur.own_f = NULL;
+            }
+            sync_want_add(w->out, wf);
         }
         return;
     }
     case NODE_IF: {
         SW(n->if_stmt.cond);
-        SyncCtx tc = ctx;
-        Symbol *f = sync_expr_atomic_flag(c, n->if_stmt.cond, w->fnode, 0);
-        if (f) tc.acq = f;
+        /* BUG-1664: the branch taken is an observation of the flag tested */
+        SyncCtx tc = ctx, ec = ctx;
+        Symbol *of = NULL, *wf = NULL; uint64_t ov = 0;
+        if (!w->jump_fn && sync_cond_observes(c, n->if_stmt.cond, w->fnode, true, &of, &ov, &wf)) {
+            tc.own_f = of; tc.own_v = ov;
+        }
+        if (!w->jump_fn && sync_cond_observes(c, n->if_stmt.cond, w->fnode, false, &of, &ov, NULL)) {
+            ec.own_f = of; ec.own_v = ov;
+        }
+        sync_want_add(w->out, wf);
         int p0 = w->phase;
         sync_walk(w, n->if_stmt.then_body, tc, depth + 1);
         int p1 = w->phase;
         w->phase = p0;
-        SW(n->if_stmt.else_body);
+        sync_walk(w, n->if_stmt.else_body, ec, depth + 1);
         w->phase = sync_phase_join(p1, w->phase);
         return;
     }
     case NODE_WHILE: case NODE_DO_WHILE: {
-        SW(n->while_stmt.cond);
+        /* BUG-1664: a store of the held flag anywhere in the loop reaches every
+         * statement of it on the next turn — such a loop is walked without the
+         * hold (an observation inside it begins a new one) */
+        SyncCtx lc = ctx;
+        if (lc.own_f && flag_scan(c, n, lc.own_f, w->fnode, 0)) lc.own_f = NULL;
+        #define SWL(y) sync_walk(w, (y), lc, depth + 1)
+        w->loop_depth++;
+        SWL(n->while_stmt.cond);
         int p0 = w->phase;
-        SW(n->while_stmt.body);
+        SWL(n->while_stmt.body);
         /* spawned in the body and still live: later iterations run all of it */
-        if (p0 == SW_BEFORE && w->phase == SW_IN) SW(n->while_stmt.body);
+        if (p0 == SW_BEFORE && w->phase == SW_IN) SWL(n->while_stmt.body);
         if (p0 == SW_IN) w->phase = SW_IN;   /* a join in the body may not run */
+        w->loop_depth--;
         return;
     }
     case NODE_FOR: {
-        SW(n->for_stmt.init); SW(n->for_stmt.cond);
+        SyncCtx lc = ctx;
+        if (lc.own_f && flag_scan(c, n, lc.own_f, w->fnode, 0)) lc.own_f = NULL;
+        SWL(n->for_stmt.init);
+        w->loop_depth++;
+        SWL(n->for_stmt.cond);
         int p0 = w->phase;
-        SW(n->for_stmt.body); SW(n->for_stmt.step);
-        if (p0 == SW_BEFORE && w->phase == SW_IN) { SW(n->for_stmt.body); SW(n->for_stmt.step); }
+        SWL(n->for_stmt.body); SWL(n->for_stmt.step);
+        if (p0 == SW_BEFORE && w->phase == SW_IN) { SWL(n->for_stmt.body); SWL(n->for_stmt.step); }
         if (p0 == SW_IN) w->phase = SW_IN;
+        w->loop_depth--;
+        #undef SWL
         return;
     }
     case NODE_SWITCH: {
@@ -26917,15 +27238,17 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_TYPECAST:  SW(n->typecast.expr); return;
     case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++) SW(n->intrinsic.args[i]);
-        /* BUG-1565 (C4): every flag this instance WRITES — a store / RMW /
-         * exchange, not a load — and what it had waited on before */
-        if ((w->phase == SW_THREAD || w->phase == SW_IN) && n->intrinsic.arg_count > 0 &&
-            n->intrinsic.name_len > 7 && memcmp(n->intrinsic.name, "atomic_", 7) == 0 &&
-            !(n->intrinsic.name_len == 11 && memcmp(n->intrinsic.name, "atomic_load", 11) == 0)) {
-            SyncGl gl; memset(&gl, 0, sizeof(gl));
-            sync_value_globals(w, n->intrinsic.args[0], &gl, 0);
-            for (int i = 0; i < gl.n; i++) sync_fw_add(w->out, gl.v[i], ctx.acq);
-            free(gl.v);
+        /* BUG-1664: every store of a flag this instance makes, and the value
+         * its thread holds there (H_sto). The census lists the store SITES; a
+         * site no walk records, or records holding nothing, voids the flag. */
+        if (w->phase == SW_THREAD || w->phase == SW_IN) {
+            static const char *const st[] = { "atomic_store", NULL };
+            Symbol *sf = sync_lock_word(c, n, st, w->fnode);
+            if (sf) {
+                int from = ctx.own_f == sf ? 1 : (w->impl_store == n ? 2 : 0);
+                sync_fs_add(w->out, sf, n, from, from == 1 ? ctx.own_v : 0,
+                            w->fn_depth == 0 && w->loop_depth == 0 && w->entry_once);
+            }
         }
         return;
     case NODE_STRUCT_INIT:
@@ -26992,7 +27315,7 @@ static bool census_indirect_visit(Checker *c, Symbol *fn, void *ud) {
 static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool loop, int depth) {
     if (!n) return;
     /* BUG-1663: past the cap the discipline scan saw nothing — no word is a lock */
-    if (depth > 4 * ZER_STMT_NEST_MAX) { _lock_broken_lost = true; return; }
+    if (depth > 4 * ZER_STMT_NEST_MAX) { _lock_broken_lost = true; _flag_lost = true; return; }
     #define CW(y) census_walk(c, k, (y), caller, loop, depth + 1)
     #define CWL(y) census_walk(c, k, (y), caller, true, depth + 1)
     switch (n->kind) {
@@ -27088,7 +27411,24 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
      * "plain access to 'L' in a concurrent context" — and outside one, the
      * `lock = 0;` before the first spawn, it cannot open a lock anyone holds.
      * Recording it refused that initialisation: measured on the corpus.) */
-    case NODE_ASSIGN:    CW(n->assign.target); CW(n->assign.value); return;
+    case NODE_ASSIGN: {
+        /* BUG-1664: a PLAIN write of an atomic cell (legal only outside a
+         * concurrent context — the atomic-cell rule) must put its initial value
+         * back: any other value is a flag change no thread's hold accounts for */
+        Node *tg = n->assign.target;
+        Symbol *pg = (tg && tg->kind == NODE_IDENT)
+            ? global_decl_lookup(c, tg->ident.name, (uint32_t)tg->ident.name_len) : NULL;
+        if (pg && !pg->is_function && pg->is_atomic_cell &&
+            !(k->fn && fn_binds_name(k->fn, tg->ident.name, (uint32_t)tg->ident.name_len))) {
+            uint64_t pv = 0;
+            if (n->assign.op == TOK_EQ && sync_lit_value(n->assign.value, &pv))
+                flag_store_add(&_flag_plains, &_flag_plain_n, &_flag_plain_cap, pg, n, pv, caller);
+            else
+                flag_break(pg, n, "it is written by a plain statement that does not store "
+                           "a literal");
+        }
+        CW(n->assign.target); CW(n->assign.value); return;
+    }
     case NODE_BINARY:    CW(n->binary.left); CW(n->binary.right); return;
     case NODE_UNARY:
         /* BUG-1663: `&L` anywhere but as the cell operand of an atomic (that
@@ -27102,9 +27442,12 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
             /* a name the function binds itself is its local, not the global */
             bool local = r && r->kind == NODE_IDENT && k->fn &&
                 fn_binds_name(k->fn, r->ident.name, (uint32_t)r->ident.name_len);
-            if (!local)
-                lock_word_break(resolve_write_target_global(c, n->unary.operand, 0), n,
+            if (!local) {
+                Symbol *ag = resolve_write_target_global(c, n->unary.operand, 0);
+                lock_word_break(ag, n,
                                 "its address is taken, so it can be written through a pointer");
+                flag_break(ag, n, "its address is taken, so it can be written through a pointer");
+            }
         }
         CW(n->unary.operand); return;
     case NODE_FIELD:     CW(n->field.object); return;
@@ -27126,6 +27469,25 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
             lock_word_break(aw, n, "it is written atomically outside its acquire test and "
                             "the one release that closes that acquire's region");
         int first = (sync_cell_global(c, n, wr) || sync_cell_global(c, n, ld)) ? 1 : 0;   /* the cell operand */
+        /* BUG-1664: every atomic use of a global word, for the hand-off
+         * discipline — a load, a store of a literal (a store SITE), or an
+         * operation that makes the word no hand-off flag */
+        {
+            static const char *const st[] = { "atomic_store", NULL };
+            Symbol *fg = sync_intrinsic_lock(c, n, wr, k->fn);
+            if (!fg) fg = sync_intrinsic_lock(c, n, ld, k->fn);
+            uint64_t sv = 0;
+            if (fg && !zer_lock_word_ok(sync_cell_ident(n) ? 1 : 0,
+                                        global_is_threadlocal(fg) ? 1 : 0, 0))
+                flag_break(fg, n, "it is not one whole word every thread shares (a field, "
+                           "an element, or threadlocal)");
+            else if (fg && sync_intrinsic_named(n, st) && n->intrinsic.arg_count >= 2 &&
+                     sync_lit_value(n->intrinsic.args[1], &sv))
+                flag_store_add(&_flag_stores, &_flag_store_n, &_flag_store_cap, fg, n, sv, caller);
+            else if (fg && !sync_intrinsic_named(n, ld))
+                flag_break(fg, n, "it is written by an atomic operation other than a store "
+                           "of a literal");
+        }
         for (int i = first; i < n->intrinsic.arg_count; i++) CW(n->intrinsic.args[i]);
         return;
     }
@@ -27212,39 +27574,265 @@ static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line,
     s->binds = bv; s->nbind = total;
 }
 
-/* BUG-1565 (C4): a wait on flag `f` proves the publisher `pub` set it only
- * when nothing else can: no other instance — and no second copy of the
- * publisher — writes `f` except AFTER waiting on `f` itself (a reset or a
- * relay, which happens after a genuine publish and passes its ordering on). */
-static bool sync_flag_forged(Symbol *f, SyncAccSet *pub, SyncAccSet **all, int nall) {
-    for (int i = 0; i < nall; i++) {
-        SyncAccSet *s = all[i];
-        for (int j = 0; j < s->nfw; j++) {
-            if (s->fw[j].f != f || s->fw[j].acq == f) continue;
-            if (s == pub && !s->repeated) continue;
-            return true;
-        }
+/* BUG-1664: which logical thread runs function `fn` — SLT_MAIN, the index of
+ * the one unrepeated spawn that starts it, or SLT_AMBIG (two threads may, a
+ * repeated one, a function used as a value, one nothing in ZER calls). Two
+ * windows of `main` are ONE claimant of a flag value; two threads are two. */
+static int slt_join(int a, int b) {
+    if (a == SLT_NONE) return b;
+    if (b == SLT_NONE) return a;
+    return a == b ? a : SLT_AMBIG;
+}
+static int fn_logical_thread(Checker *c, SyncCensus *k, Symbol *fn, Symbol **stack, int sp) {
+    if (!fn) return SLT_AMBIG;
+    for (int i = 0; i < sp; i++) if (stack[i] == fn) return SLT_NONE;   /* a cycle adds no root */
+    for (int i = 0; i < k->nt; i++) if (k->taken[i] == fn) return SLT_AMBIG;
+    int r = SLT_NONE;
+    if (fn->name_len == 4 && memcmp(fn->name, "main", 4) == 0 && !fn->module_prefix)
+        r = slt_join(r, SLT_MAIN);
+    for (int i = 0; i < c->sync_spawn_count; i++)
+        if (c->sync_spawns[i].target == fn)
+            r = slt_join(r, c->sync_spawns[i].repeated ? SLT_AMBIG : i);
+    stack[sp] = fn;
+    for (int i = 0; i < k->n && r != SLT_AMBIG; i++) {
+        if (k->v[i].callee != fn || !k->v[i].call) continue;   /* a spawn is not a call */
+        r = slt_join(r, k->v[i].caller
+                        ? fn_logical_thread(c, k, k->v[i].caller, stack, sp + 1) : SLT_AMBIG);
     }
+    return sp == 0 && r == SLT_NONE ? SLT_AMBIG : r;
+}
+/* The value an access claims for flag `f`: the one its thread holds explicitly,
+ * else the initial one (an IMPLICIT hold). */
+static bool acc_claims(SyncAcc *a, Symbol *f, uint64_t *v) {
+    if (a->own_f == f) { *v = a->own_v; return true; }
+    if (a->pub == f) return flag_init_value(f, v);
     return false;
 }
-/* Is access `a` (instance `as`) ordered before access `b` (instance `bs`)?
- * Both under one lock, or one released through a flag the other waited on and
- * only its publisher sets. */
-static bool sync_ordered(SyncAcc *a, SyncAccSet *as, SyncAcc *b, SyncAccSet *bs,
+/* The logical thread that stores flag `f` FROM value `v` — the value's owner —
+ * or SLT_NONE when nobody does (a terminal value: every thread that observes it
+ * holds it for good). SLT_AMBIG: more than one does. */
+static int flag_value_owner(Symbol *f, uint64_t v, uint64_t init, SyncAccSet **all, int nall,
+                            bool *repeated) {
+    int lt = SLT_NONE;
+    for (int b = 0; b < nall; b++)
+        for (int x = 0; x < all[b]->nfs; x++) {
+            SyncFS *r = &all[b]->fs[x];
+            if (r->f != f || (r->from == 1 ? r->from_v : init) != v) continue;
+            lt = slt_join(lt, all[b]->lt);
+            if (repeated && all[b]->repeated) *repeated = true;
+        }
+    return lt;
+}
+/* Is the claim of value `v` by an access of instance `s` a HOLD? Of a terminal
+ * value, always; of a value somebody stores from, only for that thread — any
+ * other observer may be holding a value its owner has since handed on. */
+static bool flag_claim_granted(Symbol *f, uint64_t v, SyncAccSet *s, SyncAccSet **all, int nall) {
+    uint64_t u = 0;
+    if (!flag_init_value(f, &u)) return false;
+    int owner = flag_value_owner(f, v, u, all, nall, NULL);
+    return owner == SLT_NONE || (owner != SLT_AMBIG && owner == s->lt);
+}
+/* Does flag `f` keep the hand-off discipline, program-wide? Decided once per
+ * flag; a failure is explained once, at the place that broke it. */
+static struct FlagVerdict { Symbol *f; bool ok, noted; } *_flag_verdicts = NULL;
+static int _flag_verdict_n = 0, _flag_verdict_cap = 0;
+static SyncCensus *_flag_census = NULL;   /* the call graph, while the judgement runs */
+static Symbol **_flag_stack = NULL;
+static void flag_explain(Checker *c, Symbol *f, struct FlagStore *at, const char *why,
+                         int line, const char *file, const char *src) {
+    const char *sf = c->file_name, *ss = c->source;
+    if (at) { line = at->line; file = at->file; src = at->src; }
+    if (file) { c->file_name = file; c->source = src; }
+    checker_warning(c, line,
+        "'%.*s' does not order anything as a hand-off flag: %s. A hand-off flag is one "
+        "global word whose value says which thread may touch the data: a thread takes "
+        "its turn with 'while (@atomic_load(&%.*s) != V) { }' (or inside 'if "
+        "(@atomic_load(&%.*s) == V) { }') and ends it with '@atomic_store(&%.*s, W);'. "
+        "Only the thread that starts — before its first store, made once — may skip the "
+        "wait",
+        (int)f->name_len, f->name, why, (int)f->name_len, f->name,
+        (int)f->name_len, f->name, (int)f->name_len, f->name);
+    c->file_name = sf; c->source = ss;
+}
+static bool handoff_flag_compute(Checker *c, Symbol *f, SyncAccSet **all, int nall) {
+    uint64_t u = 0;
+    struct LockSite *bad = flag_bad_row(f);
+    if (_flag_lost) return false;
+    if (bad) { flag_explain(c, f, NULL, bad->why, bad->line, bad->file, bad->src); return false; }
+    if (!flag_init_value(f, &u)) {
+        flag_explain(c, f, NULL, "its initial value is not a literal", 0, NULL, NULL);
+        return false;
+    }
+    for (int i = 0; i < _flag_plain_n; i++)
+        if (_flag_plains[i].f == f && _flag_plains[i].val != u) {
+            flag_explain(c, f, &_flag_plains[i], "a plain statement stores a value other "
+                         "than its initial one", 0, NULL, NULL);
+            return false;
+        }
+    /* H_sto: every store SITE is met by a thread walk, holding a value, in every
+     * context it is met in; at most one site stores from the initial value
+     * without a wait */
+    Node *impl = NULL;
+    for (int i = 0; i < _flag_store_n; i++) {
+        if (_flag_stores[i].f != f) continue;
+        bool seen = false;
+        for (int a = 0; a < nall; a++) {
+            if (all[a]->lost) return false;
+            for (int j = 0; j < all[a]->nfs; j++) {
+                SyncFS *r = &all[a]->fs[j];
+                if (r->node != _flag_stores[i].node) continue;
+                seen = true;
+                if (r->from == 0) {
+                    flag_explain(c, f, &_flag_stores[i], "this store is made by a thread "
+                        "that does not hold the flag — it has not waited on it since its "
+                        "last store, or it is a first store that can run more than once "
+                        "(in a loop, in a callee, in a function with a label)", 0, NULL, NULL);
+                    return false;
+                }
+                if (r->from == 2) {
+                    if (impl && impl != r->node) {
+                        flag_explain(c, f, &_flag_stores[i], "two stores are made without "
+                            "a wait, and only one thread starts", 0, NULL, NULL);
+                        return false;
+                    }
+                    impl = r->node;
+                }
+            }
+        }
+        if (!seen) {
+            flag_explain(c, f, &_flag_stores[i], "this store is made outside every thread "
+                "and every spawn-to-join window, where nothing says what the flag held",
+                0, NULL, NULL);
+            return false;
+        }
+        /* ... and it must not ALSO run where no walk sees it. A function only
+         * spawned threads reach is walked whole. One the main thread reaches is
+         * walked only between a spawn and its join: a store there must be the
+         * spawning function's own, executed once. (Else `g(); spawn ...` moves
+         * the flag before anything is watching, and the thread that starts no
+         * longer holds its initial value.) */
+        int lt = (_flag_census && _flag_stack && _flag_stores[i].fn)
+            ? fn_logical_thread(c, _flag_census, _flag_stores[i].fn, _flag_stack, 0) : SLT_AMBIG;
+        bool everywhere = lt >= 0;
+        if (lt == SLT_MAIN) {
+            everywhere = true;
+            for (int a = 0; a < nall && everywhere; a++)
+                for (int j = 0; j < all[a]->nfs && everywhere; j++)
+                    if (all[a]->fs[j].node == _flag_stores[i].node && !all[a]->fs[j].single)
+                        everywhere = false;
+        }
+        if (!everywhere) {
+            flag_explain(c, f, &_flag_stores[i], "this store can also run where no thread "
+                "walk sees it — in a function the main thread calls (put it in the function "
+                "that spawns, between the spawn and the join, outside any loop), in one "
+                "more than one thread runs, or in an interrupt handler", 0, NULL, NULL);
+            return false;
+        }
+    }
+    /* H_obs: a value that is stored FROM is stored from by ONE thread, running
+     * once — its owner. (Another thread's observation of that value is simply
+     * not a hold: flag_claim_granted.) */
+    for (int a = 0; a < nall; a++)
+        for (int j = 0; j < all[a]->nfs; j++) {
+            SyncFS *r = &all[a]->fs[j];
+            if (r->f != f) continue;
+            bool rep = false;
+            int lt = flag_value_owner(f, r->from == 1 ? r->from_v : u, u, all, nall, &rep);
+            if (!zer_flag_claim_unique(lt != SLT_NONE && lt != SLT_AMBIG ? 1 : 0, rep ? 1 : 0)) {
+                struct FlagStore *at = NULL;
+                for (int i = 0; i < _flag_store_n; i++)
+                    if (_flag_stores[i].node == r->node) at = &_flag_stores[i];
+                flag_explain(c, f, at, "the value this store hands the flag on from is "
+                    "handed on by more than one thread (or by a thread that is started more "
+                    "than once), so one of them stores while another still holds it",
+                    0, NULL, NULL);
+                return false;
+            }
+        }
+    return true;
+}
+static bool handoff_flag_ok(Checker *c, Symbol *f, SyncAccSet **all, int nall) {
+    for (int i = 0; i < _flag_verdict_n; i++)
+        if (_flag_verdicts[i].f == f) return _flag_verdicts[i].ok;
+    bool ok = handoff_flag_compute(c, f, all, nall);
+    if (_flag_verdict_n >= _flag_verdict_cap) {
+        int nc = _flag_verdict_cap ? _flag_verdict_cap * 2 : 8;
+        struct FlagVerdict *nb = (struct FlagVerdict *)realloc(_flag_verdicts,
+                                                              (size_t)nc * sizeof(*nb));
+        if (!nb) return ok;   /* decided again next time; the answer is the same */
+        _flag_verdicts = nb; _flag_verdict_cap = nc;
+    }
+    _flag_verdicts[_flag_verdict_n].f = f; _flag_verdicts[_flag_verdict_n].ok = ok;
+    _flag_verdicts[_flag_verdict_n].noted = false;
+    _flag_verdict_n++;
+    return ok;
+}
+/* An access relies on having SEEN value `v` of a sound flag, and `v` is another
+ * thread's to hand on: say so once, at that thread's store — otherwise the user
+ * reads only "no flag ordering them" about a wait they wrote. (The usual cause:
+ * a wait with the wrong polarity, satisfied by the value the flag starts with.) */
+static void flag_note_ungranted(Checker *c, Symbol *f, uint64_t v, SyncAccSet **all, int nall) {
+    uint64_t u = 0;
+    if (!handoff_flag_ok(c, f, all, nall) || !flag_init_value(f, &u)) return;
+    for (int i = 0; i < _flag_verdict_n; i++) {
+        if (_flag_verdicts[i].f != f) continue;
+        if (_flag_verdicts[i].noted) return;
+        _flag_verdicts[i].noted = true;
+    }
+    for (int a = 0; a < nall; a++)
+        for (int j = 0; j < all[a]->nfs; j++) {
+            SyncFS *r = &all[a]->fs[j];
+            if (r->f != f || (r->from == 1 ? r->from_v : u) != v) continue;
+            for (int i = 0; i < _flag_store_n; i++) {
+                if (_flag_stores[i].node != r->node) continue;
+                const char *sf = c->file_name, *ss = c->source;
+                if (_flag_stores[i].file) {
+                    c->file_name = _flag_stores[i].file; c->source = _flag_stores[i].src;
+                }
+                checker_warning(c, _flag_stores[i].line,
+                    "another thread relies on having seen '%.*s' hold %llu — the value "
+                    "this store hands the flag on FROM. Seeing it gives no turn: it is "
+                    "what the flag holds before this thread is done. Wait for the value "
+                    "this store PUTS ('while (@atomic_load(&%.*s) != %llu) { }')",
+                    (int)f->name_len, f->name, (unsigned long long)v,
+                    (int)f->name_len, f->name, (unsigned long long)_flag_stores[i].val);
+                c->file_name = sf; c->source = ss;
+                return;
+            }
+        }
+}
+/* Is access `a` ordered with access `b`? Both under one lock, or made under two
+ * DIFFERENT held values of one flag that keeps the hand-off discipline. */
+/* Are the two accesses made under two different HELD values of flag `f`? */
+static bool sync_flag_orders(Checker *c, Symbol *f, SyncAcc *a, SyncAccSet *as, SyncAcc *b,
+                             SyncAccSet *bs, SyncAccSet **all, int nall) {
+    uint64_t va, vb;
+    if (!f || !acc_claims(a, f, &va) || !acc_claims(b, f, &vb)) return false;
+    if (!flag_claim_granted(f, va, as, all, nall)) { flag_note_ungranted(c, f, va, all, nall); return false; }
+    if (!flag_claim_granted(f, vb, bs, all, nall)) { flag_note_ungranted(c, f, vb, all, nall); return false; }
+    return zer_flag_orders(handoff_flag_ok(c, f, all, nall) ? 1 : 0, va != vb ? 1 : 0) != 0;
+}
+static bool sync_ordered(Checker *c, SyncAcc *a, SyncAccSet *as, SyncAcc *b, SyncAccSet *bs,
                          SyncAccSet **all, int nall) {
     if (a->lock && a->lock == b->lock) return true;
-    if (a->pub && a->pub == b->acq && !sync_flag_forged(a->pub, as, all, nall)) return true;
-    if (b->pub && b->pub == a->acq && !sync_flag_forged(b->pub, bs, all, nall)) return true;
+    if (sync_flag_orders(c, a->own_f, a, as, b, bs, all, nall)) return true;
+    if (a->pub != a->own_f && sync_flag_orders(c, a->pub, a, as, b, bs, all, nall)) return true;
+    /* not ordered: if a flag either side relies on is broken, say why (once) */
+    if (a->own_f) (void)handoff_flag_ok(c, a->own_f, all, nall);
+    if (a->pub) (void)handoff_flag_ok(c, a->pub, all, nall);
+    if (b->own_f) (void)handoff_flag_ok(c, b->own_f, all, nall);
+    if (b->pub) (void)handoff_flag_ok(c, b->pub, all, nall);
     return false;
 }
 /* The first global two access sets touch with at least one write and no
  * ordering between the two accesses, or NULL. */
-static Symbol *sync_sets_conflict(SyncAccSet *a, SyncAccSet *b, SyncAccSet **all, int nall) {
+static Symbol *sync_sets_conflict(Checker *c, SyncAccSet *a, SyncAccSet *b,
+                                  SyncAccSet **all, int nall) {
     for (int i = 0; i < a->n; i++)
         for (int j = 0; j < b->n; j++) {
             SyncAcc *x = &a->v[i], *y = &b->v[j];
             if (x->g != y->g || (!x->write && !y->write)) continue;
-            if (!sync_ordered(x, a, y, b, all, nall)) return x->g;
+            if (!sync_ordered(c, x, a, y, b, all, nall)) return x->g;
         }
     return NULL;
 }
@@ -27263,7 +27851,7 @@ static void sync_window_callers(Checker *c, SyncCensus *k, Symbol *encl, SyncAcc
     if (!q) return;
     int qn = 0;
     q[qn++] = encl;
-    SyncCtx none = { NULL, NULL, NULL };
+    SyncCtx none = { NULL, NULL, 0, NULL };
     for (int qi = 0; qi < qn; qi++) {
         Symbol *f = q[qi];
         for (int i = 0; i < k->n; i++) {
@@ -27277,6 +27865,9 @@ static void sync_window_callers(Checker *c, SyncCensus *k, Symbol *encl, SyncAcc
                 w.c = c; w.out = out; w.phase = SW_BEFORE; w.spawn = cs->call;
                 w.fnode = cl->func_node;
                 w.rmw_mode = 2;   /* BUG-1652 */
+                /* BUG-1664: a caller is not known to run once — no IMPLICIT hold */
+                w.fn_depth = 1;
+                w.jump_fn = esc_stmt_has_jump(c, cl->func_node->func_decl.body);
                 DeclModuleSave dm = decl_module_enter(c, cl);
                 sync_walk(&w, cl->func_node->func_decl.body, none, 0);
                 decl_module_leave(c, dm);
@@ -27308,6 +27899,8 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     SyncCensus k;
     memset(&k, 0, sizeof(k));
     _lock_broken_n = 0; _lock_acq_n = 0; _lock_broken_lost = false;   /* BUG-1663: one program per run */
+    _flag_store_n = 0; _flag_plain_n = 0; _flag_bad_n = 0; _flag_lost = false;   /* BUG-1664 */
+    _flag_verdict_n = 0; _flag_fn_memo_n = 0;
     for (int fi = 0; fi < count; fi++) {
         Node *fn = files[fi].ast;
         if (!fn || fn->kind != NODE_FILE) continue;
@@ -27354,7 +27947,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     SyncAccSet *win = (SyncAccSet *)calloc((size_t)n, sizeof(SyncAccSet));
     SyncWalk *ww = (SyncWalk *)calloc((size_t)n, sizeof(SyncWalk));
     if (!thr || !win || !ww) { free(thr); free(win); free(ww); free(k.v); free(k.taken); return; }
-    SyncCtx none = { NULL, NULL, NULL };
+    SyncCtx none = { NULL, NULL, 0, NULL };
     Symbol **stack = (Symbol **)calloc((size_t)k.n + 1, sizeof(Symbol *));
     for (int i = 0; i < n; i++) {
         struct SyncSpawnSite *s = &c->sync_spawns[i];
@@ -27366,6 +27959,8 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             SyncWalk tw;
             memset(&tw, 0, sizeof(tw));
             tw.c = c; tw.out = &thr[i]; tw.phase = SW_THREAD; tw.fnode = t->func_node;
+            tw.jump_fn = esc_stmt_has_jump(c, t->func_node->func_decl.body);   /* BUG-1664 */
+            tw.entry_once = stack && census_instances(c, &k, t, stack, 0) < 2;
             tw.late_seq = s->seq + 1;   /* BUG-1649 (0 = unarmed) */
             tw.rmw_mode = 1; tw.site = s;   /* BUG-1652 */
             /* the target's params, bound to what the spawn handed them */
@@ -27420,6 +28015,8 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
         }
         if (e && e->func_node && e->func_node->kind == NODE_FUNC_DECL) {
             ww[i].fnode = e->func_node;
+            ww[i].jump_fn = esc_stmt_has_jump(c, e->func_node->func_decl.body);   /* BUG-1664 */
+            ww[i].entry_once = stack && !s->repeated && census_instances(c, &k, e, stack, 0) < 2;
             DeclModuleSave dm = decl_module_enter(c, e);
             sync_walk(&ww[i], e->func_node->func_decl.body, none, 0);
             decl_module_leave(c, dm);
@@ -27427,6 +28024,10 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
         if (e && s->spawn && !s->spawn->spawn_stmt.handle_name)
             sync_window_callers(c, &k, e, &win[i]);
         thr[i].repeated = win[i].repeated = s->repeated;
+        /* BUG-1664: who runs each — the thread this spawn starts, and whichever
+         * thread runs the function that spawns it */
+        thr[i].lt = s->repeated ? SLT_AMBIG : i;
+        win[i].lt = stack ? fn_logical_thread(c, &k, e, stack, 0) : SLT_AMBIG;
     }
     /* An interrupt handler writing a hand-off flag forges it as much as a
      * thread does (C4); its accesses are the ISR rules', only its flag writes
@@ -27453,6 +28054,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             sync_walk(&iw, d->interrupt.body, none, 0);
             sync_walk_free(&iw);
             isr[ni].repeated = true;
+            isr[ni].lt = SLT_AMBIG;
             ni++;
         }
     }
@@ -27462,6 +28064,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     for (int i = 0; i < n && all; i++) { all[nall++] = &thr[i]; all[nall++] = &win[i]; }
     for (int i = 0; i < ni && all; i++) all[nall++] = &isr[i];
     bool *done = (bool *)calloc((size_t)n, sizeof(bool));
+    _flag_census = &k; _flag_stack = stack;   /* BUG-1664: for handoff_flag_ok */
     for (int i = 0; i < n && done && all; i++) {
         struct SyncSpawnSite *s = &c->sync_spawns[i];
         Symbol *g = NULL;
@@ -27471,10 +28074,28 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
          * was handed: its own copies and its parent are the scoped-borrow
          * rules' (BUG-969/1118); here it only meets a downgraded thread. */
         bool ffg = s->spawn && !s->spawn->spawn_stmt.handle_name;
+        /* BUG-1665: an incomplete walk orders nothing */
+        bool lost = s->downgraded && (thr[i].lost || win[i].lost);
+        for (int j = 0; j < n && !lost; j++)
+            lost = j != i && (s->downgraded || c->sync_spawns[j].downgraded) && thr[j].lost &&
+                   !sync_seq_has(&ww[i], c->sync_spawns[j].spawn) &&
+                   !sync_seq_has(&ww[j], s->spawn);
+        if (lost && !done[i]) {
+            done[i] = true;
+            c->file_name = s->file; c->source = s->source;
+            checker_error(c, s->line,
+                "spawn target '%.*s' touches non-shared globals, and the code it (or a "
+                "thread beside it) runs could not be followed to the end — a call chain "
+                "deeper than the analysis walks. What lies beyond cannot be shown ordered "
+                "against the other thread, and an @atomic_* / @barrier elsewhere does not "
+                "order it. Shorten the chain, or keep the data in a shared struct",
+                (int)s->target->name_len, s->target->name);
+            continue;
+        }
         if (s->downgraded && s->repeated &&
-            (g = sync_sets_conflict(&thr[i], &thr[i], all, nall))) {
+            (g = sync_sets_conflict(c, &thr[i], &thr[i], all, nall))) {
             why = "is started more than once, and its copies";
-        } else if (s->downgraded && (g = sync_sets_conflict(&thr[i], &win[i], all, nall))) {
+        } else if (s->downgraded && (g = sync_sets_conflict(c, &thr[i], &win[i], all, nall))) {
             why = ffg ? "and the code that runs after it was started (in the function that "
                         "spawned it, or in any caller after that function returns)"
                       : "and the code that spawned it (between the spawn and the join)";
@@ -27483,7 +28104,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
                 if (!s->downgraded && !c->sync_spawns[j].downgraded) continue;
                 if (sync_seq_has(&ww[i], c->sync_spawns[j].spawn) ||
                     sync_seq_has(&ww[j], s->spawn)) continue;   /* joined before */
-                if ((g = sync_sets_conflict(&thr[i], &thr[j], all, nall))) {
+                if ((g = sync_sets_conflict(c, &thr[i], &thr[j], all, nall))) {
                     other = c->sync_spawns[j].target;
                     why = "and spawn target";
                     break;
@@ -27492,6 +28113,20 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
         }
         if (!g || done[i]) continue;
         done[i] = true;
+        /* BUG-1664: a word one of these waited on like a hand-off flag, and
+         * that is not one — say why, once */
+        for (int q = 0; q < 3; q++) {
+            SyncAccSet *ws = q == 0 ? &thr[i] : q == 1 ? &win[i] : NULL;
+            if (q == 2)
+                for (int j = 0; j < n; j++)
+                    if (other && c->sync_spawns[j].target == other) { ws = &thr[j]; break; }
+            for (int x = 0; ws && x < ws->nwant; x++) {
+                struct LockSite *bad = flag_bad_row(ws->want[x]);
+                if (!bad || bad->noted) continue;
+                bad->noted = true;
+                flag_explain(c, ws->want[x], NULL, bad->why, bad->line, bad->file, bad->src);
+            }
+        }
         c->file_name = s->file; c->source = s->source;
         if (other)
             checker_error(c, s->line,
@@ -27517,11 +28152,13 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
                 (int)g->name_len, g->name);
     }
     c->file_name = sv_fn; c->source = sv_src;
+    _flag_census = NULL; _flag_stack = NULL;
     for (int i = 0; i < n; i++) {
-        free(thr[i].v); free(win[i].v); free(thr[i].fw); free(win[i].fw);
+        free(thr[i].v); free(win[i].v); free(thr[i].fs); free(win[i].fs);
+        free(thr[i].want); free(win[i].want);
         sync_walk_free(&ww[i]);
     }
-    for (int i = 0; i < ni; i++) { free(isr[i].v); free(isr[i].fw); }
+    for (int i = 0; i < ni; i++) { free(isr[i].v); free(isr[i].fs); free(isr[i].want); }
     free(thr); free(win); free(ww); free(done); free(k.v); free(k.taken); free(stack);
     free(all); free(isr);
 }

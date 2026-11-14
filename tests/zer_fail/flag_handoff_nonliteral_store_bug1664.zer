@@ -1,0 +1,14 @@
+// expect-error: other than a store of a literal
+// BUG-1664: the stored value is not a literal: nothing says which value the flag takes, so no wait can be matched to it.
+u32 ready;
+u32 data;
+u32 sink;
+u32 one = 1;
+void writer() { data = 1; @atomic_store(&ready, one); }
+void reader() { while (@atomic_load(&ready) == 0) { } sink = data; }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

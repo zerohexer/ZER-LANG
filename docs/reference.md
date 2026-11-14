@@ -6991,6 +6991,28 @@ u32 main() {
 }
 ```
 
+**What counts as a flag hand-off (BUG-1664).** The flag is a TOKEN: its value says which
+thread may touch the data. A thread HOLDS a value from the moment it has seen the flag
+hold it until its own next store of the flag, and two plain accesses are ordered when they
+are made under two DIFFERENT held values of one flag.
+- *Taking a turn:* `while (@atomic_load(&F) != V) { }` (afterwards the thread holds `V`), or
+  the branch of `if (@atomic_load(&F) == V) { … } else { … }` that proves a value. For a
+  flag with exactly two values, `while (@atomic_load(&F) == 0) { }` proves the other one.
+  The loop must have no `break` and the comparison must be the whole condition.
+- *Ending it:* `@atomic_store(&F, W);` — after it the thread holds nothing: touching the
+  data again needs a new wait. A loop or a call that may store the flag ends the hold too.
+- *Starting:* the one thread that holds the flag's INITIAL value may skip the wait — up to
+  its first store, which must run once: in the thread's entry function (or in the spawning
+  function, between the spawn and the join), outside every loop, in a function with no label.
+- *The flag:* one global word every thread shares; only `@atomic_load` and `@atomic_store`
+  of a literal touch it; its address is not taken; a plain `F = <initial value>;` is allowed
+  where no thread runs. Each value that is stored FROM is handed on by one thread, started
+  once.
+A reader that waits for the value the flag STARTS with (`while (@atomic_load(&ready) != 0)
+{ }`) has seen nothing; a writer that publishes in a loop writes the data while the reader
+reads it — both are compile errors, and a warning at the store says which rule broke. A
+ping-pong (each side waits for its own value and stores the other's) may loop for ever.
+
 ### Condvar — Thread Synchronization
 ```zer
 shared struct Queue { u32 count; }

@@ -1,0 +1,16 @@
+// GAP (2026-11-14, docs/limitations.md section B): a write through a pointer a CALL
+// returned. `*getp() += 1` and `*u32 q = getp(); *q += 1;` both write the global `g`, and
+// the context walk attributes neither to it. The spawn scan's finding is downgraded to a
+// warning because each thread uses an @atomic (ThreadSanitizer: data race on `g`).
+// Compile-clean IS the gap.
+u32 flagx;
+u32 g;
+*u32 getp() { return &g; }
+void w() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { *getp() += 1; } }
+void w2() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { *u32 q = getp(); *q += 1; } }
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w2();
+    a.join(); b.join();
+    return 0;
+}

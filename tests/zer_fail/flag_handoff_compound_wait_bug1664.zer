@@ -1,0 +1,14 @@
+// expect-error: no release/acquire flag ordering them
+// BUG-1664: `while (load == 0 && n < 5)` can end because of `n`: leaving it observes nothing.
+u32 ready;
+u32 data;
+u32 sink;
+u32 lim;
+void writer() { data = 1; @atomic_store(&ready, 1); }
+void reader() { u32 n = 0; while (@atomic_load(&ready) == 0 && n < 5) { n += 1; } sink = data; }
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

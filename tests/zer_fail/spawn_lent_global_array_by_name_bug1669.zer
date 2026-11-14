@@ -1,0 +1,14 @@
+// expect-error: lends that parameter to a scoped spawn while it touches 'garr' by name
+// BUG-1669: the lend-versus-global half of the same rule (BUG-1645). `lend(garr)` passes the global array
+// as a slice; `lend` gives it to a thread and writes `garr` by name before the join.
+u32[4] garr;
+void child([*]u32 q) { for (u32 r = 0; r < 100000; r += 1) { q[0] += 1; } }
+void lend([*]u32 s) {
+    ThreadHandle t = spawn child(s);
+    for (u32 r = 0; r < 100000; r += 1) { garr[0] += 1; }
+    t.join();
+}
+i32 main() {
+    lend(garr);
+    return 0;
+}

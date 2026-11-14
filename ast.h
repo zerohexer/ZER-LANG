@@ -426,6 +426,10 @@ struct Node {
             const char *section;    /* section(".rodata") or NULL */
             size_t section_len;
             bool is_synthetic;      /* parser-emitted (desugaring); bypasses reserved-prefix check */
+            /* BUG-1668: the checker's annotation on a `static` LOCAL — its Symbol.
+             * A static local is one object for every execution of its function and
+             * has no global name; the concurrency walk keys its accesses by this. */
+            struct Symbol *static_sym;
         } var_decl;
 
         /* NODE_BLOCK: { stmts... } */

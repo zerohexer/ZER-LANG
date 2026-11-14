@@ -8819,6 +8819,21 @@ every body) and checked against what the context walks RECORDED — a site no wa
 met without a hold, voids the flag — and "the walk saw everything" was itself false past
 the depth cap (BUG-1665: a bounded walk feeding an ACCEPT must mark its result incomplete).
 
+**11o. The context walk's access records (BUG-1666..1668).** A record is Named(global) or
+Typed(pointee type); `sync_record_place` makes one per DEREFERENCE STEP of a place (the
+step nearest the leaf carries the write, deeper ones are loads), and `sync_ref_unknown`
+decides whether the reference at that step is known. Three traps. (1) A local's class is
+computed at its declaration over the WHOLE function (`ast_name_writes` for a reference,
+`_parts` for an aggregate): the walk visits statements in source order, and the write
+that re-aims the pointer may sit later in the loop body than the access. (2) Names resolve
+through `sync_ident_global`, never `global_decl_lookup`: a `static` local is program-wide
+storage under a local name (a `self` binding, from the checker's `var_decl.static_sym`
+annotation), and a struct / enum NAME is not memory although it has a symbol. (3) The
+checker has REWRITTEN the tree by the time the walk runs: `alloc(T)` is `T.alloc_ptr()`,
+`free(p)` is `T.free_ptr(p)`, `x orelse return` has no fallback node, only a flag — a
+recogniser written against the source spelling matches nothing (measured: the own-heap
+rule recognised no allocation at all until it read the flags).
+
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key
 built from `&tbl[i]` names a different slot per evaluation and re-broke the valid teardown

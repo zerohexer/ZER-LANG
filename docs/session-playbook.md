@@ -876,6 +876,26 @@ next hour (BUG-1664), and its grid shows 95 accepted races on the compiler befor
 (4) a rule that says "the walk sees every X" must be checked against the walk's own caps —
 asking that found BUG-1665.
 
+**A model certifies the JUDGEMENT; what was never written down has no theorem to fail
+(BUG-1666..1669, 2026-11-14).** `access_alias.v` proves that two overlapping accesses with
+sound records have records that may alias. Three of the four holes closed with it were
+not about that at all: a container method (`pool.alloc()`), a `static` local and an array
+argument were accesses — or aliases — that produced NO record, so the comparison never
+ran. They were found the cheap way, while writing the POSITIVE tests: the own-heap
+positive needed `alloc(Node)` in two threads, and that was accepted where it should not
+have been; the "callee handed the thread's own stack" positive needed an array argument.
+So: (1) for every construct a new positive USES — an allocator call, a static, an
+implicit coercion, a builtin method — write its two-thread negative before believing the
+positive; (2) "which constructs touch memory without naming it in an assignment or an
+identifier read?" is a list nobody maintains — when a walk's records feed an ACCEPT, that
+list is a hypothesis of the model, and the honest statement is "sound over the accesses
+recorded"; (3) the first safety net (here the spawn scan's outright refusal) hides the
+second net's holes until something downgrades the first — probe with the downgrade ON.
+A fourth lesson is mechanical: by the time a post-pass walks the tree the checker has
+REWRITTEN it (`alloc(T)` is `T.alloc_ptr()`, `orelse return` is a flag with no fallback
+node). A recogniser written against the source spelling compiled, ran, and matched
+nothing; one trace line showed it (rule 8 — verify the edit RUNS).
+
 **THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
 precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by
 Rice: the true set "memory-safe on every execution" is undecidable, so no sound,

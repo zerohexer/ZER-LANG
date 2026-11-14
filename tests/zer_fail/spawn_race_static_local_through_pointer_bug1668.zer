@@ -1,0 +1,16 @@
+// expect-error: both access static local 'cell'
+// BUG-1668: the static local reached through a pointer handed to a callee (`inc(&cell)`): the address of
+// a static is the address of program-wide storage, not of the thread's stack.
+u32 flagx;
+void inc(*u32 p) { *p += 1; }
+void w() {
+    @atomic_store(&flagx, 1);
+    static u32 cell;
+    for (u32 r = 0; r < 100000; r += 1) { inc(&cell); }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

@@ -1,0 +1,16 @@
+// expect-error: both access static local 'cnt'
+// BUG-1668: a `static` local is ONE object for every thread that runs its function. The spawn scan knows
+// it (BUG-971); the context walk that judges a thread using an @atomic bound it like any other local —
+// the walking thread's own — and recorded nothing. TSan: data race on the pre-fix compiler.
+u32 flagx;
+void w() {
+    @atomic_store(&flagx, 1);
+    static u32 cnt;
+    for (u32 r = 0; r < 100000; r += 1) { cnt += 1; }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

@@ -116,6 +116,16 @@ Each item was run on the build that carries BUG-1658..1661. None is accept-unsaf
    `docs/limitations-closed.md`, "[ARCHIVED 2026-11-14] OPEN — BRANCH
    `loving-davinci-ii7a90`", sections L and M.
 
+## OPEN — a `static` LOCAL Pool or Ring emits C that GCC refuses (2026-11-14, LOW — loud, valid program refused)
+
+`u32 f() { static Pool(N, 4) sp; … }` passes the checker ("Pool / Ring / Slab / Arena must
+be global or static") and GCC then reports `variable 'sp' has initializer but incomplete
+type`: the struct for a Pool / Ring stamp is emitted from the GLOBAL declarations, and a
+static local's stamp has no definition before the function. A static-local Slab or Arena
+builds. Measured while writing the BUG-1668 grid (whose static-Pool cells are therefore
+checker-only). Fix sketch: collect the stamps of static locals in the same pre-pass that
+collects the globals'. Until then declare the Pool / Ring at file scope.
+
 ## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1643; measured, reproducers in `tests/zer_gaps/`)
 
 Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
@@ -192,7 +202,9 @@ each a missing SUMMARY fact, not a missing key:
 4. [residual of: A helper lends its pointer param and touches the same global by NAME — closed by BUG-1645, BUG-1646]
    **Residual (precision, loud):** the pair is keyed on the
    ROOT object, so two arguments naming DISJOINT fields of one struct (`sp(&t.x, &t.y)`) are
-   refused as "both reach 't'"; a field-path disjointness test would recover it.
+   refused as "both reach 't'"; a field-path disjointness test would recover it. (An array
+   handed to a slice parameter is rooted the same way since BUG-1669: two array FIELDS of
+   one struct are "both reach" it.)
 
 7. [residual of: ISR split read-modify-write through MEMORY — closed by BUG-1650]
    **Residuals:** (a) the global carrier relation is flow-INSENSITIVE, so `mem = g; mem = 0;
@@ -246,44 +258,54 @@ each a missing SUMMARY fact, not a missing key:
    **Not derived:** that the list of statements which sit lexically in a region and do
    not run in it (a `defer` body, the spin body) is complete — it was found by probing.
 
-11. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; every baseline
-   accepts it): an access through a pointer the context walk cannot NAME.** When a thread
-   uses any `@atomic_*` / `@barrier`, the spawn scan's "touches a non-shared global"
-   finding is a warning and the context walk judges each access against the other
-   threads'. The walk has three answers for where a reference points — KNOWN globals
-   (recorded), the thread's OWN STACK (private), and UNKNOWN — and treats unknown as
-   private. Eight measured shapes, one executed reproducer each in `tests/zer_gaps/`
-   (`spawn_race_*`; two threads, two warnings, a data race):
-   - *unknown, taken for private:* a pointer loaded out of memory and bound to a new name
-     (`…through_loaded_pointer`), returned by a call (`…through_returned_pointer`),
-     planted in a local struct by a callee (`…local_struct_filled_by_callee`) or in a
-     local pointer through a pointer to it (`…pointer_to_local_pointer`), or assigned
-     LATER in the loop than the access (`…pointer_reassigned_in_loop` — bindings are read
-     in source order);
-   - *known, keyed by the wrong name:* two global pointers to one heap object
-     (`…two_pointers_one_object`), two Handles for one pool slot
-     (`…two_handles_one_slot` — a Handle dereference is not recorded as an access to its
-     Pool), a global struct's pointer field against the global it points at
-     (`…global_struct_pointer_vs_name`).
-   (A never-reassigned global pointer used by name, `**gpp`, a view slice, two threads
-   through the SAME global struct or Handle ARE caught: measured.)
-   **Design of the fix, measured but not built.** (i) A local's class must be
-   flow-INSENSITIVE: its declaration plus every write of the name or of part of it
-   anywhere in the function, and its address being taken — `ast_name_writes_parts` is that
-   walk; a name bound more than once is unknown. (ii) A dereference through a GLOBAL must
-   record what the global may hold (the enumerating resolver `for_each_write_target_ex`,
-   not the single-answer `resolve_write_target_global` the walk uses), and that resolver
-   needs a "could not follow" answer. (iii) A Handle dereference records its allocator
-   (`field.handle_alloc`). (iv) What remains unknown makes the access set INCOMPLETE, as
-   the depth cap does (BUG-1665): an incomplete set of such a thread is an error. A
-   scratch build of (iii) + (iv) with a source-ordered (i) rejects five of the eight shapes
-   and changes NO other verdict in the corpus (4,000 files) — the cost of being strict is
-   small, and threads that use no `@atomic` are already held to "touch no non-shared
-   global at all". The payable over-rejection afterwards: an access through an unknown
-   pointer under a lock every writer holds (key such accesses by pointee TYPE instead of
-   refusing them), and a thread's own never-published heap object. Until it is built:
-   reach shared data by name or by index, not through a pointer fetched at run time, or
-   keep it in a `shared struct`.
+11. [residual of: an access through a pointer the context walk cannot NAME — closed by BUG-1666]
+   **Residuals (over-rejections, loud — the error says "memory of type 'T' reached through
+   a reference the compiler cannot name"):**
+   - *keyed by TYPE.* An access through an unknown reference is recorded as "some object
+     of the pointee type". Two threads each working on ITS OWN object of one type, through
+     pointers fetched at run time, are refused unless one lock (or a hand-off) covers both;
+     and such an access meets any unordered access of a global whose type CONTAINS that
+     type.
+   - *what is unknown:* a call's result; a pointer loaded from memory behind a reference or
+     out of a global; a capture (`|v|`); a name the function binds twice; a name whose
+     address is taken; a mutable global pointer; a static-local reference; every local of a
+     function containing inline asm, a `static_assert` or a cast node the write walk does
+     not see into.
+   - *the own-heap rule is name-local.* A fresh `alloc` is the thread's own only while its
+     reference never leaves the name it was FIRST bound to: handing the buffer to a helper
+     (`fill(buf)`), copying it, unwrapping it in two steps (`?*T m = alloc(T); *T n = m
+     orelse return;` — bind directly, `*T n = alloc(T) orelse return;`), returning it,
+     `&buf[i]`, a sub-slice, an array field read as a value all make it unknown. The
+     payable part is a callee whose parameter is not `keep` and whose result carries no
+     reference (`keep_value_roots` is the query); it needs the publish model extended to
+     calls first.
+   - *a thread's own LOCAL Arena.* Objects carved from it are unknown. Design: `Arena.over(x)`
+     points where `x` does and `a.alloc(T)` where `a` does, through the existing bindings.
+   - *an allocator call is a write of the whole allocator*, so it meets an access through
+     an unknown pointer to one of its objects made outside the allocator's lock — although
+     the call rewrites only bookkeeping and the slot it hands out. (A third record kind,
+     "bookkeeping only", would recover it.)
+   - *a view formed outside the lock* (`[*]u32 s = garr; LOCK; s[0] += 1; UNLOCK;`) counts
+     as an unlocked READ of the array, for a global and a static local alike, on every
+     compiler measured; `&garr[0]` does not. Form the view inside the region.
+   **By fiat, not modelled:** a union contains every variant; an Arena contains anything,
+   and in a program with an arena-backed buffer a byte access aliases every typed record.
+   **Not derived:** that the syntactic classification — known, unknown,
+   fresh-and-never-leaves — is right on every execution. Argued at the checks and gated by
+   the "pointer reach" and "own heap" grids. Privacy of the STACK rests on the
+   scoped-borrow rules and the escape analysis; of the heap, on zercheck's use-after-free
+   rule (the model has no `free`).
+
+12. [residual of: a builtin container method was recorded as a READ of its receiver — closed by BUG-1667]
+   **Residuals (loud):** `get` is the one method recorded as a read. A Ring shared by a
+   pushing thread and a popping thread is refused unless both hold one lock — correctly:
+   the emitted `count` is a plain field both sides rewrite, so the Ring is single-CORE
+   (ISR and main) safe, not two-thread safe.
+
+13. [residual of: a `static` local was the walking thread's own — closed by BUG-1668]
+   **Residuals (over-rejections, loud):** a static local cannot be a spin-lock word or a
+   hand-off flag (both recognisers are keyed by global), so data guarded by one is
+   refused; a static-local reference is always unknown.
 
 **B2. Proof status of the data-race class (2026-11-14 — read before claiming "proven").**
 What is machine-checked, and where the chain stops:
@@ -319,6 +341,18 @@ What is machine-checked, and where the chain stops:
   republished flag, a forged store, a second claimant, a wait satisfied by the initial
   value). `proofs/vst/verif_handoff_rules.v` (in `make check-vst`): the C of the four
   extracted hand-off decisions equals its `_coq` definition.
+- `access_alias.v` (plain Coq, zero admits, no axioms; in `make check-proofs`): WHAT AN
+  ACCESS TOUCHES. Memory is typed objects, an access a path in one; a record is "inside
+  global g" or "inside some object of type t". Two overlapping accesses with sound
+  records have records that MAY ALIAS (`overlap_may_alias`), so judging every may-aliasing
+  pair misses no overlapping pair; each way of may-aliasing is realised (three necessity
+  theorems) and unrelated records do not alias. A local written only by its listed
+  assignments holds one of the listed values (`local_value_listed`; one foreign write and
+  it need not). A FRESH object its thread never publishes is used by that thread alone
+  (`fresh_stays_own`); one publication and any thread may use it (`published_is_shared`).
+  `proofs/vst/verif_alias_rules.v` (in `make check-vst`): the C of the four extracted
+  decisions (`zer_access_may_alias`, `zer_local_ref_known`, `zer_global_ref_known`,
+  `zer_fresh_ref_own`) equals its `_coq` definition for every input.
 - NOT proven: that `checker.c` discharges each hypothesis of the instances (the syntactic
   walk `win_exits_live`, the branch-depth / jump census at the join; for the lock, that a
   lexical region with no label, no nested release and no out-of-role write IS a dynamic
@@ -327,20 +361,26 @@ What is machine-checked, and where the chain stops:
   spawn-window" and "lock-region" cells only. NOT modelled at all: the spawn-target race
   scan, the atomic-cell and atomic-downgrade rules, shared-struct locking, the ISR rules,
   (for the hand-off: that an access tagged with a held value is made while its thread
-  holds it). The spin lock and the hand-off each had NO model until 2026-11-14, and each
-  was holed in a dozen shapes the day it got one.
+  holds it; for the access records: that every reference is classified correctly, that
+  every access the program makes is recorded at all — BUG-1667 and BUG-1668 were two
+  kinds of access with no record, found by probing, not by a failing proof — and that the
+  leak walk sees every way a reference moves). The spin lock and the hand-off each had NO
+  model until 2026-11-14, and each was holed in a dozen shapes the day it got one.
   The Iris subset proves the four-condition closure sufficient; nothing proves the checker
   enforces it on every program form. "100% data-race-free, proven" is therefore NOT a claim
   this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
   proven" is.
-- Accept-unsafe items still recorded as OPEN in this class: ONE as of 2026-11-14 — a
-  access through a pointer the context walk cannot name (item 11; eight reproducers). Closed
-  the same day: the lock regions (BUG-1663), the flag hand-off (BUG-1664), the silent
-  depth cap (BUG-1665); before them BUG-1652..1654. That is a statement about this ledger
-  — what was probed and measured — and NOT a proof, and its record is poor: "none" was
-  written here on 2026-11-13 and four families were found the next day, each by writing
-  down what a rule assumed and trying to break it. What has not had that treatment is the
-  list just above ("NOT modelled at all").
+- Accept-unsafe items still recorded as OPEN in this class: none known as of 2026-11-14.
+  Closed that day: the lock regions (BUG-1663), the flag hand-off (BUG-1664), the silent
+  depth cap (BUG-1665), the unnamed pointer (BUG-1666), container methods recorded as
+  reads (BUG-1667), static locals taken for the thread's own (BUG-1668), an array argument
+  the lend rule gave no root (BUG-1669); before them BUG-1652..1654. That is a statement
+  about this ledger — what was probed and measured — and NOT a proof, and its record is
+  poor: "none" was written here on 2026-11-13 and seven families were found the next day.
+  The last three were found while writing the POSITIVE tests for the fourth: each
+  construct a safe program needed (an allocator call, a static counter, an array handed
+  to a helper) turned out to have an unsafe twin nothing recorded. What has not had that
+  treatment is the list just above ("NOT modelled at all").
   as far as measured: the handler-side split RMW done in helpers (a handler is not preempted
   by main code). `cinclude` code is a floor.
 
@@ -392,10 +432,9 @@ What is machine-checked, and where the chain stops:
 ## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
 
 1. [residual of: What the atomic/barrier downgrade check still trusts — closed by BUG-1663, BUG-1664]
-   **What the context walk still does not follow.** A pointer it cannot name — read
-   back out of memory, returned by a call, re-aimed behind its back, or a second name
-   for one object: ACCEPT-UNSAFE, section B item 11. A C caller is still invisible
-   beyond "may run more than once".
+   **What the context walk still does not follow.** A C caller is invisible beyond "may
+   run more than once". (A pointer it cannot name is no longer taken for private —
+   BUG-1666; what that costs is section B item 11.)
    [residual of BUG-1665] A thread whose code is deeper than the walk's cap (about eighty
    calls on one path) is refused even when every access is locked: shorten the chain or
    use a `shared struct`.

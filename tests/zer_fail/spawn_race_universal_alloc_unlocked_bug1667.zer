@@ -1,0 +1,16 @@
+// expect-error: both access the allocator behind alloc / free of 'Node'
+// BUG-1667: `alloc(Node)` / `free(n)` are calls into Node's auto-slab, which takes no lock. Two threads
+// allocating at once corrupt its bookkeeping — on the pre-fix compiler this program was accepted, raced
+// under ThreadSanitizer and TRAPPED ("slab: use-after-free, wrong-slab or invalid handle").
+u32 flagx;
+struct Node { u32 v; u32[4] arr; }
+void w() {
+    @atomic_store(&flagx, 1);
+    for (u32 r = 0; r < 20000; r += 1) { *Node n = alloc(Node) orelse return; n.v += 1; free(n); }
+}
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

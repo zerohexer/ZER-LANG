@@ -764,6 +764,9 @@ Count tests from the tree (`ls tests/zer/*.zer | wc -l`), never from a document.
   ISR, BOTH the assign and the var-decl spelling, all value-flow sites (init, assign, call
   arg, return). Then write one REAL 10-60 line program: real programs found bugs that
   1,700 unit tests missed.
+- **Every construct a new POSITIVE uses gets its negative twin first** (an allocator call, a
+  `static`, a builtin method, an implicit coercion): three of BUG-1666's four siblings were
+  accesses no walk recorded, found only by writing the positive (playbook, "A model certifies").
 - A new diagnostic that fires on a corpus file which is not your own new negative is either
   a real bug or a test that was passing for the wrong reason — check which, every time.
   Measure the corpus cost of any tightening by COMPILING the corpus with the rule and

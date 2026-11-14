@@ -1,0 +1,105 @@
+// BUG-1666, the precision half. A thread that uses an @atomic has every plain access judged against the
+// other threads' — including accesses through references the compiler cannot name. What must still be
+// accepted, with exact results:
+//   - the thread's own stack through a pointer, a slice, a struct holding a pointer, a callee handed it
+//   - a FRESH heap object whose reference never leaves its name (access_alias.v, fresh_stays_own)
+//   - one object from alloc(T): the allocator calls take the lock, the object is used outside it
+//   - a shared list reached through loaded pointers, every access under ONE lock
+u32 flagx;
+u32 lk;
+u32 total_stack;
+u32 total_heap;
+u32 total_node;
+
+struct Cur { *u32 p; }
+struct Node { u32 v; u32[4] arr; }
+struct Item { u32 n; ?*Item next; }
+
+Item i0;
+Item i1;
+?*Item list_head = null;
+u32 list_sum;
+
+void bump(*u32 q) { *q += 1; }
+
+void lock() { while (!@atomic_cas(&lk, 0, 1)) { } }
+
+void stack_worker() {
+    @atomic_store(&flagx, 1);
+    u32 x = 0;
+    u32[8] arr;
+    *u32 q = &x;
+    [*]u32 s = arr;
+    Cur c = { .p = &x };
+    for (u32 i = 0; i < 1000; i += 1) {
+        *q += 1;
+        s[i % 8] += 1;
+        *c.p += 1;
+        bump(&x);
+    }
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    total_stack += x + s[0];
+    @atomic_store(&lk, 0);
+}
+
+void heap_worker() {
+    @atomic_store(&flagx, 1);
+    [*]u32 buf = alloc(u32, 64) orelse return;
+    for (u32 r = 0; r < 100; r += 1) {
+        for (u32 i = 0; i < buf.len; i += 1) { buf[i] += i; }
+    }
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    total_heap += buf[3];
+    @atomic_store(&lk, 0);
+    free(buf);
+}
+
+void node_worker() {
+    @atomic_store(&flagx, 1);
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    *Node n = alloc(Node) orelse return;
+    @atomic_store(&lk, 0);
+    for (u32 i = 0; i < 1000; i += 1) { n.v += 1; n.arr[i % 4] = n.v; }
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    total_node += n.v + n.arr[3];
+    free(n);
+    @atomic_store(&lk, 0);
+}
+
+void list_worker() {
+    @atomic_store(&flagx, 1);
+    for (u32 r = 0; r < 500; r += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        ?*Item cur = list_head;
+        if (cur) |it| {
+            it.n += 1;
+            list_sum += 1;
+            if (it.next) |nx| { nx.n += 2; }
+        }
+        @atomic_store(&lk, 0);
+    }
+}
+
+i32 main() {
+    i0.next = &i1;
+    list_head = &i0;
+    ThreadHandle a = spawn stack_worker();
+    ThreadHandle b = spawn stack_worker();
+    ThreadHandle c = spawn heap_worker();
+    ThreadHandle d = spawn heap_worker();
+    ThreadHandle e = spawn node_worker();
+    ThreadHandle f = spawn node_worker();
+    ThreadHandle g = spawn list_worker();
+    ThreadHandle h = spawn list_worker();
+    a.join(); b.join(); c.join(); d.join(); e.join(); f.join(); g.join(); h.join();
+    // each stack worker: x = 3000, s[0] = 125
+    if (total_stack != 6250) { return 1; }
+    // each heap worker: buf[3] = 300
+    if (total_heap != 600) { return 2; }
+    // each node worker: v = 1000, arr[3] = 1000
+    if (total_node != 4000) { return 3; }
+    if (list_sum != 1000) { return 4; }
+    if (i0.n != 1000) { return 5; }
+    if (i1.n != 2000) { return 6; }
+    return 0;
+}

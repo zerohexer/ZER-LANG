@@ -1,7 +1,7 @@
-// GAP (2026-11-14, docs/limitations.md section B item 11): a local struct whose pointer field a CALLEE re-aims
-// (`fill(&hh)` stores a pointer to the global `g` into `hh.p`); `*hh.p += 1` is then taken for an access to the
-// thread's own stack.
-// ThreadSanitizer reports a data race. Compile-clean IS the gap.
+// expect-error: both access non-shared global 'g'
+// BUG-1666 (was docs/limitations.md B.11): a local struct whose pointer field a CALLEE re-aims (`fill(&hh)` stores a pointer to the
+// global `g` into `hh.p`); `*hh.p += 1` was taken for an access to the thread's own stack.
+// ThreadSanitizer reported a data race on the pre-fix compiler, which accepted this.
 u32 flagx;
 u32 g;
 struct H { *u32 p; }

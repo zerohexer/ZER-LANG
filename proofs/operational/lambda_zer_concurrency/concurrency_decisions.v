@@ -151,3 +151,39 @@ Definition zer_flag_claim_unique_coq (single_thread repeated : Z) : Z :=
 Definition zer_flag_orders_coq (flag_valid values_differ : Z) : Z :=
   if Z.eq_dec flag_valid 0 then 0
   else (if Z.eq_dec values_differ 0 then 0 else 1).
+
+(* ---- WHAT AN ACCESS TOUCHES (BUG-1666; meaning lemmas: access_alias.v) ---- *)
+
+(* May two access records name overlapping memory?  `same_global`: both are
+   named and name one global.  Otherwise two named records never do; a named
+   and a typed one do when the global's type holds the type (`a_holds_b`); two
+   typed ones when either type holds the other. *)
+Definition zer_access_may_alias_coq (same_global both_named a_holds_b b_holds_a : Z) : Z :=
+  if Z.eq_dec same_global 0 then
+    (if Z.eq_dec both_named 0 then
+       (if Z.eq_dec a_holds_b 0 then
+          (if Z.eq_dec b_holds_a 0 then 0 else 1)
+        else 1)
+     else 0)
+  else 1.
+
+(* A local reference is KNOWN (it points only where the values assigned to it
+   point) iff its name is one variable, its address is never taken, and every
+   value assigned to it is itself known. *)
+Definition zer_local_ref_known_coq (bound_once addr_taken values_known : Z) : Z :=
+  if Z.eq_dec bound_once 0 then 0
+  else (if Z.eq_dec addr_taken 0 then
+          (if Z.eq_dec values_known 0 then 0 else 1)
+        else 0).
+
+(* A global reference is its initializer iff it is const or never re-aimed. *)
+Definition zer_global_ref_known_coq (is_const never_mutated : Z) : Z :=
+  if Z.eq_dec is_const 0 then
+    (if Z.eq_dec never_mutated 0 then 0 else 1)
+  else 1.
+
+(* A FRESH heap object is the allocating thread's own iff the reference to it
+   never leaves the name it was bound to. *)
+Definition zer_fresh_ref_own_coq (fresh leaves : Z) : Z :=
+  if Z.eq_dec fresh 0 then 0
+  else (if Z.eq_dec leaves 0 then 1 else 0).

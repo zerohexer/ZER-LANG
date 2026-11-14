@@ -5572,6 +5572,7 @@ static void arena_over_scan(Node *n, ArenaOverVec *av) {
  * named arenas over one buffer hand out the same bytes to both. */
 static void arena_backing_note(Checker *c, Symbol *sym, const char *t, uint32_t tl, int line) {
     if (!sym) return;
+    c->any_arena_backing = true;   /* BUG-1666 */
     if (sym->arena_backing_of && sym->arena_backing_of_len > 0 && t && tl > 0 &&
         (sym->arena_backing_of_len != tl || memcmp(sym->arena_backing_of, t, tl) != 0)) {
         checker_error(c, line,
@@ -26395,7 +26396,13 @@ static Symbol *sync_stmt_handoff_store(Checker *c, Node *s, Node *fn, Node **nod
  *                   and has not stored the flag since);
  *   pub           — a flag whose INITIAL value the thread still holds: the access
  *                   precedes the thread's first, unrepeated store of it. */
-typedef struct { Symbol *g; bool write; Symbol *lock, *own_f; uint64_t own_v; Symbol *pub; } SyncAcc;
+/* BUG-1666: `g` NULL — the access is to "some object of type `ty`": it went
+ * through a reference that is not known to point only into recorded globals or
+ * the thread's own stack (sync_ref_unknown). `atomic`: made by an @atomic_*. */
+typedef struct {
+    Symbol *g; bool write; Symbol *lock, *own_f; uint64_t own_v; Symbol *pub;
+    Type *ty; bool atomic;
+} SyncAcc;
 /* BUG-1664: one store of a flag as an instance's walk met it, and the value its
  * thread held there — `from` is zer_flag_store_from's answer (1 an observed
  * value `from_v`, 2 the initial value, 0 nothing). */
@@ -26451,11 +26458,12 @@ static bool sync_acc_has(SyncAccSet *s, SyncAcc a) {
     for (int i = 0; i < s->n; i++)
         if (s->v[i].g == a.g && s->v[i].write == a.write && s->v[i].lock == a.lock &&
             s->v[i].own_f == a.own_f && (!a.own_f || s->v[i].own_v == a.own_v) &&
-            s->v[i].pub == a.pub) return true;
+            s->v[i].pub == a.pub && s->v[i].atomic == a.atomic &&
+            (a.g || type_equals(s->v[i].ty, a.ty))) return true;
     return false;
 }
 static void sync_acc_add(SyncAccSet *s, SyncAcc a) {
-    if (!a.g || sync_acc_has(s, a)) return;
+    if ((!a.g && !a.ty) || sync_acc_has(s, a)) return;
     if (s->n >= s->cap) {
         int nc = s->cap ? s->cap * 2 : 8;
         SyncAcc *nb = (SyncAcc *)realloc(s->v, (size_t)nc * sizeof(SyncAcc));
@@ -26475,7 +26483,11 @@ enum { SW_THREAD, SW_BEFORE, SW_IN, SW_AFTER };
  * reaches g); otherwise it carries one (a field step, then a deref). `decl`
  * ends a name's entries (a declaration); later non-decl entries are
  * reassignments, all of which the name may hold. */
-typedef struct { const char *name; uint32_t len; Symbol *g; bool direct, decl; } SyncBind;
+/* BUG-1666: `unk` — the name may ALSO hold a reference that is neither one of
+ * its bound globals nor the thread's own stack. */
+/* BUG-1668: `self` — the name IS `g`: a `static` local, one object for every
+ * thread that runs its function. */
+typedef struct { const char *name; uint32_t len; Symbol *g; bool direct, decl, unk, self; } SyncBind;
 /* A callee already walked under this lock/flag context with these bindings. */
 typedef struct { Symbol *fn; SyncCtx ctx; SyncBind *b; int nb; } SyncSeen;
 typedef struct {
@@ -26524,16 +26536,47 @@ static void sync_gl_cb(Checker *c, Symbol *g, void *ud) {
     (void)c;
     if (g && !g->is_function) sync_gl_add((SyncGl *)ud, g);
 }
-static void sync_bind_push(SyncWalk *w, const char *nm, uint32_t nl, Symbol *g,
-                           bool direct, bool decl) {
+static void sync_bind_push_ex(SyncWalk *w, const char *nm, uint32_t nl, Symbol *g,
+                              bool direct, bool decl, bool unk) {
     if (w->nbind >= w->cbind) {
         int nc = w->cbind ? w->cbind * 2 : 16;
         SyncBind *nb = (SyncBind *)realloc(w->bind, (size_t)nc * sizeof(SyncBind));
-        if (!nb) return;
+        /* a dropped binding is an access attributed to nothing: incomplete */
+        if (!nb) { if (w->out) w->out->lost = true; return; }
         w->bind = nb; w->cbind = nc;
     }
-    SyncBind b = { nm, nl, g, direct, decl };
+    SyncBind b = { nm, nl, g, direct, decl, unk, false };
     w->bind[w->nbind++] = b;
+}
+/* BUG-1668: a `static` local's declaration. Its name is the object — a view of
+ * it or its address points at `g`; as a REFERENCE it holds whatever any thread
+ * last stored (`unk`). */
+static void sync_bind_push_self(SyncWalk *w, const char *nm, uint32_t nl, Symbol *g) {
+    int at = w->nbind;
+    sync_bind_push_ex(w, nm, nl, g, true, true, true);
+    if (w->nbind > at) w->bind[at].self = true;
+}
+/* The static local `nm` IS in the function being walked (NULL: none). */
+static Symbol *sync_name_self(SyncWalk *w, const char *nm, uint32_t nl) {
+    for (int i = w->nbind - 1; i >= w->frame; i--) {
+        SyncBind *b = &w->bind[i];
+        if (b->len != nl || memcmp(b->name, nm, nl) != 0) continue;
+        if (b->self) return b->g;
+        if (b->decl) return NULL;
+    }
+    return NULL;
+}
+/* the name a place is rooted at (through field / element / deref steps) */
+static Node *sync_place_root(Node *e) {
+    while (e && (e->kind == NODE_FIELD || e->kind == NODE_INDEX || e->kind == NODE_SLICE ||
+                 (e->kind == NODE_UNARY && e->unary.op == TOK_STAR)))
+        e = e->kind == NODE_FIELD ? e->field.object : e->kind == NODE_INDEX ? e->index_expr.object :
+            e->kind == NODE_SLICE ? e->slice.object : e->unary.operand;
+    return (e && e->kind == NODE_IDENT) ? e : NULL;
+}
+static void sync_bind_push(SyncWalk *w, const char *nm, uint32_t nl, Symbol *g,
+                           bool direct, bool decl) {
+    sync_bind_push_ex(w, nm, nl, g, direct, decl, false);
 }
 static bool sync_name_bound(SyncWalk *w, const char *nm, uint32_t nl) {
     for (int i = w->nbind - 1; i >= w->frame; i--)
@@ -26616,7 +26659,29 @@ static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
         volatile_global_exempt_from_race_check(w->c, g))
         vol_store_note(g, ctx.lock, w->rmw_mode == 1);
     if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
-    SyncAcc a = { g, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub };
+    SyncAcc a = { g, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, NULL, false };
+    sync_acc_add(w->out, a);
+}
+/* BUG-1666: an access to "some object of type `ty`". A type that locks itself
+ * (a shared struct, a Barrier, a Semaphore) needs no record, as a global of
+ * that type needs none (spawn_global_needs_sync). */
+static void sync_record_typed(SyncWalk *w, Type *ty, bool write, bool atomic, SyncCtx ctx) {
+    if (w->phase != SW_THREAD && w->phase != SW_IN) return;
+    Type *t = ty ? type_unwrap_distinct(ty) : NULL;
+    if (!t) return;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_STRUCT && (t->struct_type.is_shared || t->struct_type.is_shared_rw)) return;
+    if (k == TYPE_BARRIER || k == TYPE_SEMAPHORE) return;
+    SyncAcc a = { NULL, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, t, atomic };
+    sync_acc_add(w->out, a);
+}
+/* BUG-1668: an ATOMIC access of a named object that has no atomic-cell rule of
+ * its own (a static local). Atomic against atomic is no race; against a plain
+ * access of the same object it is. */
+static void sync_record_atomic(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
+    if (w->phase != SW_THREAD && w->phase != SW_IN) return;
+    if (!g || !spawn_global_needs_sync(w->c, g)) return;
+    SyncAcc a = { g, write, ctx.lock, ctx.own_f, ctx.own_f ? ctx.own_v : 0, ctx.pub, NULL, true };
     sync_acc_add(w->out, a);
 }
 /* A thread read-modify-writes volatile `g`: refused outright, as the spawn scan
@@ -26702,19 +26767,454 @@ static void sync_vol_rmw_facts(SyncWalk *w, Node *n, SyncCtx ctx) {
 /* BUG-1565 (C2): an access THROUGH a name bound to a global — `*p`, `p.f`,
  * `p[i]`, and for a carrier `*h.p` / `h.p.f` — is an access of that global.
  * A bare pointer name is not (it reads the pointer, a local). */
-static void sync_record_bound(SyncWalk *w, Node *place, bool write, SyncCtx ctx) {
-    Node *r = place;
-    int steps = 0;
-    bool star = false;
+/* ==== BUG-1666: WHAT AN ACCESS TOUCHES ============================================
+ *
+ * The judgement below compares RECORDS of accesses, and a record used to exist
+ * only for an access attributed to a global by NAME. The walk has three answers
+ * for where a reference points — into recorded globals, at the thread's own
+ * stack, or UNKNOWN — and it treated unknown as the thread's own. Eight shapes
+ * raced under ThreadSanitizer (tests/zer_fail/spawn_race_*): a pointer loaded
+ * from memory, returned by a call, re-aimed by a callee or later in the loop;
+ * two global pointers to one heap object; two Handles for one slot; a struct's
+ * pointer field against the global it points at.
+ *
+ * The model (proofs/operational/lambda_zer_concurrency/access_alias.v): an access
+ * is recorded as inside a NAMED global, or as inside "some object of type T" —
+ * the type of what the dereferenced reference points at. ZER has no pointer
+ * arithmetic and its pointer casts are provenance-checked, so two overlapping
+ * accesses have records that MAY ALIAS (one global; a global whose type holds
+ * the type; two types one of which holds the other), and the judgement compares
+ * every may-aliasing pair. Typed records carry the lock / flag the access was
+ * made under, like any other: a pointer-reached structure every thread locks is
+ * still accepted.
+ *
+ * KNOWN — "this reference points only into recorded globals or at my own stack",
+ * the one answer that omits the typed record — is the relaxation, and is granted
+ * only to (sync_ref_unknown):
+ *   `&place` / a view of a place rooted at a global or at an own local;
+ *   a global reference that is const or never re-aimed (its initializer's aim);
+ *   a local reference whose name is ONE variable, whose address is never taken,
+ *     and EVERY value ever assigned to which — anywhere in the function, not
+ *     "so far": `*p += 1; p = getp();` in a loop runs the first after the
+ *     second — is itself known (zer_local_ref_known).
+ * Everything else is unknown: a call's result, a reference loaded out of memory
+ * or out of a global aggregate, a capture, a parameter of a function whose
+ * caller the walk did not bind. A Handle dereference is a named access of its
+ * Pool / Slab. */
+static Type *sync_expr_type(Checker *c, Node *e) {
+    Type *t = e ? typemap_get(c, e) : NULL;
+    t = t ? type_unwrap_distinct(t) : NULL;
+    if (t && type_dispatch_kind(t) == TYPE_OPTIONAL)
+        t = type_unwrap_distinct(type_unwrap_optional(t));
+    return t;
+}
+/* the type of what a reference-typed expression points at, or NULL */
+static Type *sync_pointee(Checker *c, Node *e) {
+    Type *t = sync_expr_type(c, e);
+    if (!t) return NULL;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_POINTER) return t->pointer.inner;
+    if (k == TYPE_SLICE) return t->slice.inner;
+    if (k == TYPE_HANDLE) return t->handle.elem;
+    return NULL;
+}
+static bool sync_expr_is_ref(Checker *c, Node *e) {
+    Type *t = sync_expr_type(c, e);
+    TypeKind k = t ? type_dispatch_kind(t) : TYPE_VOID;
+    return k == TYPE_POINTER || k == TYPE_SLICE || k == TYPE_HANDLE || k == TYPE_OPAQUE;
+}
+/* `id` names a global here: one exists, and the function being walked does not
+ * bind the name itself */
+static Symbol *sync_ident_global(SyncWalk *w, Node *id) {
+    /* BUG-1668: a static local is program-wide storage under a local name */
+    Symbol *ss = sync_name_self(w, id->ident.name, (uint32_t)id->ident.name_len);
+    if (ss) return ss;
+    Symbol *gs = global_decl_lookup(w->c, id->ident.name, (uint32_t)id->ident.name_len);
+    if (!gs) return NULL;
+    if (w->fnode && fn_binds_name(w->fnode, id->ident.name, (uint32_t)id->ident.name_len))
+        return NULL;
+    return gs;
+}
+/* A local name with no declaration the walk bound (a capture, a loop variable,
+ * a parameter nobody bound) is unknown; a bound one says so itself. */
+static bool sync_name_unknown(SyncWalk *w, const char *nm, uint32_t nl) {
+    for (int i = w->nbind - 1; i >= w->frame; i--) {
+        SyncBind *b = &w->bind[i];
+        if (b->len != nl || memcmp(b->name, nm, nl) != 0) continue;
+        if (b->unk) return true;
+        if (b->decl) return false;
+    }
+    return true;
+}
+static bool sync_ref_unknown(SyncWalk *w, Node *v, int depth);
+/* Where `&place` (or a view of `place`) points: into what a reference on its
+ * path points at — that reference's answer — else at a global or an own local. */
+static bool sync_place_unknown(SyncWalk *w, Node *pl, int depth) {
+    Node *r = pl;
     while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE ||
                  (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
-        if (r->kind == NODE_FIELD) r = r->field.object;
-        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
-        else if (r->kind == NODE_SLICE) r = r->slice.object;
-        else { r = r->unary.operand; star = true; }
+        Node *ob = r->kind == NODE_FIELD ? r->field.object :
+                   r->kind == NODE_INDEX ? r->index_expr.object :
+                   r->kind == NODE_SLICE ? r->slice.object : r->unary.operand;
+        if (r->kind == NODE_UNARY || sync_expr_is_ref(w->c, ob))
+            return sync_ref_unknown(w, ob, depth + 1);
+        r = ob;
+    }
+    return !(r && r->kind == NODE_IDENT);
+}
+/* May the reference VALUE `v` point somewhere that is neither a recorded global
+ * nor the walking thread's own stack? Unknown rounds to yes. */
+static bool sync_ref_unknown(SyncWalk *w, Node *v, int depth) {
+    Checker *c = w->c;
+    v = v ? unwrap_ptr_launder(v) : NULL;
+    if (!v) return false;
+    if (depth > ZER_EXPR_WALK_MAX) return true;
+    if (v->kind == NODE_NULL_LIT || v->kind == NODE_STRING_LIT || v->kind == NODE_INT_LIT ||
+        v->kind == NODE_FLOAT_LIT || v->kind == NODE_CHAR_LIT || v->kind == NODE_BOOL_LIT)
+        return false;
+    if (v->kind == NODE_ORELSE) {
+        Node *fb = v->orelse.fallback;
+        /* a fallback that leaves (return / break / a block) yields no value */
+        bool fbv = fb && fb->kind != NODE_RETURN && fb->kind != NODE_BREAK &&
+                   fb->kind != NODE_CONTINUE && fb->kind != NODE_BLOCK;
+        return sync_ref_unknown(w, v->orelse.expr, depth + 1) ||
+               (fbv && sync_ref_unknown(w, fb, depth + 1));
+    }
+    if (v->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < v->struct_init.field_count; i++)
+            if (sync_ref_unknown(w, v->struct_init.fields[i].value, depth + 1)) return true;
+        return false;
+    }
+    if (!sync_value_carries(c, v)) return false;   /* a value that carries no reference */
+    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP)
+        return sync_place_unknown(w, v->unary.operand, depth + 1);
+    if (v->kind == NODE_SLICE)
+        return sync_expr_is_ref(c, v->slice.object)
+            ? sync_ref_unknown(w, v->slice.object, depth + 1)
+            : sync_place_unknown(w, v->slice.object, depth + 1);
+    if (v->kind == NODE_IDENT) {
+        /* a static local reference: no census of its writes — whatever was stored */
+        if (sync_name_self(w, v->ident.name, (uint32_t)v->ident.name_len)) return true;
+        Symbol *gs = sync_ident_global(w, v);
+        if (gs)
+            return !zer_global_ref_known(gs->is_const ? 1 : 0,
+                                         global_name_never_mutated(c, gs) ? 1 : 0);
+        return sync_name_unknown(w, v->ident.name, (uint32_t)v->ident.name_len);
+    }
+    if (v->kind == NODE_FIELD || v->kind == NODE_INDEX) {
+        /* a reference LOADED out of an aggregate: known only out of an own local
+         * whose every stored reference is (its name's answer). Out of memory
+         * behind a reference, or out of a global, it is whatever was stored. */
+        Node *r = v;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
+            Node *ob = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+            if (sync_expr_is_ref(c, ob)) return true;
+            r = ob;
+        }
+        if (!r || r->kind != NODE_IDENT || sync_ident_global(w, r)) return true;
+        return sync_name_unknown(w, r->ident.name, (uint32_t)r->ident.name_len);
+    }
+    return true;   /* a call's result, `*pp`, an intrinsic, anything else */
+}
+/* Every write of a local name in its function: the globals the assigned values
+ * point into, whether any of them is unknown, whether the name's address (or a
+ * view into it) is formed. A compound operator stores no reference. */
+typedef struct { SyncWalk *w; SyncGl *gl; bool unk, addr, direct, fresh; } SyncClassUd;
+/* Is `ob` the receiver of a builtin allocator method — a Pool / Slab, or a
+ * struct TYPE name (its auto-slab)? A struct VARIABLE has no such method: there
+ * the call goes through a function-pointer field. */
+static bool sync_alloc_receiver(Checker *c, Node *fn, Node *ob) {
+    if (!ob || ob->kind != NODE_IDENT) return false;
+    uint32_t ol = (uint32_t)ob->ident.name_len;
+    if (fn && fn_binds_name(fn, ob->ident.name, ol)) return false;
+    Type *ot = sync_expr_type(c, ob);
+    TypeKind ok = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+    if (ok == TYPE_POOL || ok == TYPE_SLAB) return true;
+    if (ok != TYPE_STRUCT) return false;
+    Symbol *gs = global_decl_lookup(c, ob->ident.name, ol);
+    return !(gs && gs->func_node && (gs->func_node->kind == NODE_GLOBAL_VAR ||
+                                     gs->func_node->kind == NODE_VAR_DECL));
+}
+/* A FRESH heap object: the builtin `alloc(T, n)`, or `alloc(T)` — which the
+ * checker has rewritten to `T.alloc_ptr()` by now, the spelling a Pool / Slab
+ * also offers — bare or under an `orelse` whose fallback leaves. Nothing else
+ * reaches it yet. */
+static bool sync_value_fresh(SyncWalk *w, Node *v) {
+    if (v && v->kind == NODE_ORELSE) {
+        /* `orelse return / break / continue` is a flag with no fallback node */
+        bool leaves = v->orelse.fallback_is_return || v->orelse.fallback_is_break ||
+                      v->orelse.fallback_is_continue ||
+                      (v->orelse.fallback && v->orelse.fallback->kind == NODE_BLOCK);
+        if (!leaves) return false;
+        v = v->orelse.expr;
+    }
+    if (!v || v->kind != NODE_CALL || !v->call.callee) return false;
+    Node *ce = v->call.callee;
+    if (ce->kind == NODE_FIELD)
+        return ce->field.field_name_len == 9 && memcmp(ce->field.field_name, "alloc_ptr", 9) == 0 &&
+               sync_alloc_receiver(w->c, w->fnode, ce->field.object);
+    if (ce->kind != NODE_IDENT || ce->ident.name_len != 5 || memcmp(ce->ident.name, "alloc", 5) != 0)
+        return false;
+    /* the builtin, not a function or a local that took the name */
+    if (global_decl_lookup(w->c, "alloc", 5)) return false;
+    return !(w->fnode && fn_binds_name(w->fnode, "alloc", 5));
+}
+static bool sync_class_visit(Node *value, int kind, void *ud) {
+    SyncClassUd *u = (SyncClassUd *)ud;
+    if (kind == ANW_ASSIGN || kind == ANW_PART_ASSIGN) {
+        if (!value) return false;
+        if (kind == ANW_ASSIGN && u->w && sync_value_fresh(u->w, value)) {
+            u->fresh = true;
+            return false;
+        }
+        if (u->gl) sync_value_globals(u->w, value, u->gl, 0);
+        if (!u->w || sync_ref_unknown(u->w, value, 0)) u->unk = true;
+        if (u->w && sync_value_direct(u->w->c, value)) u->direct = true;
+        return false;
+    }
+    u->addr = true;   /* `&name`, `&name.f`, a `|*v|` capture, a node the walk cannot see into */
+    return false;
+}
+/* ---- BUG-1666: does a FRESH object's reference ever LEAVE its name? ----
+ * The oracle (access_alias.v, fresh_stays_own): an object its allocating thread
+ * never publishes is used by that thread alone — and one publication is enough
+ * for any thread to use it (published_is_shared). So the name is the thread's
+ * own only when EVERY occurrence of it is one of:
+ *     the base of a field / element access   name.f   name[i]   name.len
+ *     the argument of the builtin free       free(name)
+ *     the target of an assignment to it      name = alloc(...)
+ * Every other occurrence moves the reference somewhere this walk does not
+ * follow — a copy, a call or spawn argument, a return, a store, a comparison —
+ * or forms a second reference into the object: `&name.f`, a sub-slice, a `|*v|`
+ * capture, a builtin method on a field, an ARRAY field read as a value (which
+ * may coerce to a view). All of those answer "leaves". Whole-function and
+ * flow-insensitive, like the class it feeds: a name that leaves anywhere is
+ * unknown everywhere. No-default switch — a kind this walk does not see into
+ * answers "leaves". */
+typedef struct { Checker *c; Node *fn; const char *nm; uint32_t nl; } SyncLeak;
+static bool sync_leak_is_name(SyncLeak *k, Node *e) {
+    return e && e->kind == NODE_IDENT && (uint32_t)e->ident.name_len == k->nl &&
+           memcmp(e->ident.name, k->nm, k->nl) == 0;
+}
+/* the name itself, or a place chain built on it */
+static bool sync_leak_rooted(SyncLeak *k, Node *e) {
+    while (e && (e->kind == NODE_FIELD || e->kind == NODE_INDEX || e->kind == NODE_SLICE ||
+                 (e->kind == NODE_UNARY && e->unary.op == TOK_STAR)))
+        e = e->kind == NODE_FIELD ? e->field.object :
+            e->kind == NODE_INDEX ? e->index_expr.object :
+            e->kind == NODE_SLICE ? e->slice.object : e->unary.operand;
+    return sync_leak_is_name(k, e);
+}
+/* a place read as a VALUE whose type is an array may become a view of it */
+static bool sync_leak_value_views(SyncLeak *k, Node *e) {
+    Type *t = sync_expr_type(k->c, e);
+    return !t || type_dispatch_kind(t) == TYPE_ARRAY;
+}
+/* `base`: `n` is the object of a field / element step, so it is dereferenced
+ * rather than handed on. */
+static bool sync_name_leaves(SyncLeak *k, Node *n, bool base) {
+    if (!n) return false;
+    switch (n->kind) {
+    case NODE_IDENT:
+        return !base && sync_leak_is_name(k, n);
+    case NODE_FIELD:
+        if (sync_leak_rooted(k, n->field.object)) {
+            Type *ot = sync_expr_type(k->c, n->field.object);
+            if (!ot) return true;
+            /* `.ptr` of a slice IS the reference */
+            if (type_dispatch_kind(ot) == TYPE_SLICE && n->field.field_name_len == 3 &&
+                memcmp(n->field.field_name, "ptr", 3) == 0) return true;
+            if (!base && sync_leak_value_views(k, n)) return true;
+        }
+        return sync_name_leaves(k, n->field.object, true);
+    case NODE_INDEX:
+        if (!base && sync_leak_rooted(k, n->index_expr.object) && sync_leak_value_views(k, n))
+            return true;
+        return sync_name_leaves(k, n->index_expr.object, true) ||
+               sync_name_leaves(k, n->index_expr.index, false);
+    case NODE_SLICE:
+        if (sync_leak_rooted(k, n->slice.object)) {
+            /* a sub-slice is a second reference; on an integer it is a bit extract */
+            Type *ot = sync_expr_type(k->c, n->slice.object);
+            if (!ot || !type_is_integer(ot)) return true;
+        }
+        return sync_name_leaves(k, n->slice.object, true) ||
+               sync_name_leaves(k, n->slice.start, false) ||
+               sync_name_leaves(k, n->slice.end, false);
+    case NODE_UNARY:
+        if (n->unary.op == TOK_AMP) {
+            if (sync_leak_rooted(k, n->unary.operand)) return true;
+            return sync_name_leaves(k, n->unary.operand, true);
+        }
+        if (n->unary.op == TOK_STAR) {
+            if (!base && sync_leak_rooted(k, n->unary.operand) && sync_leak_value_views(k, n))
+                return true;
+            return sync_name_leaves(k, n->unary.operand, true);
+        }
+        return sync_name_leaves(k, n->unary.operand, false);
+    case NODE_BINARY:
+        return sync_name_leaves(k, n->binary.left, false) ||
+               sync_name_leaves(k, n->binary.right, false);
+    case NODE_ASSIGN:
+        /* a write OF the name is the class walk's business, not a use of its value */
+        if (!sync_leak_is_name(k, n->assign.target) &&
+            sync_name_leaves(k, n->assign.target, true)) return true;
+        return sync_name_leaves(k, n->assign.value, false);
+    case NODE_CALL: {
+        Node *ce = n->call.callee;
+        bool is_free = ce && ce->kind == NODE_IDENT && ce->ident.name_len == 4 &&
+                       memcmp(ce->ident.name, "free", 4) == 0 && n->call.arg_count == 1 &&
+                       !global_decl_lookup(k->c, "free", 4) &&
+                       !(k->fn && fn_binds_name(k->fn, "free", 4));
+        /* `free(p)` of one object is `T.free_ptr(p)` by now (a Pool / Slab spells it so) */
+        if (!is_free && ce && ce->kind == NODE_FIELD && n->call.arg_count == 1 &&
+            ce->field.field_name_len == 8 && memcmp(ce->field.field_name, "free_ptr", 8) == 0)
+            is_free = sync_alloc_receiver(k->c, k->fn, ce->field.object);
+        if (is_free && sync_leak_is_name(k, n->call.args[0])) return false;
+        /* a builtin method takes its object by address */
+        if (ce && ce->kind == NODE_FIELD && sync_leak_rooted(k, ce->field.object)) return true;
+        if (sync_name_leaves(k, n->call.callee, false)) return true;
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (sync_name_leaves(k, n->call.args[i], false)) return true;
+        return false;
+    }
+    case NODE_ORELSE:
+        return sync_name_leaves(k, n->orelse.expr, false) ||
+               sync_name_leaves(k, n->orelse.fallback, false);
+    case NODE_TYPECAST: return sync_name_leaves(k, n->typecast.expr, false);
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (sync_name_leaves(k, n->intrinsic.args[i], false)) return true;
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (sync_name_leaves(k, n->struct_init.fields[i].value, false)) return true;
+        return false;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (sync_name_leaves(k, n->block.stmts[i], false)) return true;
+        return false;
+    case NODE_IF:
+        /* `|*v|` points into the optional it unwraps */
+        if (n->if_stmt.capture_name && n->if_stmt.capture_is_ptr &&
+            sync_leak_rooted(k, n->if_stmt.cond)) return true;
+        return sync_name_leaves(k, n->if_stmt.cond, false) ||
+               sync_name_leaves(k, n->if_stmt.then_body, false) ||
+               sync_name_leaves(k, n->if_stmt.else_body, false);
+    case NODE_FOR:
+        return sync_name_leaves(k, n->for_stmt.init, false) ||
+               sync_name_leaves(k, n->for_stmt.cond, false) ||
+               sync_name_leaves(k, n->for_stmt.step, false) ||
+               sync_name_leaves(k, n->for_stmt.body, false);
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        return sync_name_leaves(k, n->while_stmt.cond, false) ||
+               sync_name_leaves(k, n->while_stmt.body, false);
+    case NODE_SWITCH:
+        if (sync_name_leaves(k, n->switch_stmt.expr, false)) return true;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            SwitchArm *a = &n->switch_stmt.arms[i];
+            if (a->capture_name && a->capture_is_ptr &&
+                sync_leak_rooted(k, n->switch_stmt.expr)) return true;
+            for (int j = 0; j < a->value_count; j++)
+                if (sync_name_leaves(k, a->values[j], false)) return true;
+            if (sync_name_leaves(k, a->body, false)) return true;
+        }
+        return false;
+    case NODE_RETURN:    return sync_name_leaves(k, n->ret.expr, false);
+    case NODE_EXPR_STMT: return sync_name_leaves(k, n->expr_stmt.expr, false);
+    case NODE_VAR_DECL:  return sync_name_leaves(k, n->var_decl.init, false);
+    case NODE_DEFER:     return sync_name_leaves(k, n->defer.body, false);
+    case NODE_CRITICAL:  return sync_name_leaves(k, n->critical.body, false);
+    case NODE_ONCE:      return sync_name_leaves(k, n->once.body, false);
+    case NODE_AWAIT:     return sync_name_leaves(k, n->await_stmt.cond, false);
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            if (sync_name_leaves(k, n->spawn_stmt.args[i], false)) return true;
+        return false;
+    /* leaves: no occurrence of a value name */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_YIELD: case NODE_SIZEOF:
+        return false;
+    /* not seen into: the reference may go anywhere */
+    case NODE_CAST: case NODE_ASM: case NODE_STATIC_ASSERT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return true;
+    }
+    return true;
+}
+static Node *sync_fn_body(Node *fn) {
+    if (!fn) return NULL;
+    if (fn->kind == NODE_FUNC_DECL) return fn->func_decl.body;
+    if (fn->kind == NODE_INTERRUPT) return fn->interrupt.body;
+    return NULL;
+}
+static bool sync_name_bound_once(Node *fn, const char *nm, uint32_t nl) {
+    Node *body = sync_fn_body(fn);
+    int n = 0;
+    if (!body) return false;
+    if (fn->kind == NODE_FUNC_DECL)
+        for (int i = 0; i < fn->func_decl.param_count; i++)
+            if (fn->func_decl.params[i].name_len == nl &&
+                memcmp(fn->func_decl.params[i].name, nm, nl) == 0) n++;
+    return n + ast_name_bind_count(body, nm, nl) == 1;
+}
+/* Is a PARAMETER of `fn` known, given what the caller's argument was? Any write
+ * of it in the body makes it unknown (the value is in another frame's terms). */
+static bool sync_param_known(Node *fn, const char *nm, uint32_t nl, bool arg_unknown) {
+    Node *body = sync_fn_body(fn);
+    SyncClassUd u = { NULL, NULL, false, false, false, false };
+    if (!body) return false;
+    ast_name_writes_parts(body, nm, nl, sync_class_visit, &u, false);
+    return zer_local_ref_known(sync_name_bound_once(fn, nm, nl) ? 1 : 0, u.addr ? 1 : 0,
+                               (arg_unknown || u.unk) ? 0 : 1) != 0;
+}
+/* The accesses reading, writing (`mode` 1) or taking the address of (`mode` 2)
+ * a place makes: the globals its root name is bound to, and — per step that
+ * goes THROUGH a reference — the object behind that reference. The step nearest
+ * the leaf is the one written (or, for an address, not touched at all); every
+ * deeper one is a load. */
+static void sync_record_place(SyncWalk *w, Node *place, int mode, SyncCtx ctx) {
+    Checker *c = w->c;
+    Node *r = place;
+    int steps = 0;
+    bool star = false, leaf = true, write = mode == 1;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE ||
+                 (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+        Node *ob = r->kind == NODE_FIELD ? r->field.object :
+                   r->kind == NODE_INDEX ? r->index_expr.object :
+                   r->kind == NODE_SLICE ? r->slice.object : r->unary.operand;
+        Type *ot = sync_expr_type(c, ob);
+        TypeKind ok = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+        /* `s.len` reads the slice's own header; forming a view reads nothing */
+        bool deref = r->kind == NODE_UNARY ||
+                     (r->kind == NODE_FIELD && (ok == TYPE_POINTER || ok == TYPE_HANDLE)) ||
+                     (r->kind == NODE_INDEX && (ok == TYPE_SLICE || ok == TYPE_POINTER));
+        if (deref) {
+            bool touched = !(mode == 2 && leaf), wr = write && leaf;
+            leaf = false;
+            if (touched && r->kind == NODE_FIELD && r->field.handle_alloc)
+                sync_record(w, r->field.handle_alloc, wr, ctx);
+            else if (touched && (ok == TYPE_HANDLE || sync_ref_unknown(w, ob, 0)))
+                sync_record_typed(w, sync_pointee(c, ob), wr, false, ctx);
+        }
+        if (r->kind == NODE_UNARY) star = true;
+        r = ob;
         steps++;
     }
-    if (!r || r->kind != NODE_IDENT || steps == 0) return;
+    if (!r || r->kind != NODE_IDENT || steps == 0 || mode == 2) return;
+    /* through a GLOBAL reference that is known: what its initializer aims it at
+     * — for a READ as for a write (the assignment arm records only writes; a
+     * read of `*gp` was keyed by `gp`, and met no write of its target) */
+    if (!leaf && !sync_name_self(w, r->ident.name, (uint32_t)r->ident.name_len) &&
+        sync_ident_global(w, r)) {
+        sync_record(w, resolve_write_target_global(c, place, 0), write, ctx);
+        return;
+    }
     for (int i = w->nbind - 1; i >= w->frame; i--) {
         SyncBind *b = &w->bind[i];
         if (b->len != (uint32_t)r->ident.name_len ||
@@ -26722,6 +27222,76 @@ static void sync_record_bound(SyncWalk *w, Node *place, bool write, SyncCtx ctx)
         if (b->g && (b->direct || star || steps >= 2)) sync_record(w, b->g, write, ctx);
         if (b->decl) return;
     }
+}
+static void sync_record_bound(SyncWalk *w, Node *place, bool write, SyncCtx ctx) {
+    sync_record_place(w, place, write ? 1 : 0, ctx);
+}
+/* A struct / union / enum NAME is not memory: `Node.alloc()`, `@size(Node)`,
+ * `State.idle` read nothing. (The spawn-site scan lets a struct type's symbol
+ * stand for its auto-slab; this walk records the slab itself — below.) Recorded
+ * as a read of a "global", the name met every typed record of its own type.
+ * A variable always carries its declaration, and cannot share its type's name. */
+static bool sync_sym_is_type_name(Symbol *g) {
+    if (!g || g->func_node || !g->type) return false;
+    Type *t = type_unwrap_distinct(g->type);
+    TypeKind k = type_dispatch_kind(g->type);
+    const char *tn = NULL; uint32_t tl = 0;
+    if (k == TYPE_STRUCT) { tn = t->struct_type.name; tl = t->struct_type.name_len; }
+    else if (k == TYPE_UNION) { tn = t->union_type.name; tl = t->union_type.name_len; }
+    else if (k == TYPE_ENUM) { tn = t->enum_type.name; tl = t->enum_type.name_len; }
+    /* the builtin `Arena`, registered so `Arena.over(buf)` resolves */
+    else if (k == TYPE_ARENA) { tn = "Arena"; tl = 5; }
+    return tn && tl == g->name_len && memcmp(tn, g->name, tl) == 0;
+}
+/* ---- BUG-1667: a builtin container method runs INSIDE its receiver ----
+ * `pool.alloc()`, `slab.free(h)`, `ring.push(x)`, `arena.alloc(T)`,
+ * `Task.alloc()` and the universal `alloc(T)` / `free(p)` (which are
+ * `T.alloc_ptr()` / `T.free_ptr(p)` by now) rewrite the container's
+ * bookkeeping — the used map, the generation table, head / tail / count, the
+ * bump offset. The walk recorded only the READ of the receiver's name that
+ * walking the callee makes, so two threads allocating from one Pool met as two
+ * readers. Every such method WRITES its receiver; `get` reads it (the
+ * generation check). A struct TYPE as receiver means that type's auto-slab —
+ * the symbol a Handle dereference names, so the two meet. */
+static Symbol *sync_auto_slab_of(Checker *c, Type *st) {
+    for (int i = 0; st && i < c->auto_slab_count; i++)
+        if (type_equals(c->auto_slabs[i].elem_type, st)) return c->auto_slabs[i].slab_sym;
+    return NULL;
+}
+static Node *sync_method_receiver(Checker *c, Node *fn, Node *call, bool *mut, Symbol **slab) {
+    *mut = false; *slab = NULL;
+    Node *ce = call ? call->call.callee : NULL;
+    if (!ce || ce->kind != NODE_FIELD || !ce->field.object) return NULL;
+    Node *ob = ce->field.object;
+    Type *ot = sync_expr_type(c, ob);
+    TypeKind k = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+    const char *mn = ce->field.field_name; size_t ml = ce->field.field_name_len;
+    /* (a container is a global, a static or a local — never a struct field, and
+     * it has no methods through a pointer: the receiver is always a variable) */
+    if (k == TYPE_POOL || k == TYPE_SLAB || k == TYPE_RING || k == TYPE_ARENA) {
+        /* `Arena.over(buf)` builds a value; the assignment that keeps it is the write */
+        if (k == TYPE_ARENA && ml == 4 && memcmp(mn, "over", 4) == 0) return NULL;
+        *mut = !(ml == 3 && memcmp(mn, "get", 3) == 0);
+        return ob;
+    }
+    if (k != TYPE_STRUCT || !sync_alloc_receiver(c, fn, ob)) return NULL;
+    if (!((ml == 5 && memcmp(mn, "alloc", 5) == 0) || (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0) ||
+          (ml == 4 && memcmp(mn, "free", 4) == 0) || (ml == 8 && memcmp(mn, "free_ptr", 8) == 0)))
+        return NULL;
+    *slab = sync_auto_slab_of(c, type_unwrap_distinct(ot));
+    *mut = true;
+    return ob;
+}
+/* the access a method makes to the container `recv` names. A local one is the
+ * walking thread's own. */
+static void sync_record_receiver(SyncWalk *w, Node *recv, bool write, SyncCtx ctx) {
+    if (recv->kind == NODE_IDENT) {
+        Symbol *g = sync_ident_global(w, recv);
+        if (g && !g->is_function) sync_record(w, g, write, ctx);
+        return;
+    }
+    sync_record(w, resolve_write_target_global(w->c, recv, 0), write, ctx);
+    sync_record_place(w, recv, write ? 1 : 0, ctx);
 }
 /* An lvalue: its ROOT is named, not read; its index expressions are read. */
 /* BUG-1649: `h.v` is a call into its Pool / Slab (BUG-1625), named only by the
@@ -26784,7 +27354,8 @@ static bool sync_seen_same(SyncSeen *a, Symbol *fn, SyncCtx ctx, SyncBind *b, in
         (ctx.own_f && a->ctx.own_v != ctx.own_v) || a->ctx.pub != ctx.pub) return false;
     for (int i = 0; i < nb; i++)
         if (a->b[i].g != b[i].g || a->b[i].direct != b[i].direct ||
-            a->b[i].decl != b[i].decl || a->b[i].len != b[i].len ||
+            a->b[i].decl != b[i].decl || a->b[i].unk != b[i].unk ||
+            a->b[i].self != b[i].self || a->b[i].len != b[i].len ||
             memcmp(a->b[i].name, b[i].name, b[i].len) != 0) return false;
     return true;
 }
@@ -26946,7 +27517,9 @@ static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCt
                 if (!x) { if (w->out) w->out->lost = true; break; }
                 nb = x; cn = nc;
             }
-            SyncBind b = { pd->name, (uint32_t)pd->name_len, gl.n ? gl.v[j] : NULL, direct, j == 0 };
+            SyncBind b = { pd->name, (uint32_t)pd->name_len, gl.n ? gl.v[j] : NULL, direct, j == 0,
+                           !sync_param_known(fd, pd->name, (uint32_t)pd->name_len,
+                                             sync_ref_unknown(w, args[i], 0)), false };
             nb[nn++] = b;
         }
         free(gl.v);
@@ -26971,7 +27544,7 @@ static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCt
     w->jump_fn = esc_stmt_has_jump(w->c, fd->func_decl.body);
     w->frame = w->nbind;
     for (int i = 0; i < nn; i++)
-        sync_bind_push(w, nb[i].name, nb[i].len, nb[i].g, nb[i].direct, nb[i].decl);
+        sync_bind_push_ex(w, nb[i].name, nb[i].len, nb[i].g, nb[i].direct, nb[i].decl, nb[i].unk);
     w->phase = SW_THREAD;   /* the whole callee runs in the window */
     w->fnode = fd;
     if (w->rmw_mode == 1) (void)func_rmw_param_mask(w->c, fs, 0);   /* BUG-1652: its pfacts */
@@ -27000,13 +27573,21 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     #define SW(y) sync_walk(w, (y), ctx, depth + 1)
     switch (n->kind) {
     case NODE_IDENT: {
+        Symbol *ss = sync_name_self(w, n->ident.name, (uint32_t)n->ident.name_len);
+        if (ss) { sync_record(w, ss, false, ctx); return; }   /* BUG-1668 */
         Symbol *g = global_decl_lookup(c, n->ident.name, (uint32_t)n->ident.name_len);
-        if (g && !g->is_function) sync_record(w, g, false, ctx);
+        if (g && !g->is_function && !sync_sym_is_type_name(g)) sync_record(w, g, false, ctx);
         return;
     }
     case NODE_ASSIGN: {
         sync_vol_rmw_facts(w, n, ctx);   /* BUG-1652 */
-        sync_record(w, resolve_write_target_global(c, n->assign.target, 0), true, ctx);
+        Node *troot = sync_place_root(n->assign.target);
+        Symbol *tself = troot ? sync_name_self(w, troot->ident.name,
+                                               (uint32_t)troot->ident.name_len) : NULL;
+        /* BUG-1668: a static local is written by its own name; the global
+         * resolver knows only the program's scope */
+        if (tself) sync_record(w, tself, true, ctx);
+        else sync_record(w, resolve_write_target_global(c, n->assign.target, 0), true, ctx);
         sync_record_bound(w, n->assign.target, true, ctx);
         sync_lvalue(w, n->assign.target, ctx, depth + 1);
         SW(n->assign.value);
@@ -27025,7 +27606,11 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         return;
     }
     case NODE_UNARY:
-        if (n->unary.op == TOK_AMP) { sync_lvalue(w, n->unary.operand, ctx, depth + 1); return; }
+        if (n->unary.op == TOK_AMP) {
+            sync_record_place(w, n->unary.operand, 2, ctx);   /* BUG-1666: what it loads on the way */
+            sync_lvalue(w, n->unary.operand, ctx, depth + 1);
+            return;
+        }
         if (n->unary.op == TOK_STAR) sync_record_bound(w, n, false, ctx);
         SW(n->unary.operand);
         return;
@@ -27033,6 +27618,12 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         sync_vol_rmw_facts(w, n, ctx);   /* BUG-1652 */
         SW(n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++) SW(n->call.args[i]);
+        {   /* BUG-1667: a builtin method rewrites the container it is called on */
+            bool mut = false; Symbol *slab = NULL;
+            Node *recv = sync_method_receiver(c, w->fnode, n, &mut, &slab);
+            if (slab) sync_record(w, slab, mut, ctx);
+            else if (recv) sync_record_receiver(w, recv, mut, ctx);
+        }
         Node *cal = n->call.callee;
         if (cal && cal->kind == NODE_FIELD && w->handle && w->phase == SW_IN &&
             cal->field.field_name_len == 4 && memcmp(cal->field.field_name, "join", 4) == 0 &&
@@ -27205,13 +27796,43 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     }
     case NODE_VAR_DECL: {
         SW(n->var_decl.init);
+        /* BUG-1668: a `static` local is ONE object for every thread running
+         * this function — the walk bound it like any local, the thread's own */
+        if (n->var_decl.is_static && n->var_decl.static_sym) {
+            sync_bind_push_self(w, n->var_decl.name, (uint32_t)n->var_decl.name_len,
+                                n->var_decl.static_sym);
+            return;
+        }
         /* a declaration ends every earlier binding of its name */
         SyncGl gl; memset(&gl, 0, sizeof(gl));
         if (n->var_decl.init) sync_value_globals(w, n->var_decl.init, &gl, 0);
         bool direct = n->var_decl.init && sync_value_direct(c, n->var_decl.init);
         const char *nm = n->var_decl.name; uint32_t nl = (uint32_t)n->var_decl.name_len;
-        if (gl.n == 0) sync_bind_push(w, nm, nl, NULL, false, true);
-        for (int i = 0; i < gl.n; i++) sync_bind_push(w, nm, nl, gl.v[i], direct, i == 0);
+        /* BUG-1666: the name's answer comes from its declaration AND every write
+         * of it anywhere in the function. A reference name is written whole; an
+         * aggregate also field by field. */
+        bool ifresh = n->var_decl.init && sync_value_fresh(w, n->var_decl.init);
+        SyncClassUd cu = { w, &gl,
+                           n->var_decl.init && !ifresh && sync_ref_unknown(w, n->var_decl.init, 0),
+                           false, false, ifresh };
+        Node *fbody = sync_fn_body(w->fnode);
+        if (!fbody) cu.addr = true;
+        else if (n->var_decl.init && sync_expr_is_ref(c, n->var_decl.init))
+            ast_name_writes(fbody, nm, nl, sync_class_visit, &cu);
+        else
+            ast_name_writes_parts(fbody, nm, nl, sync_class_visit, &cu, false);
+        if (!n->var_decl.init) direct = cu.direct;
+        /* a FRESH heap object is as known as the thread's own stack — while its
+         * reference never leaves the name */
+        bool vknown = !cu.unk;
+        if (vknown && cu.fresh) {
+            SyncLeak lk = { c, w->fnode, nm, nl };
+            vknown = zer_fresh_ref_own(1, (!fbody || sync_name_leaves(&lk, fbody, false)) ? 1 : 0) != 0;
+        }
+        bool unk = !zer_local_ref_known(sync_name_bound_once(w->fnode, nm, nl) ? 1 : 0,
+                                        cu.addr ? 1 : 0, vknown ? 1 : 0);
+        if (gl.n == 0) sync_bind_push_ex(w, nm, nl, NULL, false, true, unk);
+        for (int i = 0; i < gl.n; i++) sync_bind_push_ex(w, nm, nl, gl.v[i], direct, i == 0, unk);
         free(gl.v);
         return;
     }
@@ -27238,6 +27859,41 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_TYPECAST:  SW(n->typecast.expr); return;
     case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++) SW(n->intrinsic.args[i]);
+        /* BUG-1666: an @atomic_* whose cell is reached THROUGH a reference —
+         * `@atomic_add(p, 1)`, `@atomic_store(&q.count, 0)` — touches the object
+         * behind it. Atomic against atomic is no race; against a plain access of
+         * the same object it is. (A cell named `&g` is the atomic-cell rule's.) */
+        if (n->intrinsic.arg_count > 0 && n->intrinsic.name_len > 7 &&
+            memcmp(n->intrinsic.name, "atomic_", 7) == 0) {
+            Node *cell = unwrap_ptr_launder(n->intrinsic.args[0]);
+            Node *ref = cell;
+            if (cell && cell->kind == NODE_UNARY && cell->unary.op == TOK_AMP) {
+                /* the reference the cell's place goes through nearest its leaf */
+                ref = NULL;
+                for (Node *r = cell->unary.operand; r && !ref; ) {
+                    Node *ob = r->kind == NODE_FIELD ? r->field.object :
+                               r->kind == NODE_INDEX ? r->index_expr.object :
+                               r->kind == NODE_SLICE ? r->slice.object :
+                               (r->kind == NODE_UNARY && r->unary.op == TOK_STAR)
+                                   ? r->unary.operand : NULL;
+                    if (!ob) break;
+                    if (r->kind == NODE_UNARY || sync_expr_is_ref(c, ob)) ref = ob;
+                    r = ob;
+                }
+            }
+            bool awr = !(n->intrinsic.name_len == 11 &&
+                         memcmp(n->intrinsic.name, "atomic_load", 11) == 0);
+            if (ref && sync_expr_is_ref(c, ref) && sync_ref_unknown(w, ref, 0))
+                sync_record_typed(w, sync_pointee(c, ref), awr, true, ctx);
+            /* BUG-1668: a static-local cell has no atomic-cell rule of its own
+             * (that rule is keyed by global) — the atomic access is recorded, and
+             * meets every plain access of the same static */
+            Node *croot = (!ref && cell && cell->kind == NODE_UNARY && cell->unary.op == TOK_AMP)
+                              ? sync_place_root(cell->unary.operand) : NULL;
+            Symbol *cself = croot ? sync_name_self(w, croot->ident.name,
+                                                   (uint32_t)croot->ident.name_len) : NULL;
+            if (cself) sync_record_atomic(w, cself, awr, ctx);
+        }
         /* BUG-1664: every store of a flag this instance makes, and the value
          * its thread holds there (H_sto). The census lists the store SITES; a
          * site no walk records, or records holding nothing, voids the flag. */
@@ -27541,7 +28197,7 @@ static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line,
     s->target = target; s->spawn = spawn; s->encl = current_func_symbol(c);
     s->repeated = c->in_loop;
     s->downgraded = downgraded;
-    s->binds = NULL; s->nbind = 0;
+    s->binds = NULL; s->nbind = 0; s->binds_lost = false;
     s->file = c->file_name; s->source = c->source; s->line = line;
     s->seq = c->body_check_seq;   /* BUG-1649 */
     /* BUG-1565 (C2): what each argument points at, resolved now — the
@@ -27557,16 +28213,20 @@ static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line,
         SyncWalk none; memset(&none, 0, sizeof(none)); none.c = c;
         sync_value_globals(&none, a, &gl, 0);
         bool direct = sync_value_direct(c, a);
-        for (int j = 0; j < gl.n; j++) {
+        /* BUG-1666: one more row, with no global, when the argument may carry a
+         * reference this site cannot follow */
+        int rows = gl.n + (sync_ref_unknown(&none, a, 0) ? 1 : 0);
+        for (int j = 0; j < rows; j++) {
             if (total >= cap) {
                 int nc = cap ? cap * 2 : 4;
                 struct SyncArgBind *nb = (struct SyncArgBind *)arena_alloc(c->arena,
                                             (size_t)nc * sizeof(*nb));
-                if (!nb) break;
+                if (!nb) { s->binds_lost = true; break; }
                 if (bv) memcpy(nb, bv, (size_t)total * sizeof(*nb));
                 bv = nb; cap = nc;
             }
-            bv[total].param = i; bv[total].g = gl.v[j]; bv[total].direct = direct;
+            bv[total].param = i; bv[total].g = j < gl.n ? gl.v[j] : NULL;
+            bv[total].direct = direct; bv[total].unk = j >= gl.n;
             total++;
         }
         free(gl.v);
@@ -27824,15 +28484,75 @@ static bool sync_ordered(Checker *c, SyncAcc *a, SyncAccSet *as, SyncAcc *b, Syn
     if (b->pub) (void)handoff_flag_ok(c, b->pub, all, nall);
     return false;
 }
-/* The first global two access sets touch with at least one write and no
- * ordering between the two accesses, or NULL. */
-static Symbol *sync_sets_conflict(Checker *c, SyncAccSet *a, SyncAccSet *b,
-                                  SyncAccSet **all, int nall) {
+/* BUG-1666: may type `outer` hold a sub-object of type `inner` — a field, an
+ * element, a variant, an optional's payload, a container's slot — or be it?
+ * Not through a pointer: what a pointer field points at is another object. An
+ * Arena carves any type out of its buffer. (A walk over types: no cap.) */
+static bool type_may_hold(Type *outer, Type *inner) {
+    Type *o = outer ? type_unwrap_distinct(outer) : NULL;
+    Type *i = inner ? type_unwrap_distinct(inner) : NULL;
+    if (!o || !i) return true;   /* a type the walk could not name: assume */
+    if (type_equals(o, i)) return true;
+    TypeKind k = type_dispatch_kind(o);
+    if (k == TYPE_ARENA) return true;
+    if (k == TYPE_OPTIONAL) return type_may_hold(o->optional.inner, i);
+    if (k == TYPE_ARRAY) return type_may_hold(o->array.inner, i);
+    if (k == TYPE_POOL) return type_may_hold(o->pool.elem, i);
+    if (k == TYPE_SLAB) return type_may_hold(o->slab.elem, i);
+    if (k == TYPE_RING) return type_may_hold(o->ring.elem, i);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t f = 0; f < o->struct_type.field_count; f++)
+            if (type_may_hold(o->struct_type.fields[f].type, i)) return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t f = 0; f < o->union_type.variant_count; f++)
+            if (type_may_hold(o->union_type.variants[f].type, i)) return true;
+        return false;
+    }
+    return false;
+}
+/* Does the named global hold an object of type `t`? An arena's backing buffer
+ * holds whatever was carved out of it. */
+static bool sync_global_holds(Symbol *g, Type *t) {
+    return g->arena_backing_of != NULL || type_may_hold(g->type, t);
+}
+static bool sync_type_is_byte(Type *t) {
+    TypeKind k = t ? type_dispatch_kind(t) : TYPE_VOID;
+    return k == TYPE_U8 || k == TYPE_I8;
+}
+/* May the two records name overlapping memory (access_alias.v, may_alias)? The
+ * model's types are trees; an Arena breaks that — it carves objects of any type
+ * out of a byte buffer — so in a program that has one, a typed BYTE access is
+ * taken to overlap a typed access of any type (the model's limit 3, by fiat). */
+static bool sync_acc_may_alias(Checker *c, SyncAcc *x, SyncAcc *y) {
+    int both_named = (x->g && y->g) ? 1 : 0;
+    int same = (both_named && x->g == y->g) ? 1 : 0;
+    int ab = 0, ba = 0;
+    if (!both_named) {
+        if (x->g) ab = sync_global_holds(x->g, y->ty) ? 1 : 0;
+        else if (y->g) ab = sync_global_holds(y->g, x->ty) ? 1 : 0;
+        else {
+            ab = type_may_hold(x->ty, y->ty) ? 1 : 0;
+            ba = type_may_hold(y->ty, x->ty) ? 1 : 0;
+            if (c->any_arena_backing && (sync_type_is_byte(x->ty) || sync_type_is_byte(y->ty)))
+                ab = 1;
+        }
+    }
+    return zer_access_may_alias(same, both_named, ab, ba) != 0;
+}
+/* The first access of `a` that may alias one of `b`, with at least one a write
+ * and nothing ordering the two — or NULL. */
+static SyncAcc *sync_sets_conflict(Checker *c, SyncAccSet *a, SyncAccSet *b,
+                                   SyncAccSet **all, int nall) {
     for (int i = 0; i < a->n; i++)
         for (int j = 0; j < b->n; j++) {
             SyncAcc *x = &a->v[i], *y = &b->v[j];
-            if (x->g != y->g || (!x->write && !y->write)) continue;
-            if (!sync_ordered(c, x, a, y, b, all, nall)) return x->g;
+            if (!x->write && !y->write) continue;
+            if (x->atomic && y->atomic) continue;
+            if (!sync_acc_may_alias(c, x, y)) continue;
+            /* report the NAMED side when there is one */
+            if (!sync_ordered(c, x, a, y, b, all, nall)) return (!x->g && y->g) ? y : x;
         }
     return NULL;
 }
@@ -27961,21 +28681,25 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             tw.c = c; tw.out = &thr[i]; tw.phase = SW_THREAD; tw.fnode = t->func_node;
             tw.jump_fn = esc_stmt_has_jump(c, t->func_node->func_decl.body);   /* BUG-1664 */
             tw.entry_once = stack && census_instances(c, &k, t, stack, 0) < 2;
+            if (s->binds_lost) thr[i].lost = true;   /* BUG-1666 */
             tw.late_seq = s->seq + 1;   /* BUG-1649 (0 = unarmed) */
             tw.rmw_mode = 1; tw.site = s;   /* BUG-1652 */
             /* the target's params, bound to what the spawn handed them */
             Node *fd = t->func_node;
             for (int p = 0; p < fd->func_decl.param_count; p++) {
                 ParamDecl *pd = &fd->func_decl.params[p];
-                bool first = true;
+                bool first = true, arg_unk = false;
+                for (int b = 0; b < s->nbind; b++)
+                    if (s->binds[b].param == p && s->binds[b].unk) arg_unk = true;
+                bool punk = !sync_param_known(fd, pd->name, (uint32_t)pd->name_len, arg_unk);
                 for (int b = 0; b < s->nbind; b++) {
-                    if (s->binds[b].param != p) continue;
-                    sync_bind_push(&tw, pd->name, (uint32_t)pd->name_len, s->binds[b].g,
-                                   s->binds[b].direct, first);
+                    if (s->binds[b].param != p || !s->binds[b].g) continue;
+                    sync_bind_push_ex(&tw, pd->name, (uint32_t)pd->name_len, s->binds[b].g,
+                                      s->binds[b].direct, first, punk);
                     first = false;
                 }
-                if (first) sync_bind_push(&tw, pd->name, (uint32_t)pd->name_len, NULL,
-                                          false, true);
+                if (first) sync_bind_push_ex(&tw, pd->name, (uint32_t)pd->name_len, NULL,
+                                             false, true, punk);
             }
             DeclModuleSave dm = decl_module_enter(c, t);
             sync_walk(&tw, t->func_node->func_decl.body, none, 0);
@@ -28067,7 +28791,7 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     _flag_census = &k; _flag_stack = stack;   /* BUG-1664: for handoff_flag_ok */
     for (int i = 0; i < n && done && all; i++) {
         struct SyncSpawnSite *s = &c->sync_spawns[i];
-        Symbol *g = NULL;
+        SyncAcc *g = NULL;   /* the unordered access (a named global, or a type) */
         const char *why = NULL;
         Symbol *other = NULL;
         /* A thread the scan found clean reaches globals only through what it
@@ -28128,9 +28852,27 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
             }
         }
         c->file_name = s->file; c->source = s->source;
+        /* BUG-1666: what the two meet on — a global, or "an object of type T" */
+        const char *what = g->g ? "non-shared global" : "memory of type";
+        const char *wn = g->g ? g->g->name : type_name(g->ty);
+        int wl = g->g ? (int)g->g->name_len : (int)strlen(wn);
+        if (g->g && g->g->is_static && g->g->func_node && g->g->func_node->kind == NODE_VAR_DECL)
+            what = "static local";   /* BUG-1668 */
+        /* an auto-slab has no name the program wrote: say whose allocator it is */
+        if (g->g && g->g->type && type_dispatch_kind(g->g->type) == TYPE_SLAB)
+            for (int q = 0; q < c->auto_slab_count; q++)
+                if (c->auto_slabs[q].slab_sym == g->g) {
+                    Type *et = type_unwrap_distinct(c->auto_slabs[q].elem_type);
+                    what = "the allocator behind alloc / free of";
+                    wn = et->struct_type.name; wl = (int)et->struct_type.name_len;
+                    break;
+                }
+        const char *how = g->g ? "" :
+            " reached through a reference the compiler cannot name (a pointer loaded from "
+            "memory, returned by a call, or re-aimed where it cannot see)";
         if (other)
             checker_error(c, s->line,
-                "spawn target '%.*s' %s '%.*s' both access non-shared global '%.*s', at "
+                "spawn target '%.*s' %s '%.*s' both access %s '%.*s'%s, at "
                 "least one writing, with no common lock and no release/acquire flag "
                 "ordering them — an @atomic_* / @barrier elsewhere in a thread does not. "
                 "Take ONE lock around every access (`while (!@atomic_cas(&lock, 0, 1)) {}` "
@@ -28138,18 +28880,17 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
                 "`@atomic_store(&flag, 1)`; wait on `@atomic_load(&flag)`, then read), or "
                 "use @atomic_* / a shared struct",
                 (int)s->target->name_len, s->target->name, why,
-                (int)other->name_len, other->name, (int)g->name_len, g->name);
+                (int)other->name_len, other->name, what, wl, wn, how);
         else
             checker_error(c, s->line,
-                "spawn target '%.*s' %s both access non-shared global '%.*s', at least "
+                "spawn target '%.*s' %s both access %s '%.*s'%s, at least "
                 "one writing, with no common lock and no release/acquire flag ordering "
                 "them — an @atomic_* / @barrier elsewhere in the thread does not. Take ONE "
                 "lock around every access (`while (!@atomic_cas(&lock, 0, 1)) {}` ... "
                 "`@atomic_store(&lock, 0);`), hand it off through a flag (write, then "
                 "`@atomic_store(&flag, 1)`; wait on `@atomic_load(&flag)`, then read), or "
                 "use @atomic_* / a shared struct",
-                (int)s->target->name_len, s->target->name, why,
-                (int)g->name_len, g->name);
+                (int)s->target->name_len, s->target->name, why, what, wl, wn, how);
     }
     c->file_name = sv_fn; c->source = sv_src;
     _flag_census = NULL; _flag_stack = NULL;
@@ -29879,6 +30620,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
             /* BUG-430: store AST node for const init lookup (enables
              * const u32 perms = ...; comptime if (FUNC(perms)) pattern) */
             sym->func_node = node;
+            if (node->var_decl.is_static) node->var_decl.static_sym = sym;   /* BUG-1668 */
             if (node->var_decl.init) {   /* BUG-1404: the Handle's allocator */
                 sym->slab_source = handle_alloc_source_of(c, node->var_decl.init);
                 if (sym->slab_source && !handle_source_stable(c, sym))
@@ -40317,6 +41059,7 @@ static int param_alias_of_value(Checker *c, Node *e) {
  * to a function that lends one parameter to a thread and writes through the
  * other (TSan: data race). Unknown must mean "may be the same as any other". */
 static const char _alias_unknown_root[] = "";
+static const char *alias_place_root(Checker *c, Node *a, uint32_t *len);
 static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
     a = unwrap_ptr_launder(a);
     if (!a) return NULL;
@@ -40342,6 +41085,10 @@ static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
         }
         return NULL;
     } else return NULL;
+    return alias_place_root(c, a, len);
+}
+/* The object a PLACE is in — `v`, `v.f`, `v[i]` name v. */
+static const char *alias_place_root(Checker *c, Node *a, uint32_t *len) {
     for (int d = 0; a && d <= ZER_EXPR_WALK_MAX; d++) {
         if (a->kind == NODE_FIELD) a = a->field.object;
         else if (a->kind == NODE_INDEX) a = a->index_expr.object;
@@ -40383,8 +41130,22 @@ static void alias_call_record(Checker *c, Node *call) {
         roots[i] = NULL; lens[i] = 0; pparam[i] = -1;
         Type *at = typemap_get(c, call->call.args[i]);
         TypeKind k = type_dispatch_kind(at);
-        if (k != TYPE_POINTER && k != TYPE_SLICE) continue;
-        roots[i] = alias_arg_root(c, call->call.args[i], &lens[i]);
+        /* BUG-1669: an ARRAY handed to a slice parameter is a VIEW of it —
+         * `f(arr)` is `f(arr[0..])`. The question is what the PARAMETER
+         * receives; asked of the argument's own type, `both(arr, arr)` passed
+         * one object twice under no name at all (TSan: data race). An array
+         * parameter takes a copy, and stays out. */
+        bool arr_view = false;
+        if (k == TYPE_ARRAY) {
+            Type *ft = rc->type ? type_unwrap_distinct(rc->type) : NULL;
+            Type *pt = (ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR &&
+                        (uint32_t)i < ft->func_ptr.param_count) ? ft->func_ptr.params[i] : NULL;
+            /* a parameter whose type is not known receives whatever it is given */
+            arr_view = !pt || type_dispatch_kind(pt) != TYPE_ARRAY;
+        }
+        if (k != TYPE_POINTER && k != TYPE_SLICE && !arr_view) continue;
+        roots[i] = arr_view ? alias_place_root(c, call->call.args[i], &lens[i])
+                            : alias_arg_root(c, call->call.args[i], &lens[i]);
         if (!roots[i]) {   /* BUG-1654: unknown — it may be any other argument's object, or a global */
             roots[i] = _alias_unknown_root; lens[i] = 0;
             dup = true;

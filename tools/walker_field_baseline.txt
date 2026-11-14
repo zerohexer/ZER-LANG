@@ -2495,3 +2495,17 @@ checker.c:win_exits_live:NODE_FUNC_DECL:func_decl.body
 checker.c:win_exits_live:NODE_GLOBAL_VAR:var_decl.init
 checker.c:win_exits_live:NODE_INTERRUPT:interrupt.body
 checker.c:win_exits_live:NODE_RETURN:ret.expr
+
+# --- checker.c: sync_name_leaves (BUG-1666, the own-heap rule) ---
+# "Does the reference this name holds go anywhere but through a dereference or into
+# `free`?" The arms below ANSWER without descending: a node the walk does not see into
+# (inline asm, a static assert, the top-level declaration kinds that cannot appear in a
+# body) answers YES — the name is then unknown, the rejecting direction for the
+# relaxation this walk feeds.
+checker.c:sync_name_leaves:NODE_ASM:asm_stmt.inputs
+checker.c:sync_name_leaves:NODE_ASM:asm_stmt.outputs
+checker.c:sync_name_leaves:NODE_FILE:file.decls
+checker.c:sync_name_leaves:NODE_FUNC_DECL:func_decl.body
+checker.c:sync_name_leaves:NODE_GLOBAL_VAR:var_decl.init
+checker.c:sync_name_leaves:NODE_INTERRUPT:interrupt.body
+checker.c:sync_name_leaves:NODE_STATIC_ASSERT:static_assert_stmt.cond

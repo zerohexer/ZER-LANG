@@ -385,3 +385,66 @@ int zer_flag_orders(int flag_valid, int values_differ) {
     }
     return 1;
 }
+
+/* ---- WHAT AN ACCESS TOUCHES (BUG-1666) ----
+ * Oracle: lambda_zer_concurrency/access_alias.v (definitions shared through
+ * concurrency_decisions.v). Flat cascades, VST style. */
+
+/* May two access records name overlapping memory? `same_global`: both are
+ * named and name one global. Otherwise two named records never do; a named and
+ * a typed one do when the global's type holds the type (`a_holds_b`); two typed
+ * ones when either type holds the other. */
+int zer_access_may_alias(int same_global, int both_named, int a_holds_b, int b_holds_a) {
+    if (same_global != 0) {
+        return 1;
+    }
+    if (both_named != 0) {
+        return 0;
+    }
+    if (a_holds_b != 0) {
+        return 1;
+    }
+    if (b_holds_a != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+/* A local reference is KNOWN — it points only where the values assigned to it
+ * point — iff its name is one variable, its address is never taken, and every
+ * value assigned to it is itself known. */
+int zer_local_ref_known(int bound_once, int addr_taken, int values_known) {
+    if (bound_once == 0) {
+        return 0;
+    }
+    if (addr_taken != 0) {
+        return 0;
+    }
+    if (values_known == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* A global reference is its initializer iff it is const or never re-aimed. */
+int zer_global_ref_known(int is_const, int never_mutated) {
+    if (is_const != 0) {
+        return 1;
+    }
+    if (never_mutated == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* A FRESH heap object is the allocating thread's own iff the reference to it
+ * never leaves the name it was bound to. */
+int zer_fresh_ref_own(int fresh, int leaves) {
+    if (fresh == 0) {
+        return 0;
+    }
+    if (leaves != 0) {
+        return 0;
+    }
+    return 1;
+}

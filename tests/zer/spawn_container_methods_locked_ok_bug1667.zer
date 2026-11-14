@@ -1,0 +1,66 @@
+// BUG-1667 / BUG-1668, the precision half. A builtin container method (Pool / Slab / Ring / Arena, the
+// universal alloc / free) rewrites its container, and a `static` local is one object for every thread —
+// both are judged like any other shared write when the thread uses an @atomic. Under ONE lock every one
+// of them is fine; so is a static local touched only atomically. Exact results.
+u32 flagx;
+u32 lk;
+u32 total;
+u32 popped;
+u32 carved;
+
+struct PNode { u32 v; }
+struct SNode { u32 v; }
+struct HNode { u32 v; }
+struct Blk { u32 a; u32 b; }
+
+Pool(PNode, 8) pl;
+Slab(SNode) sl;
+Ring(u32, 16) rg;
+u8[8192] backing;
+Arena ar;
+
+u32 next_id() {
+    static u32 seq;
+    return @atomic_add(&seq, 1);
+}
+
+u32 count_call() {
+    static u32 calls;
+    calls += 1;
+    return calls;
+}
+
+void worker() {
+    @atomic_store(&flagx, 1);
+    for (u32 r = 0; r < 200; r += 1) {
+        u32 id = next_id();
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        ?Handle(PNode) mh = pl.alloc();
+        if (mh) |h| { h.v = 1; total += h.v; pl.free(h); }
+        ?Handle(SNode) ms = sl.alloc();
+        if (ms) |h| { h.v = 2; total += h.v; sl.free(h); }
+        ?*HNode mp = alloc(HNode);
+        if (mp) |p| { p.v = 3; total += p.v; free(p); }
+        rg.push(4);
+        u32 x = rg.pop() orelse 0;
+        popped += x;
+        ?*Blk mb = ar.alloc(Blk);
+        if (mb) |b| { b.a = 1; carved += b.a; }
+        count_call();
+        @atomic_store(&lk, 0);
+        if (id > 100000) { return; }
+    }
+}
+
+i32 main() {
+    ar = Arena.over(backing);
+    ThreadHandle a = spawn worker();
+    ThreadHandle b = spawn worker();
+    a.join(); b.join();
+    if (total != 2400) { return 1; }
+    if (popped != 1600) { return 2; }
+    if (carved != 400) { return 3; }
+    if (next_id() != 400) { return 4; }
+    if (count_call() != 401) { return 5; }
+    return 0;
+}

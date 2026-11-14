@@ -1,0 +1,16 @@
+// expect-error: both reach 'arr'
+// BUG-1669: an ARRAY handed to a slice parameter is a view of it — `both(arr, arr)` is
+// `both(arr[0..], arr[0..])`. The lent-argument rule (BUG-1303) asked the ARGUMENT's type, found an array
+// ("not a reference") and gave it no root, so one object went in twice under no name: `both` lends the
+// first to a thread and writes through the second before the join. TSan: data race on the pre-fix compiler.
+void child([*]u32 q) { for (u32 r = 0; r < 100000; r += 1) { q[0] += 1; } }
+void both([*]u32 s1, [*]u32 s2) {
+    ThreadHandle t = spawn child(s1);
+    for (u32 r = 0; r < 100000; r += 1) { s2[0] += 1; }
+    t.join();
+}
+i32 main() {
+    u32[4] arr;
+    both(arr, arr);
+    return 0;
+}

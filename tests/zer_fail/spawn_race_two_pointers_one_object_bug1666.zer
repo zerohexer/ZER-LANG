@@ -1,6 +1,7 @@
-// GAP (2026-11-14, docs/limitations.md section B item 11): two global pointers hold ONE heap object; a thread
-// works through each. The context walk keys each access by the pointer it came through, so the two never meet.
-// ThreadSanitizer reports a data race. Compile-clean IS the gap.
+// expect-error: reached through a reference the compiler cannot name
+// BUG-1666 (was docs/limitations.md B.11): two global pointers hold ONE heap object; a thread works through each. Each access was
+// keyed by the pointer it came through, so the two never met.
+// ThreadSanitizer reported a data race on the pre-fix compiler, which accepted this.
 u32 flagx;
 struct Node { u32 v; }
 ?*Node p1;

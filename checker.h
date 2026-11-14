@@ -299,6 +299,9 @@ typedef struct {
      * statement that could begin or end a spin-lock region
      * (sync_stmt_is_lock_boundary) and never steps back. */
     uint32_t lock_region, lock_region_seq;
+    /* BUG-1666: some buffer backs an Arena (arena_backing_note) — typed objects
+     * are then carved out of BYTE storage, and a byte access may overlap any type */
+    bool any_arena_backing;
     RmwTaintEnt *rmw_taints;
     int rmw_taint_count;
     int rmw_taint_capacity;
@@ -553,7 +556,10 @@ typedef struct {
                                * scan found no plain global access at all */
         /* BUG-1565: the globals each argument points at (or carries a pointer
          * to), resolved at the spawn while its scope is live */
-        struct SyncArgBind { int param; Symbol *g; bool direct; } *binds;
+        /* `g` NULL with `unk`: the argument may carry a reference the spawn
+         * site could not follow (BUG-1666) */
+        struct SyncArgBind { int param; Symbol *g; bool direct; bool unk; } *binds;
+        bool binds_lost;   /* a row could not be recorded: the thread's walk is incomplete */
         int nbind;
         const char *file; const char *source;
         int line;

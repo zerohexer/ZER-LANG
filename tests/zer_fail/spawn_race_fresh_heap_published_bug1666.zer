@@ -1,0 +1,30 @@
+// expect-error: reached through a reference the compiler cannot name
+// BUG-1666, the own-heap rule (access_alias.v: published_is_shared). A fresh `alloc` is the thread's own
+// only while its reference never leaves the name. Here it is stored in a global under a lock; the writer
+// then keeps writing through its name with no lock, and the reader writes through the published copy.
+u32 flagx;
+u32 lk;
+?[*]u32 shared_buf = null;
+void wr() {
+    @atomic_store(&flagx, 1);
+    [*]u32 buf = alloc(u32, 64) orelse return;
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    shared_buf = buf;
+    @atomic_store(&lk, 0);
+    for (u32 r = 0; r < 100000; r += 1) { buf[0] += 1; }
+}
+void rd() {
+    @atomic_store(&flagx, 1);
+    for (u32 r = 0; r < 100000; r += 1) {
+        while (!@atomic_cas(&lk, 0, 1)) { }
+        ?[*]u32 m = shared_buf;
+        @atomic_store(&lk, 0);
+        if (m) |s| { s[0] += 1; }
+    }
+}
+i32 main() {
+    ThreadHandle a = spawn wr();
+    ThreadHandle b = spawn rd();
+    a.join(); b.join();
+    return 0;
+}

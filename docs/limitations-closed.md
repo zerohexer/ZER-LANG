@@ -8254,3 +8254,52 @@ open as its own entry in `docs/limitations.md`. The entry as it stood:
    literal, a pointer name's declaration and reassignments, and parameters — not a pointer
    read back out of memory (`*pp`, a pointer field of a global loaded at run time). A
    C caller is still invisible beyond "may run more than once".
+
+## CLOSED 2026-11-14 by BUG-1666 — an access through a pointer the context walk cannot name (section B item 11)
+
+Closed model-first (`access_alias.v`): an access through a reference that is not KNOWN to
+point only into recorded globals or the thread's own stack is recorded as "some object of
+the pointee type", and records are compared by may-alias. Built as designed below, except
+(iv): unknown does not make the set incomplete — it gets a typed record, which is the
+"payable over-rejection" the entry named, paid at once. The eight reproducers moved to
+`tests/zer_fail/spawn_race_*_bug1666.zer`. What the fix left open is the residual entry in
+`docs/limitations.md` section B item 11. The entry as it stood:
+
+11. **OPEN, accept-unsafe (found 2026-11-14, ThreadSanitizer-confirmed; every baseline
+   accepts it): an access through a pointer the context walk cannot NAME.** When a thread
+   uses any `@atomic_*` / `@barrier`, the spawn scan's "touches a non-shared global"
+   finding is a warning and the context walk judges each access against the other
+   threads'. The walk has three answers for where a reference points — KNOWN globals
+   (recorded), the thread's OWN STACK (private), and UNKNOWN — and treats unknown as
+   private. Eight measured shapes, one executed reproducer each in `tests/zer_gaps/`
+   (`spawn_race_*`; two threads, two warnings, a data race):
+   - *unknown, taken for private:* a pointer loaded out of memory and bound to a new name
+     (`…through_loaded_pointer`), returned by a call (`…through_returned_pointer`),
+     planted in a local struct by a callee (`…local_struct_filled_by_callee`) or in a
+     local pointer through a pointer to it (`…pointer_to_local_pointer`), or assigned
+     LATER in the loop than the access (`…pointer_reassigned_in_loop` — bindings are read
+     in source order);
+   - *known, keyed by the wrong name:* two global pointers to one heap object
+     (`…two_pointers_one_object`), two Handles for one pool slot
+     (`…two_handles_one_slot` — a Handle dereference is not recorded as an access to its
+     Pool), a global struct's pointer field against the global it points at
+     (`…global_struct_pointer_vs_name`).
+   (A never-reassigned global pointer used by name, `**gpp`, a view slice, two threads
+   through the SAME global struct or Handle ARE caught: measured.)
+   **Design of the fix, measured but not built.** (i) A local's class must be
+   flow-INSENSITIVE: its declaration plus every write of the name or of part of it
+   anywhere in the function, and its address being taken — `ast_name_writes_parts` is that
+   walk; a name bound more than once is unknown. (ii) A dereference through a GLOBAL must
+   record what the global may hold (the enumerating resolver `for_each_write_target_ex`,
+   not the single-answer `resolve_write_target_global` the walk uses), and that resolver
+   needs a "could not follow" answer. (iii) A Handle dereference records its allocator
+   (`field.handle_alloc`). (iv) What remains unknown makes the access set INCOMPLETE, as
+   the depth cap does (BUG-1665): an incomplete set of such a thread is an error. A
+   scratch build of (iii) + (iv) with a source-ordered (i) rejects five of the eight shapes
+   and changes NO other verdict in the corpus (4,000 files) — the cost of being strict is
+   small, and threads that use no `@atomic` are already held to "touch no non-shared
+   global at all". The payable over-rejection afterwards: an access through an unknown
+   pointer under a lock every writer holds (key such accesses by pointee TYPE instead of
+   refusing them), and a thread's own never-published heap object. Until it is built:
+   reach shared data by name or by index, not through a pointer fetched at run time, or
+   keep it in a `shared struct`.

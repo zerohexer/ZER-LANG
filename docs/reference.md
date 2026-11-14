@@ -7013,6 +7013,54 @@ A reader that waits for the value the flag STARTS with (`while (@atomic_load(&re
 reads it — both are compile errors, and a warning at the store says which rule broke. A
 ping-pong (each side waits for its own value and stores the other's) may loop for ever.
 
+**What a thread touches when it goes through a reference (BUG-1666..1668).** In a thread
+that uses an `@atomic_*` / `@barrier`, every plain access is judged against the other
+threads' — two accesses of one object, one of them a write, need a common lock or a
+hand-off. An access by name is an access of that global. An access through a reference is
+an access of whatever the reference may point at:
+- *known:* `&g`, a view of `g`, a local bound to one and never re-aimed elsewhere — the
+  global itself; `&x` of the thread's own local — nothing another thread can reach;
+- *unknown:* a pointer returned by a call, loaded out of a struct or another pointer,
+  captured by `|v|`, or held in a local that anything else writes (a later assignment, a
+  callee through `&p`) — "some object of the pointee type". It meets every unordered
+  access through another unknown reference to that type, and every unordered access of a
+  global that contains one.
+- *a fresh allocation is the thread's own* — `[*]u32 buf = alloc(u32, n) orelse return;`,
+  `*T n = alloc(T) orelse return;` — for as long as the reference stays in that one name:
+  `buf[i]`, `n.field`, `buf.len` and `free(buf)` are all the name may be used for. Copy
+  it, pass it to a function, return it, take `&buf[i]` or a sub-slice, and it is unknown.
+- *a container method runs inside the container:* `pool.alloc()`, `slab.free(h)`,
+  `ring.push(x)`, `arena.alloc(T)`, `T.alloc()`, and `alloc(T)` / `free(p)` (the
+  allocator behind a struct type takes no lock) are writes of it; `get` is a read. Two
+  threads may call them under one lock. `alloc(T, n)` and `free(slice)` are the C heap's,
+  and need none.
+- *a `static` local is one object for every thread* that runs its function, exactly like
+  a global.
+<!-- audit: expect-error: reached through a reference the compiler cannot name -->
+```zer
+u32 flag;
+u32 total;
+*u32 current() { return &total; }
+void worker() {
+    @atomic_store(&flag, 1);
+    for (u32 i = 0; i < 100; i += 1) {
+        *u32 p = current();
+        *p += 1;          // some u32 — the other worker's `*p` may be the same one
+    }
+}
+u32 main() {
+    ThreadHandle a = spawn worker();
+    ThreadHandle b = spawn worker();
+    a.join(); b.join();
+    return 0;
+}
+```
+Take one lock around the access (`while (!@atomic_cas(&lk, 0, 1)) { }` … `@atomic_store(&lk,
+0);`), or reach the data by name. A function that lends one slice parameter to a scoped
+spawn and uses another before the join must be given two objects: an array handed to a
+slice parameter is a view of it, so `both(arr, arr)` is refused like `both(&x, &x)`
+(BUG-1669).
+
 ### Condvar — Thread Synchronization
 ```zer
 shared struct Queue { u32 count; }

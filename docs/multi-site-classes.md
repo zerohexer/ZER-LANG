@@ -10,7 +10,95 @@ the code, plus one index line in `CLAUDE.md`. Counts quoted in rows are illustra
 drift — RUN the gate. The text below was moved out of `CLAUDE.md` on 2026-11-13 (it was
 80 KB of an always-loaded file) and is unchanged apart from one corrected helper name.
 
+## The index — class → the ONE query → gate
+
+One line per class; the full row (sites, history, traps) is further down — find it by the
+class name. `pNN` = a SHAPE in `tools/sink_matrix.sh`; "conc" / "hw" =
+`tests/test_conc_matrix.c` / `tests/test_hw_matrix.c`. Moved here from `CLAUDE.md` on
+2026-11-14 so the always-loaded file stays within its budget.
+
+
+| Class (the question) | The ONE query / helper | Gate |
+|---|---|---|
+| Escape / keep: is this value frame-bound? (source AND destination side) | `call_result_escapes`, `arg_is_local_derived`, `classify_escape_sink` | sink matrix — a shape with no cell is invisible |
+| VRP: where an expression is evaluated vs checked (loop cond, for step, counter lower bound) | loop-carried ranges; `ast_name_mutated_or_addrd` | `tests/test_vrp_position_matrix.c` |
+| VRP: is the recorded range still TRUE here? (identity, constant, invalidation, hoist, summary) | `vrp_key_root`, `vrp_const_value`, `vrp_widen_global_like`, `vrp_guard_hoist_sound`, `vrp_record_return_range` | `tests/test_vrp_fact_matrix.c` (runtime oracle) |
+| Condition facts: what does a true / false condition prove? | `vrp_push_cond_facts` gated on `vrp_cond_effect_free` | vrp-position matrix |
+| Return-range summary: which `return`s were unioned? | `scan_expr_orelse_returns` at every expression position | `zer_trap/return_range_orelse_in_*` |
+| Is this NAME the global? (identity, not existence) | `name_is_global_here`, `name_is_shadowed_here` | p70, p71 |
+| Is this name ever written? (trusting an initializer) | `ast_name_writes_r` (mode), `global_name_never_mutated` | `funcptr_global_*_bug1609` |
+| Which context runs a body: main or interrupt? | `isrref_body_isr_only` | hw `isr-helper-*` / `isr-only-*` |
+| A C function at the ZER boundary (prefix, `*opaque` bridge, alias, variadic, signature) | `unprefix_c_externs`, `emit_c_extern_opaque_bridge`, `emit_c_extern_alias_decl`, `variadic_arg_is_c_scalar`, `check_c_extern_signatures` | `tests/test_lib.sh` |
+| Node-kind walkers | exhaustive `switch`, no `default:` | `-Werror=switch`, `walker_default_audit.sh`, `audit_walker_fields.sh` |
+| Type-kind dispatch | `type_dispatch_kind()` | `audit_type_dispatch.sh` |
+| A wrapper hides the inner kind (`?T`, distinct, array, struct carrying a pointer) | `type_carries_data_pointer`, `type_can_carry_pointer`, `escape_type_carries_ref` | `audit_carrier_dispatch.sh` (emitter.c excluded on purpose) |
+| `volatile` race-check exemption | `volatile_global_exempt_from_race_check` | hw SITE x SHAPE volatile grid |
+| Spawn-arg gates: does this arg let the child reach my memory? | `type_carries_handle`, `type_carries_nonshared_pointer` | conc CARRIER grid |
+| Funcptr REACH: which function does this callback run? (spawn AND ISR sinks) | `scan_funcname_binding`, `scan_returned_funcname`, `func_forwards_param_to_spawn`, `funcptr_sig_racy_target`, `global_bound_functions`, `indirect_callee_functions`, `for_each_orelse_block`; from an argument's type: `funcptr_first_reached` | conc REACH grid + ISR sub-grid |
+| Non-atomic RMW on a shared global (site x spelling x position x reach x call x aim) | `resolve_write_target_global`, `assign_reads_own_target`, `for_each_write_target`, `vf_summary`, `call_rmw_globals`, `carrier_value_global` | hw RMW FORM grid |
+| Is this statement an RMW of volatile `g` — in a THREAD, or in a spawner's WINDOW? | the main checker classifies once and records a fact per statement (`vol_rmw_fact_add`); `sync_walk` reads it (`sync_vol_rmw_facts`); locked: `check_volatile_locked_rmw`. Never teach the spawn scan a spelling by hand | hw "volatile RMW at the thread sinks" |
+| A shared struct's `*opaque` handle leaving its lock (cast, call, return, store, spawn) | `opaque_read_from_shared` + `shared_opaque_value`; `reject_shared_opaque_unwrap`, `reject_shared_opaque_leak`, `check_shared_opaque_store`. Only C may receive it | conc "shared *opaque handle leaves the lock" |
+| One object passed as TWO arguments to a function that lends one of them to a thread | `alias_arg_root` (an unresolvable argument is `_alias_unknown_root`: it may alias anything), `alias_pair_has`, `check_alias_spawn_calls` | conc "one object as two arguments of a lending function" |
+| A copy of a volatile global held in MEMORY (split RMW) | `mem_edge_add` / `check_mem_split_rmw`, `rmw_taint_maintain`, `VfSummary.gin` | hw "RMW split through memory" |
+| ISR single writer (tick-counter relaxation) | `isr_rmw_regular_code_only_reads` | hw SINGLE-WRITER grid |
+| Static locals in a race scan | `static_local_record` | hw STATIC-LOCAL grid |
+| When is a plain access CONCURRENT? | refcounted `after_spawn_in_func` | conc CONCURRENT-WINDOW grid |
+| A window fact kept in TEXT ORDER (is the thread running HERE?) | `win_exits_live` (closed vs open), `zer_window_join_releases`, `esc_latch_enter`; proven: `lambda_zer_concurrency/window_cfg.v` | conc jump x spawn-window grid |
+| Scoped-spawn borrow: what does this argument LEND? | `Symbol.borrow_root_name`, `walk_callee_globals` | p20, p32 |
+| A `shared(rw)` lock held across a call | `lockchk_direct_only` ∩ `lockchk_callee_only` | conc RE-ENTRY grid |
+| Lock order across a call (another INSTANCE of a held type) | `FuncSharedTypes.inst_*`, `lockchk_check_call` | p58 |
+| Two shared structs in ONE spawn argument | `collect_shared_in_spawn_args` | p23 |
+| An async task: what it holds, who runs while it is suspended | `async_init_keep_sig`, `ir_async_task_call`, `ir_suspend_barrier`; re-entry traps (`_zer_running`) | p40, `zer_trap/async_reentrant_poll_*` |
+| Launder peel: does this wrapper keep provenance / allocation identity? | `unwrap_ptr_launder` (checker), `ir_peel_launder` (zercheck_ir); `orelse` is a JOIN → `value_frame_bound_symbol` | p15, p15b |
+| Call-result VIEW: which call is this value a view of? | `value_escaping_call` | p74, p75, p76 |
+| A taint "kill": does the reassignment replace the value on EVERY path? | `bk_replaces` | p72, p73 |
+| Escape taint POSITION (back edge, goto, defer body) | the escape fixpoint in `check_func_body`; `esc_restore` | p61, `audit_esc_restore.sh` |
+| Block lifetime: does the destination outlive the block? | `check_block_lifetime_escape` | p69 |
+| A struct LITERAL's field value | `struct_init_has_local_derived` → `arg_is_local_derived` | p35 |
+| Which FRAME holds an array that becomes a view? | `array_storage_frame_root`, `array_view_frame_root` | p60 |
+| Forming a slice over an ARRAY (qualifiers, packed) | `reject_array_view_hazards`, `make_array_view_explicit` | — |
+| Misaligned view into a packed struct | `addr_of_is_packed_field`, `packed_array_field_view` | p22 |
+| View-header write (`s.len = …`) | `view_header_field` | — |
+| Unique-resource COPY (Arena / Pool / Ring / Barrier …) | `unique_resource_name`, `reject_unique_resource_copy` | p21 |
+| Keep inference: which non-keep params does this VALUE carry? | `keep_value_roots`, `taint_nonkeep_from_value` | p51 |
+| Value-flow compatibility (8 sites; the global init is the forgotten one) | `value_flows_to` | — |
+| The carrier of an incoming allocation (SLICE too) | call-result registration AND `ir_type_is_ptrish` — they must agree | p26 |
+| Two SPELLINGS of one operation (`x = alloc()` vs `T x = alloc()`) | `ir_register_alloc_result` | write both spellings |
+| A CALL kept inside a passthrough instruction (the assign spelling, an orelse fallback, an intrinsic argument) | `ir_passthrough_calls`, `ir_apply_passthrough_calls` | p54 |
+| An allocation stored into a SLOT | `ir_register_alloc_result_compound`, `ir_global_projection_key`, `ir_carry_compounds` | p25 |
+| A store / read THROUGH a pointer: which object does `*p` name? | `ir_ptr_stable_aim`, `ir_reroot_views`, `ir_view_set_of_value` | p53, p55, p57 |
+| Allocation VIEW roots: which slot does `&place` name? | `ir_view_set_of_value`, `ir_place_fixed_below_root`, `ir_local_view_place` | p77 |
+| View into an allocation: what does this view point into? | `ir_view_root_ident`, `keep_view_root_ident` | p19 |
+| What a callee STORES of its params | `ir_ps_scan` → `ir_apply_param_stores` | p50 |
+| What a callee FREES through a pointer-to-reference param | `ir_param_deref_slot`, `ir_apply_param_deref_frees` | p68 |
+| A call argument that is itself a call result | `ir_resolve_returned_arg` | p49 |
+| Raw-AST argument positions in zercheck_ir | call BOTH `ir_check_expr_uaf` and `ir_check_expr_wrong_pool` | `audit_walker_fields.sh` |
+| A construct modelled as a FLAG (`orelse return` / `break` / `continue`) | restate every rule of the real statement beside the flag | p24 |
+| Assignment TARGET before VALUE (three lowering sites) | `hoist_place_effects`, `hoist_target_indices` | `assign_target_before_value_bug1618` |
+| Synthesized AST naming an IR local | `make_local_ident` | — |
+| Defer-body statement coverage | ONE lowering path (`emit_defer_body`, `IRInst.defer_tpl`) | defer-goto matrix |
+| Use-before-init of a resource (Arena, Barrier) | `check_resource_init` | — |
+| A whole-program POST PASS sees every module | `checker_post_passes_files` | `test_modules/*_user_negative.zer` |
+| Trusting a GLOBAL's declaration initializer | `global_name_never_mutated` | — |
+| A constant MMIO address | `mmio_const_addr` | — |
+| Does this expression mention name X? | one no-`default:` walker | — |
+| Emitter dual dispatch (AST + IR) | two handlers | two `grep` hits; `emit_audit.sh` |
+| Indirect call through a possibly-NULL funcptr (three call emitters) | `call_needs_null_funcptr_guard`, `emit_ir_call_callee` | `emit_audit.sh` required fingerprint |
+| A value LOADED out of memory that auto-zero may have forged | `load_guard_kind`, `nn_guard_wanted` | `zer_trap/nonnull_*` |
+| A forgeable scalar / enum-forge doors (exactly three guarded: `@bitcast`, `@truncate`, `@saturate`) | the emitter's forgeable-scalar guard walk, `bitcast_target_mints`, `type_carries_forgeable` | `zer_trap/*_enum_forged_*` |
+| An intrinsic's ADVERTISED runtime check: for which operand types is it constant or absent? | `pun_type_id_check_can_fire` (mirrors the emitter) | checklist |
+| The runtime type tag a `*opaque` carries | `opaque_type_id`, `opaque_type_id_nominal` | — |
+| A write INTO a union variant that is not the whole variant | `union_partial_write_target`, `emit_union_reset_prefix` | — |
+| A new value-producing op (uN / iN mask) | `emit_intn_mask` at every op | `tests/zer/uN_width_wrap_all_forms.zer` |
+| Rendering a `double` into C | `emit_double_lit` | `audit_float_literal.sh` |
+| Naming a slice typedef: which C type is `[*]E`? | `emit_slice_name`, `emit_ptr_to_elem` | `slice_elem_*_bug1027` |
+| The C NAME of a user identifier / a module's container global | `c_reserved_ident`, `local_avoid_global_name`, `emit_module_global_name`, `emit_alloc_sym_cname`; generated names are `_zer_`-prefixed | `test_modules/arena_user.zer` |
+| A privileged instruction chosen by target macros; user mode vs bare metal | the precise target macro; `_ZER_USER_MODE` | `emit_audit.sh` per-target; `tools/cross_target_sweep.sh` (by hand) |
+| Documented examples still compile and run | — | `audit_reference_examples.sh` |
+
 ---
+
+## The full rows
 
 **MULTI-SITE SAFETY IS THE #1 RECURRING BUG CLASS — enumerate ALL sibling sites,
 never fix just the reported one, and gate the class so a new sibling can't silently
@@ -73,6 +161,7 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **A window fact kept in TEXT ORDER ("is the thread running HERE?")** | the scoped borrow, `after_spawn_in_func`, the lent-param mask, lent globals, the atomic-downgrade phases — every fact set at a spawn and cleared at a join | BUG-1648/1651: text order is not execution order (goto; a `break` out of the window; another handle's join). A window is CLOSED only if no path leaves its interior with the thread running (`win_exits_live`) — then the textual rule is exact; otherwise OPEN, released only by its own handle's TAIL JOIN (`zer_window_join_releases`), borrowed from the entry in a labelled function. Proven: **`lambda_zer_concurrency/window_cfg.v`** (`window_sound` over any CFG). A new per-function window fact must be opened in `esc_latch_enter` and released only at the join. Gate: **jump x spawn-window grid in `tests/test_conc_matrix.c`** (the closed-pair and exit-after-join positives are load-bearing) |
 | **A read-modify-write of a volatile flag at the THREAD sinks ("is this statement an RMW of g — in a thread, or in a spawner's window?")** | the spawn scan (`spawn_rmw_visit`, its own taint table), the spawner's-window rule (BUG-1591), the main checker's sink (`main_rmw_visit` + the call sinks) | BUG-1652: the main checker is the ONE classifier; it records a FACT per statement node (`vol_rmw_fact_add`, through-parameter: `vol_rmw_pfact_add` from `rmw_scan_body`) and `sync_walk` reads them (`sync_vol_rmw_facts`) in thread mode and window mode. A thread's RMW is refused unless under a CAS lock, and then every other store must hold it (`vol_store_note` / `check_volatile_locked_rmw`). A spelling taught to `main_rmw_visit` reaches all sinks; do NOT teach the spawn scan a spelling by hand. `sync_descend` runs a window walk's callees in the THREAD phase — test the walk's `rmw_mode`, not its phase. Gate: **"volatile RMW at the thread sinks" in `tests/test_hw_matrix.c`** (SINK x SPELLING; the `ok:` cells are load-bearing — `@once`, locked, threadlocal, helper store) |
 | **A shared struct's `*opaque` handle leaving its lock ("can this value be turned back into a ZER pointer where no lock is held?")** | the cast sinks (C-style, `@ptrcast`, `@pun`) and every way the value is handed on: call argument, function-pointer call, spawn argument, `return`, a store into a global / through a pointer; carried by a bare local, a field of a local struct, a struct literal, an if-unwrap capture | ONE read query `opaque_read_from_shared` (+ the typed gate `shared_opaque_value`) and ONE reporter per direction: `reject_shared_opaque_unwrap` at a cast (BUG-1299), `reject_shared_opaque_leak` / `check_shared_opaque_store` at a hand-on (BUG-1653). Only a C function (no body) may receive it. The return hook must run AFTER the expression is type-checked (the gate reads its type — the first draft sat above `check_expr` and never fired). A new value-flow sink needs the leak call. Gate: **"shared *opaque handle leaves the lock" in `tests/test_conc_matrix.c`** (SINK x CARRIER; the `ok:` cells — to C, scalars — are load-bearing) |
+| **One object passed as TWO arguments to a function that lends one of them to a thread ("are these two arguments the same object?")** | every SPELLING of a pointer / slice argument: `&v`, `&v.f`, `v[..]`, a pointer local, a projection through one, a call result, a pointer read out of a struct field, a getter of a global — against the callee's (lent i, used j) parameter pairs and the globals it lends by name | ONE resolver `alias_arg_root`. BUG-1303 named the object; BUG-1646 followed a pointer local through a projection; BUG-1654: a spelling it CANNOT name is the sentinel `_alias_unknown_root`, which may alias any other pointer argument and any lent global (NULL used to mean "different from everything" — the accept direction), and a field / element read resolves through the carrier's `borrow_root_name`. The pairs come from `Symbol.alias_pairs` (fixpoint in `check_alias_spawn_calls`), so a call to a function that lends nothing is untouched. A new argument spelling needs a resolver arm or it is "unknown" — which is safe, and loud. Gate: **"one object as two arguments of a lending function" in `tests/test_conc_matrix.c`** (SPELLING x {same, distinct}) |
 | **A copy of a volatile global held in MEMORY (split read-modify-write)** | a named local (BUG-1010), a global carrier, the object behind a local pointer, a callee's out-parameter, a loop back edge | BUG-1650: `mem_edge_add` / `check_mem_split_rmw` (whole program), `rmw_taint_maintain` (pointer + borrow root), `VfSummary.gin` + `main_call_gin`, `EscState.rmw`. Gate: **"RMW split through memory" in `tests/test_hw_matrix.c`** |
 | **Static locals in a race scan ("is this shared state?")** | the spawn scan (`scan_unsafe_global_access`) and the ISR scan (`record_isr_globals`) — their NODE_VAR_DECL arms were BYTE-IDENTICAL | ONE scan-scoped table + `static_local_record` at both (BUG-971). A `static u32 c` inside a function is ONE object for every thread AND for main-vs-ISR, but has no global-scope Symbol, and both scans resolve via `scope_lookup(c->global_scope, …)` — so NEITHER saw it. Table, not a threaded body root: the scan has SEVEN entry points. `check_interrupt_safety` also had to stop `continue`-ing on a name with no global Symbol. Exemptions match a global's (`const`, single-word `volatile`). Gate: **STATIC-LOCAL GRID in `tests/test_hw_matrix.c`** (SITE x SHAPE, so disagreement fails). ~~`test_hw_matrix` AUTO-DETECTS `./zerc` from the CWD and IGNORES argv[1]~~ — since BUG-1010 (2026-09-13) EVERY `tests/test_*_matrix.c` grid honours **`ZER_MATRIX_ZERC=<path>`**; that is how a new cell is shown to FIRE against a pre-fix build (`ZER_MATRIX_ZERC=/tmp/headb/zerc ./test_hw_matrix`) |
 | **Unique-resource COPY ("does this make a second owner of one buffer?")** | the seven value-flow sinks: var-decl init, global init, call arg, orelse fallback, struct-init field, spawn arg, return | ONE predicate **`unique_resource_name`** (recurses struct/union FIELDS + array elements) + ONE reporter **`reject_unique_resource_copy`** (BUG-970). Arena/Barrier/Semaphore were refused NOWHERE; Pool/Ring/Slab at ONE site only. `Arena b = a;` then one alloc from each returned the SAME BYTES. **Test the VALUE, not the target type** — `Arena.over(buf)` is FRESH, not a copy, which is why the old rule could only live at one site. **The RETURN sink is narrower on purpose**: returning a LOCAL is a MOVE (the idiomatic factory), returning a GLOBAL is a copy. **The remedy differs by type — MEASURE it**: `*Barrier`/`*Semaphore` params work, `*Arena`/`*Pool`/`*Slab`/`*Ring` do NOT (no methods through a pointer). Gate: **p21 in `tools/sink_matrix.sh`** |

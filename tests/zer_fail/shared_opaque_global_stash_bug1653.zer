@@ -1,0 +1,17 @@
+// expect-error: is stored where it outlives the function
+// BUG-1653: parked in a plain global, the handle can be cast back anywhere, long
+// after the statement that read it released the struct's lock. (No thread touches
+// `gh` here on purpose: the spawn scan would refuse that for its own reason and
+// this file would prove nothing about the store rule.)
+struct Dev { u32 v; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+?*opaque gh = null;
+void stash() { gh = r.handle; }
+u32 main() {
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    stash();
+    return 0;
+}

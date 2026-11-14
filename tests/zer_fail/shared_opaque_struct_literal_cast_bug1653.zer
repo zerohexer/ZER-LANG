@@ -1,0 +1,22 @@
+// expect-error: turns a *opaque read out of a shared struct into a ZER pointer
+// BUG-1653: a struct LITERAL (and a field store into a local struct) carried the
+// handle past the BUG-1299 cast rule, which looked at bare locals only.
+struct Box { *opaque h; }
+struct Dev { u32 v; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+void w() {
+    Box b = { .h = r.handle };
+    *Dev d = (*Dev)b.h;
+    d.v += 1;
+}
+u32 main() {
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join();
+    b.join();
+    return 0;
+}

@@ -168,12 +168,17 @@ What is machine-checked, and where the chain stops:
   enforces it on every program form. "100% data-race-free, proven" is therefore NOT a claim
   this tree supports; "no known accept-unsafe hole in the spawn-window rule, and that rule is
   proven" is.
-- Still OPEN and accept-unsafe (each recorded above or in the older sections): a `*opaque`
-  field of a shared struct handed to / returned from a ZER function that casts it back; two
+- Still OPEN and accept-unsafe (each recorded above or in the older sections): two
   pointers to one object the checker cannot name alike (`f(p, q)`, `q` from a call) at the
-  lent-param pair; the handler-side split RMW done in helpers. `cinclude` code is a floor.
+  lent-param pair. Recorded but NOT a race as far as measured: the handler-side split RMW
+  done in helpers (a handler is not preempted by main code). `cinclude` code is a floor.
 
 **C. Values / bare metal (LOW, loud).**
+- `r.handle = (*opaque)&gd;` — a cast-to-`*opaque` of an address assigned DIRECTLY into a
+  field of a shared struct — is accepted by the checker and refused by GCC ("conversion to
+  non-scalar type requested"): the assignment path emits the `_zer_opaque` wrap as a cast.
+  Found 2026-11-13 while probing BUG-1653. Workaround: bind it to a local first
+  (`*opaque h = (*opaque)&gd; r.handle = h;`).
 - A shift COUNT literal is typed against the LEFT operand: `u3 y = x << 8;` is "cannot
   initialize 'u3' with 'u32'" while `x << 7` compiles (the documented result is 0).
 - Shift typing: a shift's result is the COMMON type of its operands (by design), and a lone
@@ -623,10 +628,14 @@ What they leave:
 ## OPEN — concurrency residuals of the ag9 round (2026-09-24e; MEDIUM — accept-unsafe races; LOW — over-rejections)
 
 Each reproducer is in the ag9 report shape; none needs `cinclude`.
-- [residual of: **MEDIUM: a `*opaque` field of a shared struct cast back to a ZER pointer** — closed by BUG-1299]
-  **Residual (LOW):** the value handed to a ZER FUNCTION (`use(s.handle)` where
-  `use` casts its `*opaque` param) or returned from one (`*opaque get() { return s.handle; }`)
-  is not followed — a per-param "casts to a ZER pointer" summary would close it.
+- [residual of: a shared struct's `*opaque` handle leaving its lock — closed by BUG-1299, BUG-1653]
+  **Over-rejection (loud):** the handle may be passed only to C. Passing it to a ZER helper
+  DIRECTLY — `use(r.handle);` — is refused although that statement holds the struct's lock
+  across the whole call (measured: TSan clean), because nothing proves the helper does not
+  store or return its parameter. A per-parameter "does not leak" summary, combined with
+  "the argument is read from the shared struct in THIS statement", would recover it. The
+  type gate is `type_carries_data_pointer`, so a pointer-carrying field of a LOCAL struct
+  that also holds the handle is refused with it.
 
 - **LOW (over-rejection, from BUG-1276): a fire-and-forget thread may not write a global inside
   `@once`** — the publish-once exemption needs the parent's window to END, which only a join

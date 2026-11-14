@@ -4405,3 +4405,22 @@ on verification the plain-const variant IS rejected while the container variant
 silently dropped const — a real asymmetry, so it was fixed (reject), not waived.
 
 ---
+
+## CLOSED 2026-11-13 (BUG-1653) — a shared struct's `*opaque` handle handed on to where the cast rule could not see it
+
+Was open in `docs/limitations.md` as:
+
+- [residual of: **MEDIUM: a `*opaque` field of a shared struct cast back to a ZER pointer** — closed by BUG-1299]
+  **Residual (LOW):** the value handed to a ZER FUNCTION (`use(s.handle)` where
+  `use` casts its `*opaque` param) or returned from one (`*opaque get() { return s.handle; }`)
+  is not followed — a per-param "casts to a ZER pointer" summary would close it.
+
+Measured before the fix (ThreadSanitizer, two threads): `*opaque h = r.handle; use(h);` with
+`use` casting its parameter — data race; `*opaque get() { return r.handle; }` cast by the
+caller — data race; `void fill(*Box b) { b.h = r.handle; }` cast by the caller — data race.
+`use(r.handle);` with the field read in the call statement itself — NO race (the statement
+holds the lock across the call). The fix refuses every way the value leaves the function
+except into C (BUG-1653 in BUGS-FIXED.md); the precise direct-call case is the
+over-rejection recorded in its place. Gate: conc-matrix "shared *opaque handle leaves the
+lock" (SINK x CARRIER).
+

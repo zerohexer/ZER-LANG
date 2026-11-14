@@ -401,6 +401,27 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   `volatile_rmw_thread_sinks_ok_bug1652` (refused before); hw-matrix "volatile RMW at the
   thread sinks" (30 cells) + one ISR cell — 23 cells fail on the previous build.
 
+- **BUG-1653 — a shared struct's `*opaque` handle could leave its lock by being handed on.**
+  The lock is held for the STATEMENT that reads the field. BUG-1299 refused turning the
+  value back into a ZER pointer where it could see the value came from a shared struct (the
+  field, a local, a capture); every way of passing it on made that invisible:
+  `*opaque h = r.handle; use(h);` (`use` casts its parameter), `*opaque get() { return
+  r.handle; }` (the caller casts the result), `void fill(*Box b) { b.h = r.handle; }` (the
+  caller casts the field), a global stash — each TSan-confirmed, two threads writing the
+  object with no lock. Also `Box b; b.h = r.handle;` / `Box b = { .h = r.handle };` followed
+  by `(*Dev)b.h` walked past the cast rule itself, which looked at bare locals. A ZER pointer
+  field is refused in a shared struct outright, so the `*opaque` field is the one door, and
+  the rule is the one its diagnostic always stated: the value may sit in a local (or a part
+  of a local aggregate — both carry the fact) and may be passed to a C function; it may not
+  be passed to a ZER function or through a function pointer, to a thread, returned, or
+  stored in a global / through a pointer (`reject_shared_opaque_leak`,
+  `check_shared_opaque_store`; `opaque_read_from_shared` now reads a local aggregate's fact
+  and a struct literal's fields). Gated on the value's TYPE carrying a pointer, so scalar
+  fields of a shared struct flow freely. Corpus cost measured by compiling it: 0 verdict
+  changes. Tests: five `shared_opaque_*_bug1653` negatives, positive
+  `shared_opaque_handle_to_c_ok_bug1653` (runs); conc-matrix "shared *opaque handle leaves
+  the lock" (20 cells, 11 false negatives on the previous build).
+
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**
   (62 and 64 folded). It folds; only a result equal to the evaluator's sentinel bit pattern

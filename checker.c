@@ -6128,13 +6128,32 @@ static bool opaque_read_from_shared(Checker *c, Node *e) {
     for (int depth = 0; e && depth <= ZER_EXPR_WALK_MAX; depth++) {
         switch (e->kind) {
         case NODE_FIELD:
-        case NODE_INDEX:
-            return lvalue_path_through_shared(c, e);
+        case NODE_INDEX: {
+            if (lvalue_path_through_shared(c, e)) return true;
+            /* BUG-1653: a part of a LOCAL aggregate that was handed such a value */
+            Node *r = e;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX))
+                r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+            if (!r || r->kind != NODE_IDENT) return false;
+            Symbol *s = scope_lookup(c->current_scope, r->ident.name,
+                                     (uint32_t)r->ident.name_len);
+            return s && s->opaque_from_shared;
+        }
         case NODE_IDENT: {
             Symbol *s = scope_lookup(c->current_scope, e->ident.name,
                                      (uint32_t)e->ident.name_len);
             return s && s->opaque_from_shared;
         }
+        case NODE_STRUCT_INIT:   /* BUG-1653: a literal carrying one in a field */
+            for (int i = 0; i < e->struct_init.field_count; i++) {
+                Node *fv = e->struct_init.fields[i].value;
+                if (!fv) continue;
+                Type *ft = fv->kind == NODE_STRUCT_INIT ? NULL : checker_get_type(c, fv);
+                if (fv->kind != NODE_STRUCT_INIT && (!ft || !type_carries_data_pointer(ft, 0)))
+                    continue;
+                if (opaque_read_from_shared(c, fv)) return true;
+            }
+            return false;
         case NODE_TYPECAST:
             e = e->typecast.expr;
             continue;
@@ -6147,8 +6166,8 @@ static bool opaque_read_from_shared(Checker *c, Node *e) {
             e = e->orelse.expr;
             continue;
         /* Not a read of a stored *opaque: a call RESULT, a literal, arithmetic,
-         * a statement. (A call returning a shared field is the documented
-         * residual — limitations.md.) */
+         * a statement. (A ZER function cannot return one — BUG-1653 — so a call
+         * result is one only when the callee is C, which is the floor.) */
         case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
         case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
         case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
@@ -6161,7 +6180,6 @@ static bool opaque_read_from_shared(Checker *c, Node *e) {
         case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT:
         case NODE_NULL_LIT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
         case NODE_CALL: case NODE_SLICE: case NODE_CAST: case NODE_SIZEOF:
-        case NODE_STRUCT_INIT:
             return false;
         }
     }
@@ -6182,6 +6200,57 @@ static void reject_shared_opaque_unwrap(Checker *c, Node *src, Type *target, int
         "%s turns a *opaque read out of a shared struct into a ZER pointer — the "
         "object it points to would be accessed outside the struct's lock; keep ZER "
         "data in the shared struct itself, and pass a *opaque field only to C", what);
+}
+
+/* BUG-1653: THE HANDLE MUST NOT LEAVE THE STATEMENT'S REACH. The struct's lock is
+ * held for the statement that reads the field and for nothing after it. BUG-1299
+ * refused turning the value back into a ZER pointer where it could SEE that it
+ * came from a shared struct: at the field, at a local holding it, at a capture.
+ * Every way of handing it on made it invisible again —
+ *     *opaque h = r.handle;  use(h);          // `use` casts its parameter
+ *     *opaque get() { return r.handle; }      // the caller casts the result
+ *     void fill(*Box b) { b.h = r.handle; }   // the caller casts b.h
+ * each a write to the pointee from two threads with no lock held (TSan).
+ * A ZER pointer field is refused in a shared struct outright; the `*opaque` field
+ * exists for C handles, so the rule is the one its diagnostic always stated: the
+ * value may sit in a local (which then carries the fact) and may be passed to C.
+ * It may not be passed to a ZER function or a thread, returned, or stored where it
+ * outlives the function. */
+static bool target_path_derefs(Checker *c, Node *n);
+static bool shared_opaque_value(Checker *c, Node *v) {
+    if (!v) return false;
+    if (v->kind != NODE_STRUCT_INIT) {   /* a literal has no type of its own */
+        Type *vt = checker_get_type(c, v);
+        if (!vt || !type_carries_data_pointer(vt, 0)) return false;
+    }
+    return opaque_read_from_shared(c, v);
+}
+static void reject_shared_opaque_leak(Checker *c, Node *v, int line, const char *how) {
+    if (!shared_opaque_value(c, v)) return;
+    checker_error(c, line,
+        "a *opaque read out of a shared struct %s — the struct's lock is held only "
+        "for the statement that reads the field, so whoever turns the value back "
+        "into a ZER pointer reaches the object unlocked. Keep it in a local and "
+        "pass it only to C functions; keep ZER data in the shared struct itself", how);
+}
+static void check_shared_opaque_store(Checker *c, Node *node) {
+    Node *t = node->assign.target, *v = node->assign.value;
+    if (!t || !v || t->kind == NODE_IDENT) return;   /* a bare name: the caller's sticky flag */
+    if (!shared_opaque_value(c, v)) return;
+    if (lvalue_path_through_shared(c, t)) return;    /* stays behind a shared struct's lock */
+    Node *r = t;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX))
+        r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+    Symbol *rs = (r && r->kind == NODE_IDENT)
+        ? scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len) : NULL;
+    if (rs && !rs->is_function && !rs->is_static &&
+        !name_is_global_here(c, rs->name, (uint32_t)rs->name_len) &&
+        !target_path_derefs(c, t)) {
+        rs->opaque_from_shared = true;               /* a part of a local aggregate */
+        return;
+    }
+    reject_shared_opaque_leak(c, v, node->loc.line,
+        "is stored where it outlives the function (a global, or through a pointer)");
 }
 
 static void array_view_qualifiers(Checker *c, Node *v, bool *is_vol, bool *is_const) {
@@ -15698,6 +15767,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             /* BUG-1124: the same question for EVERY global the target may land on
              * (a retargeted pointer), each classified against its own name. */
             for_each_write_target(c, node->assign.target, main_rmw_visit, node);
+            check_shared_opaque_store(c, node);   /* BUG-1653 */
             track_mmio_register_write(c, node);   /* BUG-1358 */
 
             /* BUG-1010: maintain the taint. A plain `local = <expr>` SETS the
@@ -16321,9 +16391,16 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         tsym->nonkeep_root_mask = 0;
                     }
                     if (node->assign.target->kind == NODE_IDENT) {
-                        /* BUG-1299: sticky — a copy of a shared *opaque stays one. */
-                        if (opaque_read_from_shared(c, node->assign.value))
+                        /* BUG-1299: sticky — a copy of a shared *opaque stays one.
+                         * BUG-1653: a GLOBAL (or static) outlives the function. */
+                        if (opaque_read_from_shared(c, node->assign.value)) {
+                            if (tsym->is_static ||
+                                name_is_global_here(c, tsym->name, (uint32_t)tsym->name_len))
+                                reject_shared_opaque_leak(c, node->assign.value, node->loc.line,
+                                    "is stored where it outlives the function (a global, "
+                                    "or through a pointer)");
                             tsym->opaque_from_shared = true;
+                        }
                         /* BUG-1303: sticky too — once it held a param it may still. */
                         if (!tsym->param_alias_pos1)
                             tsym->param_alias_pos1 = param_alias_of_value(c, node->assign.value);
@@ -17738,6 +17815,20 @@ static Type *check_expr_impl(Checker *c, Node *node) {
         /* BUG-1561/1564: a call storing a value derived from a global back into
          * it (`wr(t + 1)` after `u32 t = rd();`, `wr(&g, g + 1)`, a forwarding
          * helper, an indirect call's candidates) read-modify-writes it. */
+        /* BUG-1653: only a C function (no body) may be handed the handle */
+        {
+            Node *ocal = node->call.callee;
+            Symbol *ofs = (ocal && ocal->kind == NODE_IDENT &&
+                           name_is_global_here(c, ocal->ident.name, (uint32_t)ocal->ident.name_len))
+                ? global_decl_lookup(c, ocal->ident.name, (uint32_t)ocal->ident.name_len) : NULL;
+            bool to_c = ofs && ofs->is_function && ofs->func_node &&
+                        ofs->func_node->kind == NODE_FUNC_DECL &&
+                        !ofs->func_node->func_decl.body;
+            if (!to_c)
+                for (int oi = 0; oi < node->call.arg_count; oi++)
+                    reject_shared_opaque_leak(c, node->call.args[oi], node->loc.line,
+                        "is passed to a ZER function (or through a function pointer)");
+        }
         call_rmw_globals(c, c->rmw_taints, c->rmw_taint_count, node, main_call_rmw_hit, node);
         vf_for_each_callee(c, node, main_call_gin, node);   /* BUG-1650 */
         if (node->call.callee) {
@@ -30522,6 +30613,9 @@ static void check_stmt_impl(Checker *c, Node *node) {
 
         if (node->ret.expr) {
             Type *ret_type = check_expr(c, node->ret.expr);
+            /* BUG-1653 — after the check: the rule reads the expression's type */
+            reject_shared_opaque_leak(c, node->ret.expr, node->loc.line,
+                                      "is returned from a function");
 
             /* Stage 1->2 escape summary accumulator (2026-06-22): classify this
              * valued return's region. STATIC contributes nothing; ARParam(n) adds
@@ -32704,6 +32798,8 @@ static void check_stmt_impl(Checker *c, Node *node) {
             Type *arg_type = check_expr(c, node->spawn_stmt.args[i]);
             esc_latch_suspend(c, true);
             if (!arg_type) continue;
+            reject_shared_opaque_leak(c, node->spawn_stmt.args[i], node->loc.line,
+                                      "is passed to a spawned thread");   /* BUG-1653 */
             /* BUG-1160: a struct LITERAL has no type of its own (check_expr
              * returns void; the context supplies it). Type it against the
              * target parameter HERE, before the pointer-safety gates below —

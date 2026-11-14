@@ -1477,6 +1477,53 @@ int main(void) {
         }
     }
 
+    /* ---- a shared struct's *opaque handle leaving its lock (BUG-1299 / BUG-1653) ----
+     * The lock is held for the STATEMENT that reads the field. SINK x CARRIER: the
+     * value turned back into a ZER pointer at the field / a local / a local struct
+     * (the cast sink, BUG-1299), or handed on to where the fact is invisible — a ZER
+     * function, a return, non-local storage, a thread (BUG-1653). The `ok:` cells
+     * are the idiom the field exists for: the handle goes to C. */
+    fprintf(stderr, "\n  -- shared *opaque handle leaves the lock --\n");
+    {
+        #define OP "struct Dev { u32 v; }\nshared struct Reg { *opaque handle; u32 n; }\nReg r;\n" \
+                   "struct Box { *opaque h; u32 n; }\ni32 memcmp(*opaque a, *opaque b, usize n);\n"
+        #define OM "\nu32 main(){ return 0; }\n"
+        static const struct { const char *name; int neg; const char *code; } oc[] = {
+            { "cast/field", 1, OP "void w(){ *Dev d = (*Dev)r.handle; d.v = 1; }" OM },
+            { "cast/local", 1, OP "void w(){ *opaque h = r.handle; *Dev d = (*Dev)h; d.v = 1; }" OM },
+            { "cast/local struct field", 1, OP "void w(){ Box b; b.h = r.handle; *Dev d = (*Dev)b.h; d.v = 1; }" OM },
+            { "cast/struct literal", 1, OP "void w(){ Box b = { .h = r.handle }; *Dev d = (*Dev)b.h; d.v = 1; }" OM },
+            { "call/local to ZER fn", 1, OP "void use(*opaque h){ *Dev d = (*Dev)h; d.v = 1; }\n"
+                                         "void w(){ *opaque h = r.handle; use(h); }" OM },
+            { "call/field to ZER fn", 1, OP "void use(*opaque h){ }\nvoid w(){ use(r.handle); }" OM },
+            { "call/struct carrier", 1, OP "void take(Box b){ }\nvoid w(){ Box b; b.h = r.handle; take(b); }" OM },
+            { "call/funcptr", 1, OP "void use(*opaque h){ }\nvoid w(){ *(*opaque) fp = use; *opaque h = r.handle; fp(h); }" OM },
+            { "return/field", 1, OP "*opaque get(){ return r.handle; }" OM },
+            { "return/local", 1, OP "*opaque get(){ *opaque h = r.handle; return h; }" OM },
+            { "store/global", 1, OP "?*opaque gh = null;\nvoid w(){ gh = r.handle; }" OM },
+            { "store/through pointer", 1, OP "void fill(*Box b){ b.h = r.handle; }" OM },
+            { "store/global struct field", 1, OP "Box gb;\nvoid w(){ gb.h = r.handle; }" OM },
+            { "spawn/arg", 1, OP "void t(*opaque h){ }\nvoid w(){ *opaque h = r.handle; spawn t(h); }" OM },
+            { "ok: field to C", 0, OP "Dev gd;\nvoid w(){ i32 k = memcmp(r.handle, (*opaque)&gd, 4); }" OM },
+            { "ok: local to C", 0, OP "Dev gd;\nvoid w(){ *opaque h = r.handle; i32 k = memcmp(h, (*opaque)&gd, 4); }" OM },
+            { "ok: local struct to C", 0, OP "Dev gd;\nvoid w(){ Box b; b.h = r.handle; i32 k = memcmp(b.h, (*opaque)&gd, 4); }" OM },
+            { "ok: scalar field via ZER fns", 0, OP "u32 getn(){ return r.n; }\nvoid setn(u32 v){ r.n = v; }\nvoid w(){ setn(getn() + 1); }" OM },
+            { "ok: scalar of a carrier", 0, OP "void use(u32 v){ }\nvoid w(){ Box b; b.h = r.handle; b.n = 3; use(b.n); }" OM },
+            { "ok: stays in the struct", 0, OP "void w(){ r.handle = r.handle; }" OM },
+        };
+        #undef OP
+        #undef OM
+        for (size_t oi = 0; oi < sizeof(oc) / sizeof(oc[0]); oi++) {
+            valid_cells++;
+            char nm[160];
+            snprintf(nm, sizeof(nm), "opaque-leak/%s", oc[oi].name);
+            int ok = oc[oi].neg ? run_neg(nm, oc[oi].code) : run_pos(nm, oc[oi].code);
+            fprintf(stderr, "  [%-30s][%s] %s\n", oc[oi].name, oc[oi].neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);
     fprintf(stderr, "    false negatives: %d | invalid probes: %d | over-rejections: %d\n",
             false_neg, invalid_probe, over_reject);

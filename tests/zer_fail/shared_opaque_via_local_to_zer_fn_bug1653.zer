@@ -1,0 +1,24 @@
+// expect-error: is passed to a ZER function
+// BUG-1653: BUG-1299 refused the cast where it could see the value came from a
+// shared struct. One hop through a parameter made it invisible: `use` casts its
+// own parameter, and by then the lock taken for `h = r.handle` is long released.
+struct Dev { u32 v; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+void use(*opaque h) { *Dev d = (*Dev)h; d.v += 1; }
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) {
+        *opaque h = r.handle;
+        use(h);
+    }
+}
+u32 main() {
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join();
+    b.join();
+    return 0;
+}

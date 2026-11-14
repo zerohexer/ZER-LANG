@@ -1,0 +1,24 @@
+// expect-error: is returned from a function
+// BUG-1653: the struct's lock is held for the statement that reads the field. A
+// getter hands the handle to a caller who casts it and writes the object in a
+// LATER statement — two threads, no lock (TSan: data race, 2 reports).
+struct Dev { u32 v; }
+shared struct Reg { *opaque handle; u32 n; }
+Reg r;
+Dev gd;
+*opaque get() { return r.handle; }
+void w() {
+    for (u32 i = 0; i < 1000; i += 1) {
+        *Dev d = (*Dev)get();
+        d.v += 1;
+    }
+}
+u32 main() {
+    *opaque hh = (*opaque)&gd;
+    r.handle = hh;
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join();
+    b.join();
+    return 0;
+}

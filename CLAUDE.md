@@ -117,6 +117,9 @@ per-class safety architecture. Do NOT re-derive it.**
   gate by ITS OWN verdict line (table below) — never `grep 'OK — no'`, which matches an
   earlier gate. On a Windows checkout normalise CRLF first
   (`find . -name "*.sh" -exec sed -i 's/\r$//' {} +`) or the run dies before the audits.
+- **`make docker-check` sees only the Dockerfile's COPY list.** A script wired into `make
+  check` whose input is not copied there passes natively and fails in the image, where every
+  later gate then never runs (BUG-1662) — run `docker-check` once when you add a gate.
 - `make check` takes 5-25 minutes: run it in the background and wait on a status file; do not
   poll by hand (`pgrep -x make`, not `pgrep -f`). `grep -c error build.log` lies
   (`-Werror=switch` is on the command line); use `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.

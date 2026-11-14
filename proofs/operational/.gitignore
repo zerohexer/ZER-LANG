@@ -4,6 +4,7 @@
 *.vos
 *.glob
 .*.aux
+.lia.cache
 .*.d
 
 # coq_makefile-generated (regenerated from _CoqProject)

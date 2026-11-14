@@ -213,9 +213,31 @@ Language infrastructure:
 
 **Build:**
 ```bash
-make check-vst-image    # one-time, ~5 min
-make check-vst          # compile + verify all VST proofs
+make check-vst-image    # one-time; compiles CompCert + VST from source
+make check-vst          # compile + verify all VST proofs (~3.5 min)
 ```
+
+**The image build needs open network and RAM in proportion to the core count** (measured
+2026-11-14). It downloads from `opam.ocaml.org`, `coq.inria.fr` and GitHub source
+tarballs, so a sandbox that only reaches Docker registries cannot build it — no registry
+publishes an image with VST 3.0beta2. And opam runs `nproc - 1` jobs: on a 20-core, 16 GB
+machine that is 19 parallel `coqc`, with no memory limit. Build with the job count pinned —
+add `ENV OPAMJOBS=3` after `USER coq` in a copy of the Dockerfile, and pass
+`--memory=6g --memory-swap=12g` to `docker build` (measured with the legacy builder,
+`DOCKER_BUILDKIT=0`; not measured under BuildKit, whose build does not document those
+flags). At 3 jobs the whole build took 19 minutes (3 for the Iris layer, which
+`proofs/operational/Dockerfile` shares step for step, 16 for CompCert + VST). opam resolved
+exactly the versions above with nothing pinned.
+
+**Without building:** both images (`zer-vst`, `zer-proofs`) are published as the
+`vst-images` pre-release of this repository — one zstd part plus `SHA256SUMS`:
+```bash
+gh release download vst-images            # or fetch the two assets by URL
+sha256sum -c SHA256SUMS
+cat zer-vst-images.part-* | zstd -d | docker load
+```
+Rebuild and re-upload it when a Dockerfile under `proofs/` changes; the release notes say
+which versions are inside.
 
 **File structure per function verified:**
 ```
@@ -1559,12 +1581,18 @@ Two things to keep straight:
   step is not formalized. The three decisions that ARE pure were extracted to
   `src/safety/concurrency_rules.c` (`zer_window_*`) with a VST file,
   `proofs/vst/verif_window_rules.v`.
-- **`verif_window_rules.v` has never been compiled** (the session that wrote it had no VST).
-  It imports the same clightgen output as `verif_concurrency_rules.v` and declares its own
-  `CompSpecs` / `Vprog`; if `make check-vst` fails on it, the likely causes are in the
-  common-errors table above (a `forward_if` that needs the join postcondition for the
-  four-test cascade, or `Z.eq_dec` destruct order). Fix the proof, never the spec — the
+- `verif_window_rules.v` is machine-checked (first compiled 2026-11-14; it passed with no
+  change to spec or proof — the flat cascade tactic absorbs the four-test function). It
+  imports the same clightgen output as `verif_concurrency_rules.v` and declares its own
+  `CompSpecs` / `Vprog`. If it ever fails: fix the proof or the C, never the spec — the
   `_coq` definitions are the ones `window_cfg.v` reasons about (`join_releases_meaning`).
+  They are written TWICE (here and in `window_cfg.v`) and nothing keeps the copies equal
+  (`docs/limitations.md` B2).
+- **Check that a new VST proof can FAIL before believing it.** In a throwaway copy, flip
+  one `return` of the function, re-run clightgen + coqc on that one `verif_X.v`, and expect
+  `Attempt to save an incomplete proof` in that function's lemma. `Print Assumptions
+  body_<fn>.` appended to the copy shows what the lemma rests on (only the classical /
+  extensionality axioms VST itself uses). Done for the three window lemmas, 2026-11-14.
 - The admit gate in `make check-proofs` did not list `lambda_zer_concurrency/*.v` before
   this change (the subset was built but not grep-gated). It does now.
 

@@ -2356,6 +2356,17 @@ main already covers the shape — never soften the rule to match a directive.
   emit-audit, sink matrix) silently never runs. The trap that hid it: verifying with
   `grep -E 'OK — no'`, which matches **"OK — no gaps"** from a DIFFERENT audit that runs earlier.
   Grep the SPECIFIC line you expect (`no default: clauses`), and always print `MAKE_CHECK_EXIT=$?`.
+
+**`make check` AND `make docker-check` ARE TWO DIFFERENT GATES — a script's INPUT must be in the
+  image (BUG-1662).** `docker-check` runs `make check` inside an image built from the Dockerfile's
+  COPY list, minus `.dockerignore`. A gate added to `make check` that reads a file outside that list
+  passes on a full checkout and fails only in the image. Measured 2026-11-14 on main: `docker-check`
+  exited 2 at `FAIL — docs/limitations.md not found` (`docs/` was ignored since 2026-03), so the
+  five gates after it — docs budget, emit audit, flag-handler matrix, sink matrix, reference
+  examples — never ran there; and `audit_reference_examples.sh`, the LAST step, had needed
+  `docs/reference.md` since 2026-08-26, so the image run cannot have exited 0 since then. Every
+  session in between had verified with a native `make check`. When you wire a script into `make
+  check`, run `make docker-check` once and look for the script's own verdict line in ITS output.
 - `grep -c 'error' build.log` **lies** — `CFLAGS` has `-Werror=switch`, so the echoed gcc command
   line matches. Use `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.
 - **The matrix grids are safe to run concurrently since 2026-09-23** — each works in its own

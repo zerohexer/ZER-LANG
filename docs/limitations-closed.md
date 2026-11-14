@@ -8146,3 +8146,41 @@ the abstract state does not over-approximate the concrete one — so `checker_so
 not merely unproven for scoped borrows, it would be **false**. Same standing as the
 provenance-at-indirect-call hole recorded elsewhere: these are prerequisites for the
 Lean port, not independent bugs.
+
+## CLOSED 2026-11-14 (no BUG number — no compiler change) — B2: `verif_window_rules.v` was written but not machine-checked
+
+Moved verbatim from entry B2 of `docs/limitations.md`:
+
+- `proofs/vst/verif_window_rules.v`: VST specs + proofs for the three extracted decisions
+  (`zer_window_join_releases`, `zer_window_stmt_leaves`, `zer_window_counts_at_spawn`).
+  **WRITTEN BUT NOT YET MACHINE-CHECKED** — neither VST nor RefinedC could be installed in
+  the session that wrote it (no opam mirror reachable). It follows the cascade pattern of
+  `verif_concurrency_rules.v` and is wired into `make check-vst`; the first run of that
+  target is its verification. A brute-force comparison of the C against the proven
+  characterization (1548 argument tuples, 0 mismatches) was run instead.
+
+and from the STANDING "Proof coverage" item: "`proofs/vst/verif_window_rules.v` is written
+and has never been compiled."
+
+**How it closed.** The `zer-vst` image was built (Coq 8.18.0, coq-vst 3.0beta2,
+coq-compcert 3.13.1, coq-iris 4.2.0, coq-stdpp 1.10.0 — what opam resolves today) and
+`make check-vst` run: exit 0, `=== VST proofs compile green ===`, `OK: zero admits across
+24 VST verification files`. `verif_window_rules.v` compiled on its first run with NO change
+to the specs or the proofs. `make check-proofs` was run through Docker in the same session:
+exit 0, 67 files, `OK: zero admits across 62 Iris/subset .v files`.
+
+**That the proof can fail** (a proof that has only ever passed proves nothing about the
+gate). In a throwaway copy of the tree, four edits to `src/safety/concurrency_rules.c`, one
+at a time, each followed by clightgen + coqc: the last `return 1;` of
+`zer_window_join_releases` -> `return 0;`; the last `return 1;` of `zer_window_stmt_leaves`
+-> `return 0;`; the last `return 0;` of `zer_window_counts_at_spawn` -> `return 1;`;
+`after_last_jump == 0` -> `!= 0`. Every one ends in `Error: (in proof body_zer_window_…):
+Attempt to save an incomplete proof` in the lemma of the function that was edited; the
+unedited copy compiles. `Print Assumptions body_zer_window_join_releases` lists only the
+axioms VST and the Coq standard library already rest on (`Classical_Prop.classic`,
+`prop_ext`, `functional_extensionality_dep`, `Eq_rect_eq.eq_rect_eq`, the two
+`ClassicalDedekindReals` decidability axioms).
+
+**What it left open** is its own entry in B2, tagged `[residual of: …]`: the `_coq`
+definitions are written twice (oracle file and VST file) and nothing keeps the two copies
+equal.

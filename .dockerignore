@@ -7,8 +7,12 @@ _zer_*
 .git/
 zerc/
 release/
-docs/
 *.md
+# ... except what `make check` READS: the doc audits (audit_limitations,
+# audit_docs_budget, audit_reference_examples) need docs/ and CLAUDE.md inside
+# the image, or `make docker-check` stops at the first of them and silently
+# never runs the gates after it (BUG-1662). `docs/` is therefore NOT ignored.
+!CLAUDE.md
 # build artifacts + backups + local DBs — never COPYed by any Dockerfile, ~5GB
 # of context bloat otherwise (2026-07-01)
 *.vsix

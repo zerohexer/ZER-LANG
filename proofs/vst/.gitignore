@@ -7,6 +7,8 @@
 .*.d
 .lia.cache
 
-# CompCert clightgen generates simple_check.v from simple_check.c.
-# Don't commit — it's a generated file.
+# CompCert clightgen generates these from the .c files beside them.
+# Don't commit — they are generated files.
 simple_check.v
+zer_checks.v
+zer_checks2.v

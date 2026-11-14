@@ -37,6 +37,6 @@ check() {   # file  budget  why
 check CLAUDE.md                    60000  "loaded into every session"
 check docs/limitations.md          150000 "meant to be read whole"
 check docs/multi-site-classes.md   110000 "the registry; its index is read before any safety edit"
-check docs/compiler-internals.md   770000 "ratchet: history moves to compiler-internals-history.md"
+check docs/compiler-internals.md   722000 "ratchet: history moves to compiler-internals-history.md"
 [ "$fail" -ne 0 ] && exit 1
 echo "OK — every budgeted document is within its size budget."

@@ -7,7 +7,7 @@
 > |---|---|
 > | A safety question answered at N sites: its ONE query, its gate, its history | `docs/multi-site-classes.md` |
 > | Process lessons with their evidence (tests, audits, harvesting, debugging, proofs) | `docs/session-playbook.md` |
-> | What the code cannot tell you: why, rejected alternatives, cross-file contracts, traps | `docs/compiler-internals.md` (`grep -n '^## '` is its table of contents — read the section, never the whole file) |
+> | What the code cannot tell you: why, rejected alternatives, cross-file contracts, traps | `docs/compiler-internals.md` (`grep -n '^# PART'` lists its parts, `grep -n '^## '` its sections — read the section, never the whole file) |
 > | Dated session / migration / per-bug records — grep only | `docs/compiler-internals-history.md` |
 > | Coq / Iris / VST | `docs/proof-internals.md` |
 > | What is open NOW (meant to be read whole; gated) | `docs/limitations.md` |

@@ -4647,3 +4647,769 @@ regression-hiding.
 
 When a `tests/zer_gaps/` reproducer is fixed, move it to
 `tests/zer_fail/` so it becomes a permanent regression guard.
+
+---
+
+## Second pass, 2026-11-14 — sixteen more dated sections moved from compiler-internals.md
+
+Session records, process notes and stale counts, chosen by heading (the same rule as the
+first pass): what they describe is recorded in `BUGS-FIXED.md`, superseded by a later
+protocol section, or simply dated. Moved verbatim; each heading carries `[MOVED 2026-11-14]`.
+
+---
+
+## [MOVED 2026-11-14] Merge-back methodology — consuming the `claude/*` fix tracker (2026-07-13..15)
+
+There are **41 unique soundness/miscompile/crash fixes** already FOUND + FIXED across
+12 parallel `claude/*` audit branches, NONE merged to main. The full per-fix table
+(proper commit sha per bug, files, conflict-groups) is the TASK TRACKER in
+`docs/limitations.md` "## OPEN — unmerged audit fixes". As of 2026-07-15, **20 are
+landed** (§D miscompiles #17–#25, §F crashes #32–#35, §G bare-metal #36–#41, §A #1);
+**21 remain** (the higher-stakes memory-safety cluster §A #2–#7 / §B / §C / §E). This
+section is the HOW — the workflow + the gotchas that each cost a debug loop to
+rediscover, so a fresh session consuming the tracker doesn't re-pay them.
+
+### The per-fix workflow (proven over 20 fixes)
+
+1. **Take the tracker row, not the branch.** Read the row: proper source `sha`, files,
+   conflict-group. Do NOT `git cherry-pick`/`merge` the branch — a single audit commit
+   BUNDLES several tracker items (e.g. `66332d39` carries #6 defer-abort + #5 paren-deref
+   [rejected] + #3 ISR-ban [§G #40] + #4 frame-local-free [§A #3]; `5a6889df` carries
+   F4 mmio-span [§G #38] + F1/F3 escape [§B] + F5/F6 uN/iN [already shipped]). Pull ONLY
+   the hunk for the item you're doing: `git show <sha> -- <file>`.
+2. **Re-anchor by TEXT, never line numbers.** The branch's base is OLDER than current
+   main, so every line number in the diff is shifted (often by hundreds of lines — main
+   grew UINT/SINT cases, new intrinsics, etc.). Grep the anchor text in current main,
+   read the exact surrounding lines, and Edit against THAT. Twice this session the diff's
+   context didn't even exist in main the same way (e.g. `type_name_write` gained
+   UINT/SINT cases the old diff never saw — I had to convert those too to keep the switch
+   exhaustive under `-Werror=switch`).
+3. **Verify every dependency the hunk calls EXISTS in current main before editing.**
+   `grep` each helper the hunk references (`compute_type_size`, `type_alignment_bytes`,
+   `check_isr_ban`, `ir_snapshot_alias`, `escape_type_carries_ref`, …). A hunk that
+   assumes a helper the branch also introduced elsewhere will silently miscompile if you
+   apply it alone. `check_isr_ban` was a near-miss — it exists as `static bool` at a
+   different name/line than my first grep pattern expected.
+4. **Baseline new `_eff->kind == TYPE_X` reads.** A fix that reads `x_eff->kind == TYPE_Y`
+   on an ALREADY-`type_unwrap_distinct`'d local is documented-safe (see "Distinct-Unwrap
+   Structural Kill"), but `tools/audit_type_dispatch.sh` flags it as a NEW raw
+   type-dispatch site → `make check` exits 2 with the audit line ABSENT. Fix: add the
+   exact `file:content` lines to `tools/type_dispatch_baseline.txt` — the authoring branch
+   already did this, so `git show <sha> -- tools/type_dispatch_baseline.txt` gives you the
+   precise entries. Do NOT churn the code to `type_dispatch_kind()`; `_eff->kind` reads
+   correctly use `->kind`. (Hit on #22 designated-init and #41 @container-const.)
+5. **Verify, in this order:** (a) `bash tools/sink_matrix.sh <zerc>` for ANY escape/free
+   change (see below); (b) the fix's own negative + positive `.zer`; (c) `make check` in
+   the **FOREGROUND** with `timeout 600000` — background Docker runs get reaped by the
+   harness ("killed"). A green `make check` shows `MAKE_CHECK_EXIT=0` AND the audit lines
+   ("OK — no default:…", "OK — no new raw type-dispatch sites").
+6. **Ship + retire.** Commit (zerohexer only, no AI attribution), push, then in the SAME
+   pass: retire the tracker row (limitations.md), add the BUGS-FIXED.md entry, bump the
+   landed/remaining count in the CLAUDE.md pointer.
+
+### Gotchas that each cost a loop (do not rediscover)
+
+- **`orelse return` is BARE — no value.** `orelse return 0` / `orelse return 1` is a
+  PARSE ERROR. This bit test FIXTURES repeatedly: a negative test that "passes" may be
+  passing on the parse error (not the bug under test), and a positive test that
+  "over-rejects" may just carry this typo. `sink_matrix.sh` itself had 3 cells with
+  `orelse return 0` that produced 2 false "ok"s and 1 false OVER-REJECT until fixed to
+  bare `orelse return;` inside a `u32 main()`.
+- **A negative test's non-zero exit is NOT proof of the intended rejection.** The runner
+  accepts ANY non-zero, so a SIGSEGV (exit 139) or a parse error counts as "pass". Always
+  confirm the REASON: grep the expected error string, and for crash-class fixes assert
+  `exit != 139`. This was DECISIVE for #32 (parser DoS) — the whole point was "clean
+  'nesting too deep' error, NOT stack overflow", which a bare pass/fail check can't tell
+  apart.
+- **Two emitter dispatch paths per intrinsic — fix BOTH.** AST `emit_expr` (~2700–3300)
+  and IR `emit_rewritten_node` (~6400–11000). A codegen fix (`@inttoptr` span #38,
+  `@saturate` #23) usually needs the identical edit in both. When the two emit lines are
+  byte-identical, give each a distinguishing comment so exact-match Edit is unambiguous.
+- **Choosing the "proper version" when 2+ branches fixed the same bug — pick the more
+  central mechanism and NOTE the rejected one + why.** #21 optional-None: `ret_from_orelse`
+  flag (handles both `?T` and `?void`-orelse) over the `?T`-only fix. #34 `(*ptr & mask)`:
+  speculation + `token_can_start_unary` over the simpler "does `)` follow the type"
+  heuristic, which misparses `(*ptr) + 3` as a cast. #35 defer-abort: fix `emit_defers_from`
+  at the ROOT (covers every conditional early-exit) over per-site `emit_pending_ir_defers`.
+- **`git cherry -v main <branch>` all-`+`** confirms a branch's fixes are genuinely absent
+  from main (patch-id compare) — the heavy overlap is AMONG branches (same bug found 3–4×),
+  not with main.
+
+### The per-sink matrix — `tools/sink_matrix.sh` (the memory-safety regression gate)
+
+Escape/free analysis is a PER-SINK PATCHWORK: the "is this value frame-bound?" question is
+re-implemented at every sink (return, store-to-global, struct-field-store, keep-call,
+free, 2-step launder), so the same value SHAPE leaks through some sinks while caught at
+others. `sink_matrix.sh` makes that a grid of `{value-shape × sink}` cells, each with an
+expected `reject`/`compile`, and classifies mismatches as **HOLE** (compiles but should
+reject = a shipped UAF/dangling escape) or **OVER-REJECT**. Baseline vs current main
+(2026-07-15): **17 ok, 6 HOLES, 0 over-rejects** — every SAFE baseline passes (param-view,
+param-subslice, scalar-copy, alive-subslice), and the 6 holes map 1:1 to the remaining
+fixes:
+- `p5__k6_free` = `free(slice-of-local)` → §A #3.
+- `p7__k2_store_glob` / `p7__k3_field_store` / `p7__k2v_2step` = a `?*T` FIELD carrying
+  `&local` escaping to a global/field → §B #8.
+- `p2__k2v_2step` / `p3__k2v_2step` = `&local[i]`/`&local.field` laundered through a `?*T`
+  var-decl → §B #8/#9.
+Run it after EVERY escape/free change: a fix must flip its OWN cell(s) to ok and regress
+NONE (no new HOLE, no new OVER-REJECT). **Now WIRED into `make check` as a permanent gate
+(2026-07-15)** — CLEAN at 32 cells / 0 holes / 0 over-rejects (standalone
+`make check-sink-matrix`). This is also the discipline that made §A #1 (subslice inherits
+base `alloc_id`) safe — verified UAF-view + double-free-view caught AND param/alive subslice
+not over-rejected AND base-direct UAF still caught, not just its own test.
+
+### Merge-back COMPLETE (2026-07-16) — all 41 landed; three lessons a fresh session needs
+
+The whole tracker is done (§A #1–7, §B #8–13, §C #13–16, §D #17–25, §E #26–31, §F #32–35,
+§G #36–41), each with regression test(s) + (for escape/free) a sink-matrix cell. `make check`
+984/0. Three lessons from the hardest fixes — read before consuming ANY similar cross-branch
+diff, because they cost real loops:
+
+1. **A source hunk may be SUPERSEDED by a later main refactor — the anchors won't match, and
+   verbatim application re-introduces dead/duplicate logic (the §A #7 trap).** `582920db #4`
+   added a scattered `ir_propagate_alias_state` call at each of SIX `IR_HS_TRANSFERRED` sites,
+   but main had since unified ALL move-transfer through ONE `ir_mark_transferred` sink — only
+   TWO `IR_HS_TRANSFERRED` sites remained. **Before applying: grep the anchor COUNT in current
+   main; if it diverges from the diff's, a later refactor changed the structure.** Then build
+   current main and EMPIRICALLY test each shape the fix targets to find which are ALREADY caught
+   (§A #7: `*Tok p=&arr[0]; Tok b=arr[0]; use(p)` → exit 0 = HOLE; `&b.field` → exit 0 = HOLE;
+   `spawn &a` → exit 1 = ALREADY CAUGHT by the unified sink). Apply ONLY the genuine delta (the
+   compound-key alias block), skip the superseded part. Naively applying the 6 propagate calls
+   would have double-propagated on an already-propagating sink.
+
+2. **High-risk fixes: verify BASE IDENTITY first — then it's a faithful transcription, not a
+   re-derivation (the §C #13 method).** For the scariest fix (VRP branch-merge: 4 helpers
+   `vrp_snap_take/restore/join` + `vrp_join_assign_range` threaded through ~215 lines of
+   interleaved if-handler logic, where a snapshot/join ordering slip ships the exact silent OOB
+   it fixes) the de-risking move was to confirm the source commit's base is **line-for-line
+   identical** to current main — grep each `@@` anchor (`int saved_range_count = ...`, the
+   then-body restore, the else/join, the non-comparison branch) and confirm the surrounding
+   text matches the diff's context exactly. Once base identity holds, applying the diff behaves
+   identically to the already-tested commit — a textual transcription, NOT a from-scratch
+   semantic derivation. Verify by diffing your result's `+` lines back against the source hunk.
+   **If the base has diverged, do NOT transcribe — re-derive against the current logic** (that's
+   lesson 1's case).
+
+3. **Bash/harness gotcha: never DOUBLE-background.** Combining `run_in_background: true` (harness
+   backgrounding) with a manual `... & > "$OUT" 2>&1` redirect in the SAME command LOSES all
+   output (0-byte file): the manual `&` detaches the docker child from the tool's shell, which
+   exits and orphans it before output flushes. Use EITHER harness backgrounding (run the docker
+   command DIRECTLY, no `&`/redirect — the harness captures stdout to the task output file) OR a
+   foreground redirect — never both. (Cost a wasted re-run this session.)
+---
+
+## [MOVED 2026-11-14] The 2026-08-01/02 branch-harvest sweep — ALL 45 fixes, and WHY they existed (read before any safety work)
+
+Eleven `claude/gifted-noether-*` audit branches were harvested into main: **ALL 45 fixes** —
+§A 1 · §B 9 · §C 7 · §D 9 · §E 1 · §F 4 · §G 6 (+G5 with §J) · §H 2 · §I 1 · §J 4 — each verified
+reproducing on main FIRST, each with regression tests. Per-bug detail: BUGS-FIXED.md 2026-08-01/02;
+tracker: top of `docs/limitations.md`. This section is the DURABLE part — the root-cause taxonomy and
+what it says about where the safety architecture actually leaks.
+
+**Exactly ONE item is deliberately still open**: the durable §F2 fix (per-defer runtime "armed"
+flag). §F2 shipped as a sound interim REJECT, and its precondition — an exhaustive goto x defer
+matrix — now exists (`tests/test_defer_goto_matrix.c`, below).
+
+### The taxonomy (the first 26 classified; §E–§J below fit the same shapes)
+
+| Pattern | Count | Shape | Examples |
+|---|---|---|---|
+| Gate tests a type's **SPELLING**, not its PROPERTY | ~7 | asks "is it spelled `*T`?" when the question is "can it carry a reference into my frame?" | C3/C4 (`== TYPE_POINTER` excluded slice + distinct), C2/D2 (`?T` never unwrapped), D3 (`TYPE_ARRAY` uncased), C7 (`escape_type_carries_ref` excluded pointer-carrying struct) |
+| Same question answered at **N SITES** | ~5 | one sink fixed, siblings left | §A/G5 (3 store sinks, only bare-ident handled globals), C1, C6 (`&x` vs `&x.f`), D1 (spawn re-derived a weaker predicate), D5 (read + write checked, call-arg unowned) |
+| **Per-node-kind enumeration** incomplete | 6 | the list of places is just short | B1–B6: VRP-JOIN wired at IF/FOR/WHILE/SWITCH/LABEL, absent at defer / `@once` / orelse / if-capture / else-reset |
+| **Temporal / lifecycle** model wrong | ~5 | the state is right, the ORDER or the invariant isn't | B7 (the wipe fires in program order, AFTER the use), B9 (a return path the scan can't reach), D4/D6/D7 (borrow lifecycle: threadlocal skipped, not exclusive, first-only) |
+| **Scope decision** or proven-but-unwired | 2 | not really an implementation bug | D8 (whole-program funcptr reachability — architecturally BANNED), D9 (the concurrency closure IS proven in Iris; the compiler wiring was never started) |
+
+The first three patterns are ~18 of 26 and are all the SAME failure at different granularity: **a
+finite enumeration (of type kinds, of sinks, of node kinds) that nobody could prove complete.**
+
+**§E–§J (the remaining 19) fit the same taxonomy**, with two shapes worth naming because they recur:
+
+| Shape | Where it showed up |
+|---|---|
+| A PROXY standing in for the real predicate | §F1 used `free_line != defer_line` as a proxy for "same defer body" — correct until two frees share a physical line. §I1 used `is_volatile` as a proxy for "has an mmio bound" — correct only when the bound was actually DERIVED (a param/alias/field derives none) |
+| The check exists but is never REACHED | §E1 (`record_isr_globals` follows only DIRECT calls, so a funcptr binding defeats it at BOTH ends — the call sees a local, the binding sees a function and discards it); §J3 (`IR_STRUCT_INIT_DECOMP` was a pure no-op, so the designated-initializer form of an alias registration silently did nothing) |
+
+A PROXY is the most dangerous of these: it is right on every example anyone tried, and its failure
+mode is silent. When you find a discriminator that is not the property itself, ask what makes the two
+diverge.
+
+### The defer x goto matrix, and the shape of a "not yet" decision (2026-08-02)
+
+`tests/test_defer_goto_matrix.c` is the 9th grid and the only one that asserts a **RUNTIME VALUE**
+instead of accept/reject. Read this before touching defer emission OR before adding a new matrix.
+
+**Why a value.** The class it guards produces NO diagnostic: a `defer` that fires on a path whose
+registration never executed just leaves an unbalanced acquire/release — a lock underflow, a double
+close, a free of something never allocated. There is nothing for a reject-oracle to observe. So each
+cell pairs `acq()` with `defer rel()` plus a fall-through marker and checks the resulting BALANCE.
+
+**Two design choices that made it tractable, reusable for any future value-matrix:**
+1. **Pick a measurement INVARIANT across the axes.** Balance is identical for every defer position
+   (0 when the goto is taken, 100 when not), so the expected value is derivable from one axis instead
+   of hand-tabulated per cell. If your expected values need a 34-row table, the measurement is wrong.
+2. **Give each failure mode its own exit code.** 200 = "an unarmed defer fired"; the report names the
+   DEFECT, not "wrong value". A grid that says what broke is worth several that say something broke.
+
+**VERIFY A NEW GRID CATCHES ITS BUG.** Run it against a pre-fix build with the reject-expectation
+disabled. This one reports `MISCOMPILE — an UNARMED defer fired` on all four
+`defer-between/goto-taken/*` cells against `06c0ed9d`, 0 false positives on the not-taken variants. A
+grid that has only ever passed is a script, not a net — the same standard applied to
+`audit_carrier_dispatch.sh`.
+
+**The "not yet" decision, recorded because the reasoning generalises.** §F2's durable fix is a
+per-defer runtime armed flag: zero-init a `u8`, set it at `IR_DEFER_PUSH`, emit the fire as
+`if (armed) { body }`, and emit the flag ONLY for defers a goto can skip (the same `gi < di < li`
+analysis the reject already runs, so the common case keeps its zero-overhead unconditional fire).
+That sketch is easy. It was NOT done in the same pass, for reasons worth reusing as a checklist:
+
+- **Nothing needs to be UNDONE, and the flags COMPOSE** (`if (armed && !already_fired)`). The risk is
+  not a design conflict — it is COLLATERAL: the new flag reads and writes the same bookkeeping
+  (`defer_count` / `defer_fire_bodies` snapshots / `active_guard_below` / `restore_count`) that the
+  2026-06-29 fixes govern, and disturbing it yields a silently dropped cleanup on one path, not a
+  compile error.
+- **The net was 17 tests.** For an edit whose failure mode is silent resource mismanagement, that is
+  not enough — so the net was built FIRST and the fix goes in behind it.
+- **The interim REJECT is not a Ban-Framework violation.** That framework governs banning VALID
+  patterns; this shape currently MISCOMPILED, so an error naming the workaround is strictly better
+  than the status quo. Rejecting broken code is a safety improvement; rejecting working code is not.
+
+The matrix is now the ACCEPTANCE TEST for that fix: delete `cell_currently_rejected()` and all 34
+cells must assert values and pass. Nothing else about the grid changes.
+
+### Why the proof stack did not catch ANY of these
+
+This is the load-bearing conclusion; do not re-derive it.
+
+**Zero of the 26 fixes touched `src/safety/`.** All 26 were in `checker.c` / `zercheck_ir.c` /
+`types.h` (verifiable: `git diff --name-only 31a355a3..213ee006 -- 'src/safety/*'` is empty). A
+COMPLETE VST proof of all 29 extracted predicates passes, unchanged, with every one of these bugs
+present.
+
+- **VST (Level 3) verifies a PURE FUNCTION**: "`zer_handle_state_valid` computes what its spec says,
+  for every input." None of these bugs are in a pure function. C6 is the clean example — no predicate
+  was wrong; the keep call-site matched `&ident` and not `&ident.field`, so the predicate was never
+  REACHED. VST has no vocabulary for "checker.c should call this at six places and calls it at five."
+- **The Level-1 oracles prove the transfer is sound over the states LISTED**, not that the listed
+  states COVER the semantics — the gap this file already states in "Verification endgame" §5. A
+  `?[*]T` carrying a stack slice is not a missing STATE in `param_lattice.v`; the lattice never
+  claimed to enumerate program syntax. So the oracle is sound, the C faithfully implements it, and the
+  form simply never arrives at the door.
+- **Partial exception — D6 (double-borrow)** is a missing PRECONDITION, not a missing form: the model
+  had the state (borrowed / not) but not the exclusivity invariant. That is exactly the
+  "OPERATIONAL PRECONDITIONS ARE FINITE VARIABLES" lesson from the Level-B post-mortem, recurring.
+
+**What WOULD catch them** is the forward simulation in the endgame plan (§1): case analysis on the
+concrete `step` rules means a concrete step storing a `?*T` into a global must exhibit a matching
+abstract transition — if the domain cannot represent it, the diagram does not close and the proof gets
+STUCK on exactly that configuration. That is precisely the machinery for converting patterns 1–3 from
+silent to loud. It is unbuilt (only the concurrency subset has an operational instance), and it still
+would not cover D8 (scope) or D9 (proven, unwired).
+
+**The empirical conclusion.** The gates that already exist WORK and are cheap:
+`audit_type_dispatch.sh` fired on this very session (7 new raw `->kind ==` reads in §D, blocked the
+build until justified), `-Werror=switch`, `sink_matrix.sh`. The `?T`/carrier class had NO gate, and
+that class alone accounted for ~7 of the 26. Building the gate took a fraction of the proof effort and
+mechanically kills the whole family. **Prefer a gate over a proof for coverage questions; use the
+proof stack for transfer-soundness questions.** They answer different halves.
+
+### Gate A / Gate B — the carrier-dispatch class-kill (commit `f8374bc1`)
+
+Built as ONE gate for the whole wrapper family, not a `?T`-specific one: the set of wrappers that hide
+an inner kind is FINITE (`?T`, `distinct T`, array-of, by-value struct/union carrying a pointer) and
+this sweep hit THREE of the four. An optional-only gate would have left the struct-carrier shape (C7,
+D1) wide open.
+
+- **Gate A (author-time)** — `tools/audit_carrier_dispatch.sh` + `tools/carrier_dispatch_baseline.txt`.
+  Freezes the 33 hand-rolled carrier disjunctions in `checker.c`/`zercheck_ir.c` (`file:content`,
+  line-number-agnostic — same design as its two siblings) and FAILS on a NEW one. Wired into
+  `make check`, which now runs **6** audit gates. Proven to fire by injecting a violation.
+- **Gate B (exhaustive)** — the `LD_OPTWRAP` axis in `tests/test_escape_matrix.c`: the escaping value
+  is bound through an optional carrier before reaching each sink. `-Wswitch` on the enum forces every
+  generator/name/validity site to handle it, so the grid cannot silently shrink. **35 → 43 cells**, all
+  reject. It passes only because C2/D2 were fixed first — had it existed earlier it would have found
+  them.
+
+**Why a LINTER and not a blanket accessor (the design call).** `type_dispatch_kind()` works for
+`distinct` because distinct never changes REPRESENTATION. `?T` does (`.has_value`), and ~93
+`emitter.c` sites legitimately dispatch on `TYPE_OPTIONAL` to choose an emission form. A blanket
+`type_optional_kind()` would have fixed the safety sinks and BROKEN emission. So `emitter.c` is
+EXCLUDED from Gate A, and the linter forces a per-site choice rather than a mass rewrite. **Before
+copying an existing class-kill, check whether the wrapper is representation-preserving.**
+
+**Residual, recorded not hidden.** The 33 baselined rows are "known, untriaged" — grandfathered, NOT
+blessed. Gate A stops the 34th; Gate B is what tells you whether the existing 33 handle every wrapper.
+The baseline header says to prefer converting a row to a predicate and DELETING it over leaving it
+frozen, so the surface shrinks over time instead of ossifying.
+
+### Methodology that paid for itself (reuse it)
+
+1. **Verify the reproduction before writing code.** Of the items examined, several were already
+   closed, half-live, or described with the wrong root cause (see CLAUDE.md "Consuming an audit
+   branch"). A negative test that COMPILES is unambiguous; one that REJECTS proves nothing until you
+   check the reason — use `zerc f.zer -o out.c` to isolate the CHECKER verdict from GCC's.
+2. **Distrust a branch's test before distrusting the compiler.** Four VRP reproducers used a heap
+   slice (runtime-checked regardless of VRP) and passed on unfixed main.
+3. **Prefer the synthesis to any single branch.** §A took `38z6wi`'s 3-sink structure ⊕ `02nq43`'s
+   launder-aware RHS; the combination catches a laundered RHS INTO a projection, which NEITHER branch
+   catches alone.
+4. **Land the family, then the docs, in the SAME commit.** Three of the first four fix commits updated
+   only BUGS-FIXED.md and left the tracker showing the work as open — the stale-gate failure this
+   file warns about elsewhere. Fixed retroactively; do not repeat.
+
+---
+---
+
+## [MOVED 2026-11-14] Bugs Fixed This Session (2026-04-09/10/11)
+
+### BUG-468: move struct conditional transfer not caught
+`if (c) { consume(t); }` then `t.field` — zercheck path merge only checked `HS_FREED || HS_MAYBE_FREED`, not `HS_TRANSFERRED`. Fix: `is_handle_consumed()` helper includes all three states. Applied to if/else merge, if-no-else merge, switch merge, loop check.
+
+### BUG-469: struct containing move struct field not tracked
+`consume_wrapper(w)` where `Wrapper` has `Key` (move struct) field — compiled. Fix: `contains_move_struct_field()` helper walks struct fields for move types. Unified into `should_track_move()`. Applied at NODE_CALL (first/second pass), NODE_IDENT, NODE_RETURN.
+
+### BUG-470: return move struct not marked as transferred
+`return t; t.kind;` — dead code not flagged. Fix: NODE_RETURN handler marks move struct ident as `HS_TRANSFERRED` using `should_track_move()`.
+
+### BUG-471: pool.free()/slab.free() missing Handle element type check
+`pool_b.free(handle_from_pool_a)` compiled — Handle is `u64` at C level, no type mismatch. Fix: checker Pool/Slab `.free()` handler validates `type_equals(handle.elem, pool.elem)`. Same pattern as existing `.free_ptr()` check. ~5 lines each.
+
+### BUG-472: spawn wrapper missing in multi-module builds
+`emit_file_no_preamble` didn't prescan for spawn. In topo order, main module emitted last via this function. Fix: added prescan + `emit_spawn_wrappers()` to `emit_file_no_preamble`. Then unified into `emit_file_module(e, file, with_preamble)` — one function, one flow.
+
+### BUG-473: shared struct recursive mutex
+Non-recursive spinlock deadlocked on re-entrant auto-lock (cross-function call on shared struct). Fix: all shared structs use `pthread_mutex_t` with `PTHREAD_MUTEX_RECURSIVE`. Lazy init via `_zer_mtx_ensure_init`. `_XOPEN_SOURCE 500` for portability.
+
+### Barrier keyword type — eliminates pre-existing UB
+`u32 barrier` with `@barrier_init` was 4-byte variable for ~120-byte struct. `memset` overflow caused silent stack corruption. Fix: `Barrier` keyword type (lexer/parser/types/checker/emitter). Checker rejects non-Barrier args to `@barrier_init`/`@barrier_wait`.
+---
+
+## [MOVED 2026-11-14] Firmware Examples + Polish (2026-04-13)
+
+3 new firmware examples exercising ALL v0.3 features. Zero bugs found — confirms compiler readiness.
+
+| Example | Features Exercised |
+|---|---|
+| `async_sensor.zer` | async/yield, comptime, container(T), move struct, designated init, do-while |
+| `concurrency_demo.zer` | shared struct, Semaphore, @once, @critical, spawn+ThreadHandle |
+| `slab_registry.zer` | Slab(T), alloc_ptr/free_ptr, defer, comptime, enum switch |
+
+### cinclude angle bracket fix
+`cinclude "<stdio.h>"` now emits `#include <stdio.h>` (system header). Previously emitted `#include "<stdio.h>"` (double-quoted angles — GCC error). Detects `<` at start and `>` at end of path string. Local headers (`cinclude "myheader.h"`) unchanged.
+
+**Found by:** writing firmware examples, not adversarial testing. Real usage finds feature gaps that red team rounds don't probe (they attack safety logic, not basic emission).
+---
+
+## [MOVED 2026-11-14] Codebase Analysis Audit (2026-04-13) — 2 bugs found by code reading
+
+Targeted analysis of 3 risk areas identified by 12 red team rounds. Read code flows to understand coupling before deciding what to fix.
+
+### BUG-505: Optional enum switch emission
+`is_opt_switch` path emitted `emit_expr(arm->values[j])` for enum dot values → bare ident `red` (undeclared in C). Regular enum switch path at line 4022 uses `EMIT_ENUM_NAME`. Optional path was a copy that diverged. Fix: optional path uses same `_ZER_EnumName_variant` pattern. Also: `type_unwrap_distinct` on detection, `opt_inner_enum` tracked.
+
+### *opaque comparison unconditional
+`emit_type(TYPE_POINTER)` at line 593 emits `_zer_opaque` unconditionally (not gated by `track_cptrs`). BUG-485 fix incorrectly gated `.ptr` comparison on `e->track_cptrs`. Found by reading the type emission code flow — the struct representation is always active.
+
+**Method:** Read 3 targeted areas based on bug distribution data:
+1. Async + untested features → code analysis showed all should work (recursive local collection covers for-init, blocks, etc.)
+2. *opaque emission → found unconditional struct, incorrect guard
+3. Optional enum switch → found bare ident divergence from regular enum path
+
+**Lesson:** Code reading targeted by bug pattern data finds bugs that testing misses. The *opaque bug was invisible to tests because `--run` enables `track_cptrs` — the guard happened to be true in all test scenarios. Only reading the code reveals the unconditional struct emission.
+---
+
+## [MOVED 2026-11-14] Refactors R1-R3 (2026-04-13) — Duplication elimination, 3 latent bugs found
+
+Analysis of 12 red team rounds identified 3 areas where code duplication was CAUSING bugs (not just aesthetic debt). Each refactor extracted a helper that unified duplicated logic and fixed a latent inconsistency.
+
+### R1: `vrp_invalidate_for_assign(c, key, key_len, op, value)` (checker.c)
+**What:** Unified VRP range invalidation for assignments. Called with simple ident key AND compound key.
+**Why:** Compound key path was missing compound op check (latent BUG-502: `s.idx += 20` didn't wipe `s.idx` range). Both paths now use identical logic.
+**Impact:** 2 blocks (68 lines) → 1 helper (45 lines). Future assignment forms automatically covered.
+
+### R2: `emit_async_orelse_block(e, expr, fallback, dest, len, type)` (emitter.c)
+**What:** Unified async orelse emission. `dest=NULL` for expr-stmt (discard), `dest` set for var-decl (assign).
+**Why:** 3 near-identical blocks had void check inconsistency (one used `checker_get_type`, another used local `type` variable). Helper uses `dest_type` parameter consistently.
+**Impact:** 3 blocks (116 lines) → 1 helper (45 lines). Adding a new orelse context = one call.
+
+### R3: `emit_shared_ensure_init(e, root, arrow)` (emitter.c)
+**What:** Unified shared struct mutex+condvar initialization. Reads `struct_type.uses_condvar` (set by the checker at every `@cond_*`, BUG-1661 — the emitter's own `is_condvar_type` prescan registry is gone).
+**Why:** Auto-lock path used `_zer_mtx_ensure_init` (no condvar) for condvar-type shared structs. CAS winner set `inited=1` without condvar init → `@cond_wait` saw `inited=1` → skipped → uninitialized condvar.
+**Impact:** 5 sites (57 lines) → 1 helper (20 lines). Adding a new condvar intrinsic = one call.
+
+**Total: 10 duplicated sites → 3 helpers. ~80 lines removed. 3 latent bugs fixed by unification.**
+
+**Lesson:** Code duplication in compilers isn't just debt — it's a bug factory. When two code paths implement the same concept independently, they WILL diverge. The refactor doesn't just clean up code — it makes future divergence impossible.
+---
+
+## [MOVED 2026-11-14] Mutex Lazy Init Race Fix (2026-04-12)
+
+Found during C interop testing (C library callback + shared struct). `_zer_mtx_ensure_init` uses CAS: `__atomic_compare_exchange_n(inited, &expected, 2, ...)`. States: 0=uninit, 2=in-progress, 1=ready. CAS 0→2 = winner initializes mutex (+condvar). Losers spin `while (inited != 1) {}`. Prevents double-init when two threads hit first shared struct access simultaneously.
+---
+
+## [MOVED 2026-11-14] Proper Fixes — BUG-474 Call Graph DFS + BUG-479 VRP 100% (2026-04-12)
+
+### BUG-474 proper: Deadlock detection via call graph DFS
+Replaced `_shared_scan_depth < 8` depth limit with memoized DFS.
+
+**`FuncSharedTypes` cache on Checker struct:** `func_name → set of shared type_ids`. `compute_func_shared_types()` does DFS with `in_progress` (cycle detection) + `computed` (memoization). `scan_body_shared_types()` walks full AST. Each function computed once. `collect_shared_types_in_expr` NODE_CALL does O(1) cache lookup.
+
+Handles: any call depth (tested at 20), mutual recursion (ping/pong cycles), no false positives on separate statements.
+
+### BUG-479 proper: VRP address_taken at TOK_AMP handler
+Moved from per-site invalidation to SINGLE check point at `check_expr(NODE_UNARY, TOK_AMP)`. Every `&var` expression marks root variable's VarRange as `address_taken=true`. `push_var_range` skips narrowing for `address_taken` entries.
+
+**Correctness argument:** ZER has no pointer arithmetic. `&var` is the ONLY way to create a pointer to a variable. Single check point = 100% alias coverage without points-to analysis.
+
+**VRP architecture after all fixes (BUG-475/478/479):**
+1. `&var` in any expression → `address_taken=true`, range permanently invalid (TOK_AMP handler)
+2. `&var` passed to function call → range wiped (NODE_CALL handler, redundant with #1 but defense-in-depth)
+3. Any function call → global variable ranges wiped (NODE_CALL handler)
+4. Comptime calls exempt (pure, no side effects)
+---
+
+## [MOVED 2026-11-14] Test Counts (v0.2.1 current)
+
+| File | What | Count |
+|---|---|---|
+| `test_lexer.c` | Token scanning | 218 |
+| `test_parser.c` | AST construction | 70 |
+| `test_parser_edge.c` | Edge cases, func ptrs, overflow | 98 |
+| `test_modules/` | Multi-file imports, typedefs, interrupts | 11 |
+| `test_checker.c` | Type checking basic | 72 |
+| `test_checker_full.c` | Full spec + safety + provenance + @probe + ISR + stack + escape | 584 |
+| `test_extra.c` | Additional checker | 18 |
+| `test_gaps.c` | Gap coverage | 4 |
+| `test_emit.c` | Full E2E (ZER→C→GCC→run) + signal() fault handler | 238 |
+| `test_zercheck.c` | Handle tracking, leaks, cross-func | 54 |
+| `test_fuzz.c` | Parser adversarial inputs | 491 |
+| `test_firmware_patterns.c` | Round 1 firmware | 39 |
+| `test_firmware_patterns2.c` | Round 2 firmware | 41 |
+| `test_firmware_patterns3.c` | Round 3 firmware | 22 |
+| `test_production.c` | Production firmware E2E | 14 |
+---
+
+## [MOVED 2026-11-14] VSIX PATH management (v0.4.3, not compiler-internal but notable)
+
+Extension UX bug hit in real usage. Iterative VSIX installs (0.2.6 → 0.3.0 → 0.4.0 → 0.4.1 → …) accumulated PATH entries. `where zerc` resolved to the first-installed (0.2.6), not the newest. Reinstalls of the SAME version didn't re-prompt because `zer.pathAdded` was in VS Code's global state (persists across uninstalls).
+
+Fix in `editors/vscode/extension.js`:
+- Per-version globalState key `zer.pathHandled.{version}` instead of single flag.
+- Compare `where zerc` path against the CURRENT extension's bundled zerc.exe. If mismatch, prompt.
+- On Yes, strip ALL `zerc-language` entries from User PATH before prepending current version's platDir + gcc/bin. Auto-cleans up dead entries from uninstalled extension dirs.
+- Use `powershell -EncodedCommand` base64 to avoid quoting issues when writing PATH.
+
+Users upgrading through multiple versions may need to clean up ONCE; the per-version key handles subsequent upgrades cleanly.
+---
+
+## [MOVED 2026-11-14] 2026-04-19: IR-only function bodies, V3 routing, Task.alloc/free rename
+
+### IR-only enforcement (no AST fallback for function bodies)
+
+- `--no-ir` / `--use-ir` CLI flags DELETED from zerc_main.c.
+- `Emitter.use_ir` field DELETED from emitter.h.
+- `emit_func_decl`: IR lowering is load-bearing. If `ir_lower_func`
+  returns NULL or `ir_validate` fails, `abort()` with
+  "INTERNAL ERROR — please report" message. No silent AST fallback.
+- `emit_stmt` DELETED (~1125 lines). Truly unreachable after the
+  fallback removal; verified via abort-probe + full `make check`.
+- `emit_async_func` DELETED (~234 lines) — replaced by
+  `emit_async_func_from_ir` (called from `emit_func_from_ir`
+  when `func->is_async`).
+- `emit_async_orelse_block` DELETED (~51 lines).
+- Interrupts route through IR: `emit_top_level_decl` NODE_INTERRUPT
+  calls `ir_lower_interrupt` + `emit_func_from_ir`.
+  `emit_regular_func_from_ir` detects `func->is_interrupt` and
+  emits `void __attribute__((interrupt)) NAME_IRQHandler(void)`
+  signature; body emits as normal IR blocks.
+- `emit_expr` KEPT — still used by top-level declarations
+  (struct/enum/union definitions, global initializer expressions,
+  cinclude, mmio). Top-level constructs aren't code; IR (which is
+  CFG + basic blocks + locals) is the wrong shape for them.
+
+**`tools/walker_audit.sh` update:** was using `emit_stmt` as the
+end-of-span marker for emit_expr's switch. Now uses
+`emit_defers_from` (next static function) with `[^;]*{` anchor.
+
+**Old bug-fix history references `emit_stmt`:** several places in
+this doc describe bugs in the former AST statement emitter (e.g.
+"#line stray in else_body" at lines 476/480). These are preserved
+as historical context. The code paths they describe no longer
+exist. Do not try to reproduce the described behavior in the
+current codebase.
+
+### Validator flag-use exceptions (surfaced by IR-only enforcement)
+
+Two IR ops reuse `cond_local`/`src2_local` fields as encoded FLAGS
+rather than local-id references. Validator must skip range check:
+
+| Op | Field | Flag meaning |
+|---|---|---|
+| `IR_DEFER_FIRE` | `cond_local` | defer-stack base index (0..N) |
+| `IR_DEFER_FIRE` | `src2_local` | pop mode (0=pop, 1=no-pop, 2=pop-only) |
+| `IR_LOCK` | `src2_local` | 0=read-lock, 1=write-lock |
+
+When adding a new IR op that reuses these fields as flags, add it
+to the exception list in `ir_validate` (ir.c lines ~320 and ~335).
+Both exceptions surfaced after BUG-594's auto-lock work — 0 and 1
+as flag values fell into the validator's "out of range" check for
+functions with local_count == 0.
+---
+
+## [MOVED 2026-11-14] Methodology: validation-jump for layered work (2026-04-26)
+
+**When facing a sequence of expensive sub-sessions (e.g., F3-F6 = ~80 hrs of data entry), DO THE END-USER VALIDATION FIRST.**
+
+Concrete example from this session: F1a + F2 shipped framework + pipeline. The natural next step was F3-F6 (data entry across 4 archs, ~85 hrs). Instead, **F7-minimum (~5 hrs)** was done first: wire the existing F2 x86_64 table into checker.c NODE_ASM and confirm it works end-to-end.
+
+### The risk pattern this avoids
+
+```
+Without validation jump:
+  F3 (5 hrs) + F4 (30 hrs) + F5 (25 hrs) + F6 (25 hrs) = 85 hrs of data entry
+                              ↓
+                          F7 wires it in
+                              ↓
+              "Oh, the lookup signature was wrong"
+              "Oh, the table format doesn't fit checker's needs"
+              → 85 hrs of data needs rework
+```
+
+```
+With validation jump (what we did):
+  F7-minimum (~5 hrs) wires F1a + F2 into checker.c
+       ↓
+  Test against real asm code
+       ↓
+  Architecture validated NOW (cheap to fix if wrong)
+       ↓
+  Then confidently invest F3-F6
+```
+
+### When to apply this
+
+| Layered work pattern | Apply validation jump? |
+|---|---|
+| Build infrastructure + N units of bulk data | YES — wire one consumer first |
+| Build N predicates, then wire N call sites | YES — wire one predicate first |
+| Build framework for N archs | YES — wire one arch first |
+| Single self-contained feature | NO — just build it |
+| Refactor existing code | NO — refactor IS the validation |
+
+### Concrete checklist
+
+1. **Identify the bulk-data work.** What's the largest chunk? (F3-F6 = 85 hrs)
+2. **Identify the smallest end-user.** What CONSUMES the data? (F7 wires it)
+3. **Build minimum end-user FIRST.** With one data point, prove the pipeline works.
+4. **Then bulk-fill.** Architecture is now confirmed.
+
+### Why this matters for ZER
+
+ZER's compiler architecture has many layered patterns:
+- Phase 1 extractions (85 predicates) → Phase 2 decision call sites (~60)
+- Z-rules (13 wirings) → underlying safety systems (29+1)
+- Asm framework (F1a) → per-arch tables (F3-F6) → enforcement (F7)
+- Compile-time promotion (Tier 1) → tier 2/3 deepenings
+
+For each, the validation-jump is the right starting point. Build the rails, lay one tie, then mass-produce.
+
+### Concrete F7-minimum results
+
+End-to-end chain validated:
+```
+Makefile builds zerc with F2's vendored x86_64 table
+    ↓
+F1a's zer_asm_category stub coexists (no conflicts)
+    ↓
+F2's zer_asm_register_valid lookup reads linked table
+    ↓
+F7's checker call site invokes lookup
+    ↓
+typo "rax0" → table says invalid → checker errors → test rejects program
+```
+
+If any layer had been wrong, the test would have failed. It didn't. **No architectural rework needed for F3-F6.**
+
+This is the value: ~5 hrs of validation jump SAVED 80 hrs of potential rework.
+---
+
+## [MOVED 2026-11-14] Test additions and discoverability
+
+7 new regression tests in `tests/zer/` and `tests/zer_fail/`:
+- range_for_no_shadow.zer
+- range_for_zer_ri_reserved.zer
+- shift_negative_safe.zer
+- threadlocal_shared_reject.zer
+- switch_on_optional_reject.zer
+- comptime_depth_exceeded.zer
+- bodyless_destroy_status_uaf.zer
+- mmio_var_idx_guard.zer
+
+All auto-discovered by `tests/test_zer.sh` via directory scan. Total ZER
+integration test count: 505 (up from 497).
+
+---
+
+# Stage 2 of `docs/4-27-2026-gaps.md` Roadmap — Part A COMPLETE 2026-04-28, Part B IN PROGRESS
+
+Stage 2 splits into two distinct deliverables:
+---
+
+## [MOVED 2026-11-14] Part A — Per-walker semantic gap fixes (DONE)
+
+7 walkers in `zercheck.c`, `zercheck_ir.c`, `ir_lower.c`, `parser.c`,
+and `checker.c` were extended to handle node shapes they previously
+skipped. Each fix is a targeted recursion / root-walk / propagation
+addition, not a mechanical sweep.
+
+### contains_move_struct_field — recursive (Gap 28)
+
+**Pattern:** depth-limited recursion (cap 32) through nested struct/union
+fields. `zercheck.c:contains_move_struct_field_depth(t, depth)`. Reuse
+this pattern for any future "type contains X at any nesting" check.
+
+### BUG-385 struct param Handle scan — explicit-stack DFS (Gap 29)
+
+**Pattern:** instead of recursion, iterative DFS using explicit stack of
+`StructFrame { type, key, key_len, depth }`. Avoids C-stack overflow on
+deeply-nested types and gives O(1) cycle detection via depth limit.
+Reusable for any nested-struct-with-tracked-field registration.
+
+### Move walker NODE_FIELD/NODE_INDEX root walk (Gap 42)
+
+**Pattern:** when an arg's TYPE is move (e.g., `b.item` typed as Tok-move),
+walk through NODE_FIELD/NODE_INDEX to root ident, transfer the root's
+tracked handle. Both AST (`zercheck.c`) and IR (`zercheck_ir.c`) sides
+must apply the same logic to keep tracking consistent.
+
+### Pointer-deref alias on var-decl + NODE_UNARY/AMP key transparency (Gap 41)
+
+**Two-part pattern:**
+1. `Handle k = *p;` registers k as alias of p (same alloc_id). Future
+   `free(k)` propagates to p via existing alias_state mechanism.
+2. `handle_key_from_expr(NODE_UNARY/AMP, ...)` returns the operand's
+   key. `&h` is transparent for handle-tracking purposes.
+
+Together these make `sneak_free(&h)` (where the body does
+`Handle k = *p; free(k);`) propagate FREED state to caller.
+
+### emit_shared_lock_around_cond / unlock helper (Gap 36)
+
+**Pattern:** at each control-flow lowering site (NODE_IF, NODE_WHILE,
+NODE_DO_WHILE, NODE_FOR, NODE_SWITCH), wrap the cond/expr evaluation
+with `IR_LOCK` / `IR_UNLOCK` if it reads shared state. Lock scope is
+JUST the cond evaluation (not the body) to avoid deadlock on nested
+shared access in arms.
+
+### Stack-depth analyzer skip comptime-stripped branches (Gap 44)
+
+**Pattern:** in walkers that traverse all branches of an `if`, check
+`is_comptime` flag first. If true, evaluate cond at compile time and
+walk only the taken branch. Maintains "only the taken branch is
+type-checked" invariant.
+
+### Range-for collection.len snapshot (Gap 31)
+
+**Pattern:** parser desugaring wraps the NODE_FOR in a NODE_BLOCK
+that includes a synthetic `_zer_rlen` var-decl initialized from
+`<collection>.len`. Cond compares against this synthetic local
+instead of re-cloning collection.len each iteration. Uses the same
+`is_synthetic` flag that bypasses reserved-prefix check.
+---
+
+## [MOVED 2026-11-14] Test additions for Stage 2
+
+7 new regression tests:
+- `tests/zer/range_for_len_snapshot.zer`
+- `tests/zer/shared_in_cond_locked.zer`
+- `tests/zer/stack_depth_skip_dead_branch.zer`
+- `tests/zer_fail/nested_move_struct_uaf.zer`
+- `tests/zer_fail/nested_struct_handle_uaf.zer`
+- `tests/zer_fail/container_field_move_uaf.zer`
+- `tests/zer_fail/sneak_free_via_deref.zer`
+
+Total ZER integration count after Stage 2 Part A: 512 (up from 505).
+
+---
+---
+
+## [MOVED 2026-11-14] Concurrency memory-safety — audit + proof state (2026-06-21)
+
+Before touching ANY concurrency code (shared/spawn/atomics/Semaphore/Barrier/
+condvar/Ring/async/move) or claiming ZER concurrency is data-race-safe, read
+`docs/limitations.md` "## OPEN — Concurrency memory-safety". All concurrency
+PRIMITIVES are implemented, but three adversarial sweeps found **~25 verified
+cross-thread memory holes** (data races + cross-thread UAF) that compile clean.
+They map to **four architectural axes**: A) exclusion-list spawn scanner (volatile/
+Arena/threadlocal excluded, slice/opaque spawn-arg kinds uncased); B) single-root
+auto-lock incompleteness (multi-root / union-switch / cond-predicate / @once /
+defer-body unlocked); C) per-function CFG lattice that merges `handles[]` but NOT
+`threads[]` — so `ir_merge_states` (zercheck_ir.c:573-643) **silently drops
+scoped-spawn join obligations at every CFG merge = false-green stack-UAF, the one
+concrete shipped soundness bug, fix first**; D) cinclude/emitter-runtime
+concurrency-capture boundary. The closure (the fix, not yet implemented): a single
+inferred non-strippable `shared` taint (Model-4 extension of `volatile`) + auto-lock
+completeness + the CFG-lattice merging every tracked family + a cinclude capability,
+all frozen by a CI audit gate. Liveness (deadlock/livelock) is the named floor (same
+as Rust — Rust does NOT prevent deadlock either). Full design + Rust mapping +
+completeness-via-Iris decision: `docs/primitives-data-races.md` §24/§24.6. The
+four-condition closure is PROVEN (sufficiency) in Coq/Iris:
+`proofs/operational/lambda_zer_concurrency/` (10 files, zero admits, see its
+DESIGN.md + `docs/proof-internals.md` "λZER-Concurrency subset").
+
+**Status (2026-06-22): phase-2 implementation MOSTLY COMPLETE — BUG-743..756 closed,
+including the ENTIRE Axis B and A6-full atomic-cell taint.** Per-hole ledger:
+`docs/limitations.md`. The narrow tail still open: A5 threadlocal `&`-escape,
+scoped-borrow read-side/CFG residue, A6 micro-residuals (atomic-cell struct-field
+reads + `&s.f` launder). D1 (cinclude thread-capture) is a named FLOOR, not a hole.
+
+### Axis B implementation (B1–B5) — the "no nested lock" principle
+
+The big surprise: B1–B4 did **NOT** need the feared global "lock-scope-set redesign."
+ZER's deadlock-freedom comes from the per-statement lock model **never holding two
+different shared-struct locks at once**. Every B fix preserves that invariant rather
+than breaking it — that's the design key for any future lock work:
+- **B1 multi-root** (BUG-753, ir_lower.c `find_all_shared_roots_expr` +
+  `emit_shared_lock_if_needed`): a statement reading several `shared(rw)` roots
+  (`x = ga.v + gb.v`) locks them ALL — but the extras as **read locks**, which
+  compose (multiple readers OK). The same-statement multi-WRITE case is still a
+  compile error, so a multi-root statement is always all-reads → no deadlock.
+- **B2 shared union-switch** (BUG-754): the union-switch lowering used to alias the
+  shared bytes (`sw_ref = &g.union`) and read tag/capture AFTER the lock released.
+  Fix = **copy-out**: when `find_shared_root_expr(sw_expr) != NULL` (covers
+  `shared(rw)` since `is_shared` is set for it too), route through the *existing
+  rvalue path* (ir_lower.c, the `&& !root_is_shared` clause on `is_lvalue`) which
+  `lower_expr`s the whole union into a LOCAL *under* the switch-expr lock. Every
+  tag/capture read is then of a private snapshot. The `|*x|` mutable capture of a
+  shared union is rejected in the checker (NODE_SWITCH union ptr-capture branch) —
+  copy-out makes it alias the throwaway local (lost mutation); same class as the
+  A6/#5 `&shared.field` ban.
+- **B3 `@cond_wait` foreign read** (BUG-755, checker.c `cond_pred_foreign_shared`):
+  the predicate is re-evaluated under ONLY the cond struct's mutex, so a read of a
+  DIFFERENT shared struct races. **Reject** (not lock — locking the 2nd struct nests
+  inside the cond mutex = AB-BA + cond_wait sleeps holding it). **Instance-precise on
+  the root ident**, not type_id — catches two instances of the same shared type while
+  accepting the legit pointer-param `b`/`b.field` case. Over-rejects nothing (every
+  existing condvar predicate reads only its own cond struct).
+- **B4 `@once` loser-wait** (BUG-756): the prior "needs an IR restructure" blocker
+  was **illusory**. 3-state flag (0/1/2): winner CAS 0→1 → body → store 2 (RELEASE)
+  at the join block; loser spins on `!= 2` (ACQUIRE) → skip. The trick that avoids
+  the IR change: name the flag **`_zer_once_<bb_skip_id>`** — the `@once`'s
+  `false_block` id is unique per `@once` and is reachable from BOTH emission sites
+  (`inst->false_block` at the branch, `bb->id` at the join). The flag is declared at
+  **function scope** via a pre-scan in `emit_regular_func_from_ir` (after the local
+  decls), so both the loser-wait and the winner-store can see it. The winner-store is
+  injected after the join block's label in the block loop. `sched_yield()` relax
+  (`_zer_once_relax`, needs `<sched.h>` — added to the preamble). Control flow
+  (return/break/continue/goto) that exits a `@once` body is now **banned**
+  (`Checker.in_once`, checked in the 4 control-flow handlers) — an early exit would
+  skip the done-publish and hang losers (same rationale as the `@critical` ban; no
+  existing `@once` body uses control flow). Freestanding (`#else`) path unchanged
+  (single-core, loser does not wait).
+- **B5 defer-body lock** (BUG-749): `emit_defer_stmt` NODE_EXPR_STMT lock-wraps the
+  deferred shared access. **NARROWER THAN IT READS, and superseded for most functions
+  (2026-09-08):** it covered `NODE_EXPR_STMT` ONLY, so `defer { g.v = 7; }` locked while
+  `defer { if (g.v > 3) {…} }` emitted a bare unlocked read — a data race. Refactor L
+  lowers the whole body through `lower_stmt` for any function without a LABEL, so the
+  lock now comes from the ordinary path there; B5 remains the mechanism on the label
+  path. See "THE DEFER BODY IS IR NOW".

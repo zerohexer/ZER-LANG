@@ -936,6 +936,12 @@ turned two existing POSITIVE tests red: the older atomic-cell rule already told 
 from `g.i.b`, and my first key (one field level) was coarser than the rule it was meant to
 subsume. The sweep found it in minutes; the fix was the general key (a path), which is
 also what the oracle's model had all along.
+**A verdict sweep that compares EXIT CODES is blind to a masked negative.** The corpus
+sweep said "no change" and `make check` then failed: `scoped_spawn_goto_respawn_atomic_
+bug1422` was still rejected — by the new rule, in the checker, before zercheck's re-spawn
+rule (the one the file states) could speak. Both findings were true of that program; the
+file now has one defect and its twin states the other. For a NEW REJECTION, sweep the
+negatives for their stated reason (the runner's own test), not for their exit status.
 
 **THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
 precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by

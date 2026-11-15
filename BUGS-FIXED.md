@@ -640,7 +640,11 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   scan found clean, over each pair with an ATOMIC access in it (plain against plain there
   is two loans of one object: BUG-969 / 1118 / 1669, probed again and holding). Tests:
   `spawn_race_atomic_field_plain_in_spawner_callee`, `_atomic_vs_lent_plain_thread`,
-  `_atomic_cell_plain_through_global_pointer` (`_bug1677`).
+  `_atomic_cell_plain_through_global_pointer`, `_respawn_lost_threads_plain_write`
+  (`_bug1677`). The last is BUG-1422's atomic sibling as first written: the new judgement
+  refused its plain tail before the re-spawn rule that file states could speak, so
+  `scoped_spawn_goto_respawn_atomic_bug1422` now ends atomically and each file has one
+  defect.
 - **BUG-1678 — `@barrier_init` beside a waiter.** A Barrier synchronises its WAITERS, not
   its own set-up: the emitted `_zer_barrier_init` zeroes the object and re-creates its mutex
   with plain stores, and `_zer_barrier_wait` reads `target` before it takes the lock. A

@@ -158,14 +158,17 @@ Definition zer_flag_orders_coq (flag_valid values_differ : Z) : Z :=
    named and name one global.  Otherwise two named records never do; a named
    and a typed one do when the global's type holds the type (`a_holds_b`); two
    typed ones when either type holds the other. *)
-Definition zer_access_may_alias_coq (same_global both_named a_holds_b b_holds_a : Z) : Z :=
-  if Z.eq_dec same_global 0 then
-    (if Z.eq_dec both_named 0 then
-       (if Z.eq_dec a_holds_b 0 then
-          (if Z.eq_dec b_holds_a 0 then 0 else 1)
-        else 1)
-     else 0)
-  else 1.
+Definition zer_access_may_alias_coq
+    (same_global both_named a_holds_b b_holds_a paths_apart : Z) : Z :=
+  if Z.eq_dec paths_apart 0 then
+    (if Z.eq_dec same_global 0 then
+       (if Z.eq_dec both_named 0 then
+          (if Z.eq_dec a_holds_b 0 then
+             (if Z.eq_dec b_holds_a 0 then 0 else 1)
+           else 1)
+        else 0)
+     else 1)
+  else 0.
 
 (* A local reference is KNOWN (it points only where the values assigned to it
    point) iff its name is one variable, its address is never taken, and every

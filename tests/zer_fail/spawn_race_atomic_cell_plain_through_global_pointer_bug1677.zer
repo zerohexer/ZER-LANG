@@ -1,0 +1,19 @@
+// expect-error: both access non-shared global 'ticks'
+// BUG-1677: the plain access reaches the atomic cell through a global pointer,
+// in a function the spawner calls while the thread runs. No name of the cell
+// appears at the write, so the atomic-cell rule had nothing to match.
+u32 ticks;
+*u32 ticks_ref = &ticks;
+
+void timer() {
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&ticks, 1); }
+}
+void clear_through_ref() {
+    *ticks_ref = 0;
+}
+u32 main() {
+    ThreadHandle th = spawn timer();
+    clear_through_ref();
+    th.join();
+    return 0;
+}

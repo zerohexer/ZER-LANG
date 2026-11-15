@@ -1,0 +1,25 @@
+// expect-error: both access non-shared global 'acct'
+// The path key is written only for a place SPELLED on the global's own name.
+// A pointer to the field carries no path: what goes through it is recorded
+// against the whole global, and meets the field written by name.
+u32 tick;
+struct Account { u32 balance; u32 limit; }
+Account acct;
+
+void deposit(*u32 where) {
+    for (u32 i = 0; i < 100000; i += 1) { *where += 1; }
+}
+void by_pointer() {
+    @atomic_add(&tick, 1);
+    deposit(&acct.balance);
+}
+void by_name() {
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&tick, 1); acct.balance += 1; }
+}
+u32 main() {
+    ThreadHandle a = spawn by_pointer();
+    ThreadHandle b = spawn by_name();
+    a.join();
+    b.join();
+    return 0;
+}

@@ -8319,3 +8319,19 @@ static local's stamp has no definition before the function. A static-local Slab 
 builds. Measured while writing the BUG-1668 grid (whose static-Pool cells are therefore
 checker-only). Fix sketch: collect the stamps of static locals in the same pre-pass that
 collects the globals'. Until then declare the Pool / Ring at file scope.
+
+
+## Named access records carried no path — closed by the path key (2026-11-15)
+
+Closed by `RPath` in `access_alias.v` and `sync_place_path` in `checker.c`: a place spelled
+on a global's own name is recorded with its path (struct fields, constant array indices),
+and two paths neither of which extends the other never alias. What it left open is
+limitations B.17 (the ways a path is lost). The over-rejection as it stood, under
+"[residual of: an atomic cell's plain accesses had no judge in a thread that uses an atomic
+— closed by BUG-1675]":
+
+   **Residuals (over-rejections, loud):** an atomic access of a FIELD or ELEMENT is
+   recorded against the whole global, so a sibling field written plainly by another
+   thread (race-free) is refused unless one lock covers both — keep the atomic counter in
+   a global of its own. (Records carry no path; a first-level field key on named records
+   would recover it, and would also accept two threads writing two fields of one struct.)

@@ -7047,8 +7047,24 @@ an access of whatever the reference may point at:
   stack is its own.
 - *an asm output operand is a write* of the place it names.
 - *an atomic cell is atomic everywhere:* once a thread touches `g` (or a field or element
-  of it) with an `@atomic_*`, a plain read or write of the same global by another thread
-  is a race — by name, through a pointer, or by copying the whole struct.
+  of it) with an `@atomic_*`, a plain read or write of the same cell by anyone running
+  beside it is a race — by name, through a pointer, or by copying the whole struct; in
+  another thread, in the code that spawned it, or in a function that code calls. This
+  holds for a thread whose ONLY shared accesses are atomic, too.
+- *two sub-objects of one global are apart.* Spelled on the global's own name, `st.a`
+  and `st.b`, `tab[0]` and `tab[1]`, `st.in.x` and `st.in.y` share no byte: two threads
+  may each work in one with no lock. They are NOT apart once the place is lost: a
+  variable index (`tab[i]` is any element), the whole struct or array, a union's
+  variants, a slice view, or a pointer to the field handed to a callee — each is the
+  enclosing object, and meets everything in it.
+- *an intrinsic that fills or reads a buffer touches it:* `@cstr(dst, src)` writes `dst`
+  and reads `src`; `@nt_store(&x, v)` writes `x`; `@cpu_fxsave`, `@cpu_xsave`,
+  `@cpu_save_context`, `@cpu_save_fpu` and `@cache_zero_line` write the buffer they are
+  handed, the restore forms read it; `@wait_on_address(&w, v)` is an atomic load of `w`
+  — pair it with `@atomic_store`, never a plain store.
+- *a Barrier synchronises its waiters, not its set-up:* `@barrier_init(b, n)` is a write
+  of `b`. Do it before the first spawn, or after the join — not in a thread, and not in
+  code that runs beside one that may be waiting.
 <!-- audit: expect-error: reached through a reference the compiler cannot name -->
 ```zer
 u32 flag;

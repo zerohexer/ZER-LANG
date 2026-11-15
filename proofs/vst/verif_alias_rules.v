@@ -31,15 +31,16 @@ Definition Vprog : varspecs. mk_varspecs prog. Defined.
 
 Definition zer_access_may_alias_spec : ident * funspec :=
  DECLARE _zer_access_may_alias
-  WITH same_global : Z, both_named : Z, a_holds_b : Z, b_holds_a : Z
-  PRE [ tint, tint, tint, tint ]
+  WITH same_global : Z, both_named : Z, a_holds_b : Z, b_holds_a : Z, paths_apart : Z
+  PRE [ tint, tint, tint, tint, tint ]
     PROP (Int.min_signed <= same_global <= Int.max_signed;
           Int.min_signed <= both_named <= Int.max_signed;
           Int.min_signed <= a_holds_b <= Int.max_signed;
-          Int.min_signed <= b_holds_a <= Int.max_signed)
-    PARAMS (Vint (Int.repr same_global); Vint (Int.repr both_named); Vint (Int.repr a_holds_b); Vint (Int.repr b_holds_a)) SEP ()
+          Int.min_signed <= b_holds_a <= Int.max_signed;
+          Int.min_signed <= paths_apart <= Int.max_signed)
+    PARAMS (Vint (Int.repr same_global); Vint (Int.repr both_named); Vint (Int.repr a_holds_b); Vint (Int.repr b_holds_a); Vint (Int.repr paths_apart)) SEP ()
   POST [ tint ] PROP ()
-    RETURN (Vint (Int.repr (zer_access_may_alias_coq same_global both_named a_holds_b b_holds_a)))
+    RETURN (Vint (Int.repr (zer_access_may_alias_coq same_global both_named a_holds_b b_holds_a paths_apart)))
     SEP ().
 
 Definition zer_local_ref_known_spec : ident * funspec :=

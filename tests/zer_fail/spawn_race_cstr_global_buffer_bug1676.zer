@@ -1,0 +1,26 @@
+// expect-error: both access non-shared global 'name'
+// BUG-1676: @cstr WRITES its destination. The race walk recorded only what the
+// operand EXPRESSIONS read, so two threads filling one global buffer met as two
+// readers and the program compiled (ThreadSanitizer: data race in memcpy).
+u32 tick;
+u8[32] name;
+
+void label_a() {
+    for (u32 i = 0; i < 20000; i += 1) {
+        @atomic_add(&tick, 1);
+        @cstr(name, "worker-a");
+    }
+}
+void label_b() {
+    for (u32 i = 0; i < 20000; i += 1) {
+        @atomic_add(&tick, 1);
+        @cstr(name, "worker-b-with-a-longer-name");
+    }
+}
+u32 main() {
+    ThreadHandle a = spawn label_a();
+    ThreadHandle b = spawn label_b();
+    a.join();
+    b.join();
+    return 0;
+}

@@ -1,0 +1,21 @@
+// expect-error: both access non-shared global 'reg'
+// The path key stops at a UNION: its variants are one storage, so two threads
+// in two variants of one union field are in the same sub-object.
+u32 tick;
+union Word { u32 raw; u32 bits; }
+struct Reg { Word w; u32 gen; }
+Reg reg;
+
+void as_raw() {
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&tick, 1); reg.w.raw = i; }
+}
+void as_bits() {
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&tick, 1); reg.w.bits = i; }
+}
+u32 main() {
+    ThreadHandle a = spawn as_raw();
+    ThreadHandle b = spawn as_bits();
+    a.join();
+    b.join();
+    return 0;
+}

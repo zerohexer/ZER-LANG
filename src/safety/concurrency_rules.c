@@ -393,8 +393,14 @@ int zer_flag_orders(int flag_valid, int values_differ) {
 /* May two access records name overlapping memory? `same_global`: both are
  * named and name one global. Otherwise two named records never do; a named and
  * a typed one do when the global's type holds the type (`a_holds_b`); two typed
- * ones when either type holds the other. */
-int zer_access_may_alias(int same_global, int both_named, int a_holds_b, int b_holds_a) {
+ * ones when either type holds the other. `paths_apart`: both name ONE global,
+ * each inside a sub-object of it, and neither sub-object's path extends the
+ * other's — two fields, two elements (apart_paths_never_alias). */
+int zer_access_may_alias(int same_global, int both_named, int a_holds_b, int b_holds_a,
+                         int paths_apart) {
+    if (paths_apart != 0) {
+        return 0;
+    }
     if (same_global != 0) {
         return 1;
     }

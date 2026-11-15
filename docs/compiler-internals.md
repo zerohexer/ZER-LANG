@@ -8840,6 +8840,15 @@ every ANCESTOR's window (`sync_ancestor_conflict`), with every other thread. A s
 logical thread (`lt`) and the hand-off verdict counts owners by it — add a pair, never
 pour one thread's records into another's set. The final verdict on a pair is
 `zer_pair_ordered` (`race_free.v`); `sync_sets_conflict` is its only caller.
+EVERY instance is judged (BUG-1677): the loop used to skip a pair unless one side was
+"downgraded", and a thread whose only shared accesses are atomic has no scan finding to
+downgrade. Between two clean instances only pairs with an atomic access are compared
+(`sync_sets_conflict_f`) — plain against plain there is two loans, the lend rules'.
+A Named record may carry a PATH (`sync_place_path`, its only writer): struct fields and
+constant indices of a place spelled on the global's own name, stopping at a variable
+index, a union, a view; whole-global otherwise. Trap: the path is the CALLER's scratch
+until `sync_acc_add_path` copies it. What an intrinsic does to the object behind an
+argument is `intrinsic_arg_access`'s to say (BUG-1676) — unlisted means a write.
 
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key

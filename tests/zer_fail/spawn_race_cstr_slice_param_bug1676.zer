@@ -1,0 +1,30 @@
+// expect-error: both access non-shared global 'line'
+// BUG-1676: the destination reached through a slice PARAMETER — the access is
+// to what the reference points at, wherever the intrinsic is called from.
+u32 tick;
+u8[24] line;
+u32 seen;
+
+void put([*]u8 dst, const [*]u8 text) { @cstr(dst, text); }
+
+void writer() {
+    for (u32 i = 0; i < 20000; i += 1) {
+        @atomic_add(&tick, 1);
+        put(line[0..24], "status: ok");
+    }
+}
+void reader() {
+    u32 n = 0;
+    for (u32 i = 0; i < 20000; i += 1) {
+        @atomic_add(&tick, 1);
+        n += (u32)line[3];
+    }
+    @atomic_store(&seen, n);
+}
+u32 main() {
+    ThreadHandle a = spawn writer();
+    ThreadHandle b = spawn reader();
+    a.join();
+    b.join();
+    return 0;
+}

@@ -912,6 +912,31 @@ is a probe — write the two-thread negative, do not write the justification. An
 model's own accepted example is refused by the theorem, believe the theorem first (mine
 had a lock-guarded and a token-guarded write of one location).
 
+**Enumerate the rows; a probe list is whatever somebody thought of (BUG-1676..1678,
+2026-11-15).** Ten families of accepted race had been found by probing, each "an access
+nobody wrote down", and the residual was always the same sentence: nothing enumerates the
+constructs that touch memory. Writing the enumeration — `tests/test_access_matrix.c`:
+every form in which a program touches an object x every way two threads meet — took a
+morning, and its FIRST run was red in a family no probe had gone near (an intrinsic that
+writes through its argument); a row added to pin the new path key down found a second (a
+thread the scan calls clean is compared with nobody); a question asked while writing the
+residuals found a third (`@barrier_init` beside a waiter). Four things made it work. (1)
+The verdict of a cell comes from the DEFINITION of a race, written once as a function of
+(row, column) — never from today's output. (2) Each row has a safe twin column (one lock;
+after the join): a rejection is then known to be for the race. (3) The rows are tied to
+the `NodeKind` enum by a no-`default:` switch, so the list cannot fall behind the AST.
+(4) A known over-rejection is an asserted REJECT with a reason, not a skipped cell.
+And one that nearly did not: judge a negative by the compiler's `error:` lines only — the
+downgraded scan finding prints "data race" as a WARNING on every program in the grid, and
+a substring test over the whole stderr would have passed anything. Mistakes in my own row
+expectations (two instances of a writing form ARE a race; atomic beside atomic is not)
+showed up as red cells too: read a red cell before believing either side.
+**A relaxation's corpus cost is not only its over-rejections.** Judging clean threads
+turned two existing POSITIVE tests red: the older atomic-cell rule already told `g.i.a`
+from `g.i.b`, and my first key (one field level) was coarser than the rule it was meant to
+subsume. The sweep found it in minutes; the fix was the general key (a path), which is
+also what the oracle's model had all along.
+
 **THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
 precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by
 Rice: the true set "memory-safe on every execution" is undecidable, so no sound,

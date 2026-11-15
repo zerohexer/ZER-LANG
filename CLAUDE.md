@@ -219,7 +219,7 @@ same commit as the code.
 | `audit_float_literal.sh` | `OK — every emitted float literal goes through emit_double_lit.` |
 | `audit_matrix.sh` | `OK — every construct x context verdict holds.` |
 
-Plus the axis-crossed grids `tests/test_*_matrix.c` (shape, escape, keep, cflow, conc,
+Plus the axis-crossed grids `tests/test_*_matrix.c` (shape, escape, keep, cflow, conc, access,
 view-alias, hw, async, asm, defer-goto, vrp-position, vrp-fact), each printing
 `=== <name>-matrix: N/N cells correct ===`, and `tests/test_lib.sh` (the standard library
 in `lib/` builds and runs). A grid may assert a RUNTIME VALUE, not just accept / reject —
@@ -624,7 +624,7 @@ a.x = b.y;                 // ERROR — same statement accesses both A and B
 
 > **Concurrency safety status — read before claiming anything.** Do NOT claim ZER is fully
 > data-race-free. The known cross-thread holes are closed and gated (`tests/test_conc_matrix.c`,
-> `tests/test_hw_matrix.c`); the open ones — and exactly what is and is not PROVEN — are in
+> `tests/test_access_matrix.c`, `tests/test_hw_matrix.c`); the open ones — and exactly what is and is not PROVEN — are in
 > `docs/limitations.md` (section B / B2). Floors: `cinclude` code; liveness. Design + Rust
 > mapping: `docs/primitives-data-races.md` §24. Proofs: `proofs/operational/lambda_zer_concurrency/`
 > (`race_free.v` is the composed model: its header lists what the checker must establish).
@@ -815,7 +815,9 @@ cause → fix. Three cycles without a confirmed cause, or a fix past ~10 lines: 
 restate. A compiler segfault: rebuild with `-fsanitize=address -g -O0`.
 
 **Checklists.** New builtin method → checker + emitter (both paths) + zercheck_ir. New AST
-node → every exhaustive walker (`-Werror=switch` lists them). New coercion →
+node → every exhaustive walker (`-Werror=switch` lists them). Anything that touches memory
+→ its row in `tests/test_access_matrix.c`; an intrinsic taking a reference → its line in
+`intrinsic_arg_access`. New coercion →
 `value_flows_to`. New emission path → every safety wrapper ported. New safety rule → its
 gate cell, a negative with `expect-error`, its row in `docs/multi-site-classes.md`.
 

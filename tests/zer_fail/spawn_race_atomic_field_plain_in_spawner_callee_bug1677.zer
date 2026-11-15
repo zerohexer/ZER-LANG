@@ -1,0 +1,20 @@
+// expect-error: both access non-shared global 'stats'
+// BUG-1677: the worker's only shared access is ATOMIC, so the spawn scan finds
+// it clean and nothing was ever compared with it. A function its spawner calls
+// meanwhile clears the same field plainly; the atomic-cell rule knows scalar
+// NAMES and the spawner's own body, not a field written in a callee.
+struct Stats { u32 hits; u32 errors; }
+Stats stats;
+
+void worker() {
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&stats.hits, 1); }
+}
+void reset_stats() {
+    stats.hits = 0;
+}
+u32 main() {
+    ThreadHandle th = spawn worker();
+    reset_stats();
+    th.join();
+    return 0;
+}

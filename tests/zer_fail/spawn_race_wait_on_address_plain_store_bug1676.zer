@@ -1,0 +1,22 @@
+// expect-error: both access non-shared global 'ready'
+// BUG-1676: @wait_on_address spins on an ATOMIC load of its word. An atomic
+// load beside a PLAIN store of the same word is a race like any other; beside
+// an @atomic_store it is not (tests/zer/intrinsic_arg_access_ok_bug1676.zer).
+u32 tick;
+u32 ready;
+
+void waiter() {
+    @atomic_add(&tick, 1);
+    @wait_on_address(&ready, 0);
+}
+void setter() {
+    @atomic_add(&tick, 1);
+    ready = 1;
+}
+u32 main() {
+    ThreadHandle a = spawn waiter();
+    ThreadHandle b = spawn setter();
+    a.join();
+    b.join();
+    return 0;
+}

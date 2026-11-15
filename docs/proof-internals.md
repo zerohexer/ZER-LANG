@@ -262,7 +262,9 @@ models, each with its meaning lemmas over `concurrency_decisions.v` and a VST fi
 lock: mutual exclusion + exactness of an update; `verif_lock_rules.v`), `flag_handoff.v`
 (the flag as a token: holders agree on the current value; `verif_handoff_rules.v`),
 `access_alias.v` (what an access touches: typed objects and paths, records that may-alias
-whenever the accesses overlap; a local holds one of its listed values; a fresh object
+whenever the accesses overlap — a record is the whole global, a PATH inside it (`RPath`,
+2026-11-15: two paths neither of which extends the other never alias; no unions in the
+model), or "some object of a type"; a local holds one of its listed values; a fresh object
 never published is its thread's alone; `verif_alias_rules.v`). Each states, in its header,
 the hypotheses the compiler must establish and which syntactic check establishes each —
 that list is the probe list (playbook, "The oracle's hypothesis list"). `access_alias.v`

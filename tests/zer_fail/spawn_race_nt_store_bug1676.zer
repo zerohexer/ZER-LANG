@@ -1,0 +1,26 @@
+// expect-error: both access non-shared global 'total'
+// BUG-1676: @nt_store(&x, v) is a store of x with no `=` in it. The walk saw
+// `&total` — an address formed, nothing touched — so a non-temporal store in
+// one thread beside a plain read-modify-write in another had no record at all.
+u32 tick;
+u64 total;
+
+void stamp() {
+    for (u32 i = 0; i < 20000; i += 1) {
+        @atomic_add(&tick, 1);
+        @nt_store(&total, 7);
+    }
+}
+void count() {
+    for (u32 i = 0; i < 20000; i += 1) {
+        @atomic_add(&tick, 1);
+        total += 1;
+    }
+}
+u32 main() {
+    ThreadHandle a = spawn stamp();
+    ThreadHandle b = spawn count();
+    a.join();
+    b.join();
+    return 0;
+}

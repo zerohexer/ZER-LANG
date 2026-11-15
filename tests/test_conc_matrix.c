@@ -74,6 +74,30 @@ static int has_conc_reason(const char *eb) {
            strstr(eb, "accessed from both interrupt");
 }
 
+/* Keep only the ERROR lines of a compiler's stderr (2026-11-15). The reason a
+ * program was rejected is in an `error:` line; a WARNING says nothing about
+ * it. This grid tested the whole text — and every program whose thread uses an
+ * @atomic prints "warning: spawn target ... potential data race" whether or not
+ * anything rejects it, so "spawn", "thread" and "data race" were always
+ * there: a cell rejected by an unrelated type error passed as a concurrency
+ * rejection. (tests/test_access_matrix.c was written with the filter and is
+ * where the weakness showed.) */
+static void errors_only(char *eb) {
+    char *out = eb, *line = eb;
+    while (*line) {
+        char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) + 1 : strlen(line);
+        char saved = line[len]; line[len] = 0;
+        /* zercheck reports as `file:N: zercheck: ...` */
+        int is_err = strstr(line, ": error: ") != NULL || strstr(line, ": zercheck: ") != NULL ||
+                     strncmp(line, "error:", 6) == 0;
+        line[len] = saved;
+        if (is_err) { memmove(out, line, len); out += len; }
+        line += len;
+    }
+    *out = 0;
+}
+
 /* NEGATIVE: must reject for a concurrency reason. */
 static int run_neg(const char *name, const char *code) {
     total++;
@@ -91,6 +115,7 @@ static int run_neg(const char *name, const char *code) {
     char eb[4096]; eb[0] = 0;
     FILE *e = fopen(ZT("/tmp/_zer_co.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
+    errors_only(eb);
     if (strstr(eb, "expected ") || strstr(eb, "unexpected") || strstr(eb, "parse error")) {
         failed++; invalid_probe++;
         fprintf(stderr, "  FAIL [INVALID-PROBE] %s — rejected by parse error, not a concurrency check\n", name);

@@ -393,8 +393,14 @@ int zer_flag_orders(int flag_valid, int values_differ) {
 /* May two access records name overlapping memory? `same_global`: both are
  * named and name one global. Otherwise two named records never do; a named and
  * a typed one do when the global's type holds the type (`a_holds_b`); two typed
- * ones when either type holds the other. */
-int zer_access_may_alias(int same_global, int both_named, int a_holds_b, int b_holds_a) {
+ * ones when either type holds the other. `paths_apart`: both name ONE global,
+ * each inside a sub-object of it, and neither sub-object's path extends the
+ * other's — two fields, two elements (apart_paths_never_alias). */
+int zer_access_may_alias(int same_global, int both_named, int a_holds_b, int b_holds_a,
+                         int paths_apart) {
+    if (paths_apart != 0) {
+        return 0;
+    }
     if (same_global != 0) {
         return 1;
     }
@@ -444,6 +450,37 @@ int zer_fresh_ref_own(int fresh, int leaves) {
         return 0;
     }
     if (leaves != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* THE PAIRWISE VERDICT (race_free.v, `conflict -> ordered`). Two access records
+ * of two thread instances: 1 = this pair needs nothing more — the records cannot
+ * overlap, both are atomic, neither writes, or the pair is ordered by a common
+ * lock, by two different held values of one flag, or because one thread is not
+ * running at the other's access. */
+int zer_pair_ordered(int may_alias, int a_write, int b_write, int both_atomic,
+                     int common_lock, int tok_differ, int apart) {
+    if (may_alias == 0) {
+        return 1;
+    }
+    if (both_atomic != 0) {
+        return 1;
+    }
+    if (common_lock != 0) {
+        return 1;
+    }
+    if (tok_differ != 0) {
+        return 1;
+    }
+    if (apart != 0) {
+        return 1;
+    }
+    if (a_write != 0) {
+        return 0;
+    }
+    if (b_write != 0) {
         return 0;
     }
     return 1;

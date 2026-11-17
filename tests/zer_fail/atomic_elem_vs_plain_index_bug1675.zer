@@ -1,0 +1,13 @@
+// expect-error: both access non-shared global 'ga'
+// BUG-1675: an atomic ELEMENT (`@atomic_add(&ga[1], 1)`) against a plain write at an index the compiler
+// cannot tell from 1. TSan: data race on the pre-fix compiler.
+u32 flagx;
+u32[4] ga;
+void wa() { for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&ga[1], 1); } }
+void wp(u32 k) { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { ga[k] += 1; } }
+i32 main() {
+    ThreadHandle a = spawn wa();
+    ThreadHandle b = spawn wp(1);
+    a.join(); b.join();
+    return 0;
+}

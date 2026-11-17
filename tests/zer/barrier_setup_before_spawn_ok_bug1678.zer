@@ -1,0 +1,26 @@
+// BUG-1678, the positive side: a barrier set up BEFORE the threads that wait on
+// it exist (directly, or in a helper), and set up again after they were joined.
+// Two waiters beside each other are what a barrier is for.
+Barrier gate;
+u32 arrived;
+
+void runner() {
+    @barrier_wait(gate);
+    @atomic_add(&arrived, 1);
+}
+void prepare(u32 parties) {
+    @barrier_init(gate, parties);
+}
+u32 main() {
+    prepare(2);
+    ThreadHandle a = spawn runner();
+    ThreadHandle b = spawn runner();
+    a.join();
+    b.join();
+    if (@atomic_load(&arrived) != 2) { return 1; }
+    @barrier_init(gate, 1);              // both joined: nobody is waiting
+    ThreadHandle c = spawn runner();
+    c.join();
+    if (@atomic_load(&arrived) != 3) { return 2; }
+    return 0;
+}

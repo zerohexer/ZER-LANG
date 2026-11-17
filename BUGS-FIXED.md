@@ -589,6 +589,175 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   CRLF are brought back under budget by the Dockerfile's own `find … sed` line. NOT measured:
   a real Windows checkout (the CRLF path was simulated inside the Linux image).
 
+**The access matrix — coverage enumerated, and what its first runs found (2026-11-15)**
+- **`tests/test_access_matrix.c` — every construct that touches memory x every way two
+  threads meet.** `race_free.v` proves that ordering every conflicting pair excludes every
+  race; it cannot prove the compiler SEES every access, and BUG-1666..1675 were all
+  accesses nobody had written down, each found by a probe somebody thought of. The grid is
+  the enumeration. ROWS: each form in which a program touches an object — every node kind
+  in every operand position, every value shape, every route (name, local / global /
+  returned pointer, parameter, pointer in a field, funcptr), every capture, every intrinsic
+  that reads or writes through an argument. COLUMNS: two threads, a thread and its
+  spawner's window (either way round, and through a callee), a helper, a grandchild, a
+  detached thread, no `@atomic` at all — and three in which there is NO race (one lock,
+  after the join, a second thread after the join). A cell's verdict follows from the
+  definition of a data race, never from what the compiler does. `kind_role()` is a switch
+  over `NodeKind` with no `default:`: a new node kind does not build until it is
+  classified, and classified "carries an access" the grid refuses to run until a row names
+  it. A form the compiler refuses although it is safe is an `over` bit — asserted REJECTED,
+  so the cell goes red the day precision improves. A negative counts only if an `error:`
+  LINE names a race: every program whose thread uses an `@atomic` prints "potential data
+  race" as a WARNING, and `test_conc_matrix.c` tested the whole stderr — its filter is now
+  the same (no cell had been passing for that reason; measured). Its first runs found the
+  three families below: on the compiler before them 141 of its 3,440 cells compile a race.
+- **BUG-1676 — an intrinsic that reads or writes THROUGH an argument left no record.**
+  `@cstr(buf, s)` fills `buf`; `@nt_store(&x, v)` stores `x`; `@cpu_fxsave` / `@cpu_xsave` /
+  `@cpu_save_context` / `@cpu_save_fpu` / `@cache_zero_line` write the buffer they are
+  handed; the restore forms read it; `@wait_on_address(&w, v)` loads `w` on every spin. The
+  walk recorded what the operand EXPRESSIONS read — `gbuf` (a read), or nothing at all for
+  `&g` (an address formed). Two threads filling one global buffer compiled (TSan: data
+  race in `memcpy`; for `@nt_store` the sanitizer cannot see the inline asm — its plain-C
+  equivalent races). **Root cause:** "what does this intrinsic touch" had no owner; BUG-877
+  had hand-listed the WRITERS at five call sites for the const check. **Fix:**
+  `intrinsic_arg_access(name, arg)` — none / read / write / atomic read / atomic write —
+  asked by the const-write check and by `sync_walk`. An intrinsic nobody classified is a
+  WRITE through every reference it is handed: a new one over-rejects until it gets its
+  line. The sibling sites (VRP invalidation, use-after-free, the ISR scan, a shared
+  struct's lock) were probed and already right. Tests: `spawn_race_cstr_global_buffer`,
+  `_nt_store`, `_cstr_slice_param`, `_wait_on_address_plain_store` (`_bug1676`),
+  `zer/intrinsic_arg_access_ok_bug1676`.
+- **BUG-1677 — a thread the spawn scan found CLEAN was never compared with anyone.** A
+  thread whose only shared accesses are ATOMIC has no finding, so nothing is downgraded —
+  and the judgement loop compared a thread with its window, its ancestors and the other
+  threads only when one side was downgraded ("a clean thread reaches globals only through
+  what it was handed: the lend rules' job"). An `@atomic_*` is no loan. Accepted (TSan:
+  each a race): the worker's `@atomic_add(&st.hits, 1)` beside `st.hits = 0` in a function
+  its spawner calls; beside `*ref = 0` through a global pointer (a SCALAR cell); beside a
+  second clean thread's plain `*p += 1` through the pointer it was lent. The atomic-cell
+  rule that was trusted here knows scalar NAMES everywhere, fields and elements only in the
+  spawner's own body, and no pointer at all. `race_free.v` already said it: `judged`
+  quantifies over every two threads. **Fix:** every thread is judged; between instances the
+  scan found clean, over each pair with an ATOMIC access in it (plain against plain there
+  is two loans of one object: BUG-969 / 1118 / 1669, probed again and holding). Tests:
+  `spawn_race_atomic_field_plain_in_spawner_callee`, `_atomic_vs_lent_plain_thread`,
+  `_atomic_cell_plain_through_global_pointer`, `_respawn_lost_threads_plain_write`
+  (`_bug1677`). The last is BUG-1422's atomic sibling as first written: the new judgement
+  refused its plain tail before the re-spawn rule that file states could speak, so
+  `scoped_spawn_goto_respawn_atomic_bug1422` now ends atomically and each file has one
+  defect.
+- **BUG-1678 — `@barrier_init` beside a waiter.** A Barrier synchronises its WAITERS, not
+  its own set-up: the emitted `_zer_barrier_init` zeroes the object and re-creates its mutex
+  with plain stores, and `_zer_barrier_wait` reads `target` before it takes the lock. A
+  barrier "locks itself", so it had no record at all. **Fix:** the same query — a set-up is
+  a plain write of the barrier, a wait a synchronised use (no conflict with another wait).
+  Set a barrier up before the first spawn, or after the join. Tests:
+  `spawn_race_barrier_init_beside_waiter_bug1678`, `zer/barrier_setup_before_spawn_ok_bug1678`.
+- **The path key (a relaxation; `access_alias.v` first).** A named record said "somewhere
+  in global `g`", so two threads in two FIELDS of one struct were refused, and judging
+  clean threads (BUG-1677) would have refused `tests/zer/atomic_cell_disjoint_paths_ok` —
+  the atomic-cell rule already told `g.i.a` from `g.i.b` and `cnts[1]` from `cnts[2]`.
+  Oracle: `RPath g p` — "inside the sub-object of `g` at path `p`"; `overlap_may_alias`
+  still holds, `apart_paths_never_alias` is the precision, three witnesses show the path
+  never says "apart" more often than it may. Decision `zer_access_may_alias` gains
+  `paths_apart` (VST). The checker writes a path only for a place SPELLED on the global's
+  own name with no reference on the way (`sync_place_path`): a struct field, an element at
+  a constant index; it STOPS at a variable index, a union, a bit range, a view; anything
+  reaching the sub-object another way (a pointer, a parameter, an intrinsic's argument) is
+  the whole global as before. One grid row per hypothesis (a parameter or local that
+  shadows the global's name; a pointer / slice / Handle field on the way, and that field
+  re-aimed by the other thread; `K`, `3 - 2`, `g_i & 3` as an index; a row against a cell
+  of it). Tests: `zer/spawn_disjoint_paths_ok_path_key` (exact result, TSan-clean; refused
+  before), `zer_fail/spawn_race_same_element_two_threads`, `_field_vs_whole_struct`,
+  `_field_vs_pointer_into_it`, `_union_variants` (`_path_key`). Closes limitations B.17's
+  over-rejection.
+  Corpus (4,105 files): no verdict change but this entry's own tests.
+
+**One machine, one theorem — and what its hypotheses found (2026-11-14)**
+- **`race_free.v` — the composed model.** The data-race class had four oracles, each a
+  model of ONE ordering mechanism with its own state, and several rules with no model at
+  all (a shared struct's mutex, the atomic-cell rule, "that thread is not running").
+  Nothing said the mechanisms together are ENOUGH. `race_free.v` puts them in one
+  interleaving machine — threads as control-flow graphs over plain / atomic accesses,
+  lock take / drop, flag store / observation, spawn, join — defines a data race (two
+  threads both AT conflicting accesses), and proves: an annotation of the program points
+  (lock held, flag value held, thread not yet started, thread finished) that satisfies
+  LOCAL flow constraints, plus the pairwise rule "every two conflicting instructions are
+  ordered", excludes every reachable race (`race_free`; zero admits, no axioms). One
+  accepted three-thread example (`accepted_example` — the first draft of which the
+  theorem refused, correctly: a lock-guarded and a token-guarded write of ONE location
+  are not ordered against each other), and five theorems `acc k`, each "every hypothesis
+  but number k holds and a race is reachable". The checker's final verdict on a pair of
+  access records is now the extracted `zer_pair_ordered`, VST-verified against
+  `pair_ordered_meaning` (`verif_race_rules.v`). NOT proven: that `checker.c` computes
+  such an annotation for every program, or that every construct that touches memory is
+  an access node of the graph it judges.
+- **BUG-1671 — a thread was judged against the window of its own spawn site only.**
+  `after t n u` in the model means u has FINISHED; a join of u says nothing of a thread u
+  STARTED, and a thread lives inside every thread that can run the function that spawns
+  it. Two accepted shapes (TSan: both race): `void child() { spawn gc(); }` joined by
+  main, which then writes what `gc` is still writing; and `void child() { ThreadHandle m
+  = spawn gc(); m.join(); }` with main writing between its spawn of `child` and its join
+  — in child's window, not in gc's, so never compared. Fix: `sync_ancestor_conflict` —
+  thread i is judged against the window of every spawn site whose target reaches, through
+  calls, the function that spawns i, up the whole chain; once a spawn on the chain below
+  an ancestor is detached that ancestor's window never closes (`sync_winx`: its function
+  from the spawn to the end, and its callers after it returns; tokens dropped — only a
+  common lock orders against it). Tests: negatives
+  `spawn_race_{detached_grandchild_after_join,scoped_grandchild_in_window}_bug1671`,
+  positive `spawn_once_async_detached_ok_bug1671`, nine grid cells.
+- **BUG-1672 — the context walk never entered a `@once` body.** "It runs once" excuses it
+  against ITSELF, not against anything else: a thread reading what another thread's
+  `@once` body writes was accepted whenever the threads use an `@atomic` (TSan: race).
+  In the model a `@once` block is a lock: being its one executor. Fix: the body is walked
+  and its accesses carry the block as a tag (`SyncCtx.once`, `sync_once_site`); two
+  records with ONE tag are the only pairs it orders (`sync_common_lock`). The
+  volatile read-modify-write rule keeps its own single-owner exemption for `@once`
+  bodies. Tests: negative `spawn_race_once_body_vs_reader_bug1672`, four grid cells
+  (vs a reader, vs itself, two blocks, locked).
+- **BUG-1673 — polling one async task from two threads recorded nothing.** An async
+  function's locals and resume point live in its task; `_zer_async_NAME_poll(&task)`
+  rewrites them, and the argument is an address, not an access (TSan: 8 races on the
+  task's state). Fix: `sync_async_task_call` — `_init` / `_poll` write the object their
+  first argument points at, `_result` reads it (`sync_record_through`: the named global,
+  or "some object of the task type" through an unknown pointer; a task on the thread's
+  own stack is its own). Tests: negative `spawn_race_async_task_two_pollers_bug1673`,
+  four grid cells.
+- **BUG-1674 — an asm output operand is a write, and no scan looked.** `outputs: { "rax" =
+  g }` assigns `g`. The spawn scan, the ISR scan and the context walk each treated
+  `NODE_ASM` as a leaf, so two threads running the block wrote `g` unseen — with or
+  without an `@atomic`. Fix: all three descend the operands (inputs read, outputs written
+  — `sync_write_target`, extracted from the assignment arm). Both this and BUG-1672 were
+  ROWS OF `tools/walker_field_baseline.txt`: the gate had listed them as accepted gaps.
+  Tests: negatives `spawn_race_asm_output{,_atomic}_bug1674`, three grid cells.
+- **BUG-1675 — an atomic cell touched PLAINLY by a thread that uses an `@atomic` had no
+  judge.** `conflict` in the model excuses a pair only when BOTH accesses are atomic. The
+  atomic-cell rule (`check_atomic_cell_safety`) polices the SPAWNER's plain accesses;
+  a spawn target's are the spawn scan's, and when the target uses an `@atomic` of its own
+  they pass to the context walk — which skipped every atomic cell as "the atomic-cell
+  rule's". Seven accepted shapes (TSan: each races): `g += 1` by name, `bump(&g)` through
+  a parameter, `*gp += 1` through a global pointer, a whole-struct write and a
+  whole-struct read over a struct with an atomic field, a variable index into an array
+  with an atomic element, an unknown pointer to a cell whose address escaped. Fix: the
+  walk records a plain access of an atomic cell like any other, and records every atomic
+  access of a NAMED cell (`&g`, `&gs.f`, `&ga[i]`, a parameter bound to one, a static
+  local) as an ATOMIC record of its root global (`sync_record_atomic`). So that a lock
+  word or a counter does not thereby meet every `*u32` in the program: a reference the
+  walk cannot follow cannot point at a SCALAR global whose address the program never
+  forms except as an atomic's cell operand (`sync_global_unreachable`; the census walks
+  every body, every global initializer and — new — asm operands). Recording atomic
+  cells exposed one more: a LOCAL's write target was resolved through the spawn scan's
+  alias table (that scan's state), so `b = @atomic_load(&gb);` read as a write of `gb`;
+  a name the function binds is now answered from the walk's own bindings only
+  (`rust_tests/rc_atomic_004.zer` was the witness). Tests: three negatives
+  `atomic_{cell_plain_through_param,field_vs_whole_struct_copy,elem_vs_plain_index}_bug1675`,
+  nine grid cells (seven red on the previous compiler).
+- **BUG-1670 — a `static` local Pool / Ring did not build.** The checker accepts it; the
+  emitter spelled its type by a NAME defined nowhere (`struct _zer_pool_N_4`) where a
+  global gets an anonymous struct, and GCC refused the program. Fix:
+  `emit_container_storage_type`, one spelling for both declaration paths. Test:
+  `static_local_pool_ring_bug1670` (state persists across calls; a nested block).
+  Corpus for all of the above (4,079 files): no verdict change.
+
 **What an access touches — the unnamed pointer, and three accesses with no record at all (2026-11-14)**
 - **BUG-1666 — an access through a reference the context walk could not NAME was nobody's.**
   When a thread uses an `@atomic_*` / `@barrier` the spawn scan's "touches a non-shared

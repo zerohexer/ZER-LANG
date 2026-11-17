@@ -1,0 +1,20 @@
+// expect-error: both access non-shared global 'slots'
+// The path key (access_alias.v, RPath) sets two accesses APART only when
+// neither path extends the other. A variable index is ANY element: it meets
+// the constant one.
+u32 tick;
+u32[4] slots;
+
+void fixed() {
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&tick, 1); slots[2] += 1; }
+}
+void roaming(u32 k) {
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&tick, 1); slots[k] += 1; }
+}
+u32 main() {
+    ThreadHandle a = spawn fixed();
+    ThreadHandle b = spawn roaming(2);
+    a.join();
+    b.join();
+    return 0;
+}

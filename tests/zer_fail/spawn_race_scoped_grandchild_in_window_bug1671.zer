@@ -1,0 +1,14 @@
+// expect-error: the code running beside the thread that started it
+// BUG-1671, the scoped half: `child` starts `gc` and joins it, so `gc` is over when `child` is — but main
+// writes `g` BETWEEN its spawn of `child` and its join, while `gc` is running. That write is in child's
+// window, not in gc's, and the two were never compared. TSan: data race on the pre-fix compiler.
+u32 flagx;
+u32 g;
+void gc() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { g += 1; } }
+void child() { ThreadHandle m = spawn gc(); m.join(); }
+i32 main() {
+    ThreadHandle t = spawn child();
+    for (u32 i = 0; i < 100000; i += 1) { g += 1; }
+    t.join();
+    return 0;
+}

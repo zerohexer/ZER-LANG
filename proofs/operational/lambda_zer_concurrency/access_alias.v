@@ -20,10 +20,24 @@
    when they are in the same object and one path is a prefix of the other.
    A RECORD is what the compiler writes down for an access:
        RNamed g    "inside the global g"
+       RPath g p   "inside the sub-object at path p of the global g"
+                   (2026-11-15) — the refinement that lets two threads touch
+                   two fields, or two elements, of one global: sub-objects
+                   at paths neither of which extends the other never overlap
        RTyped t    "inside some object of type t" — the type of what the
                    dereferenced reference points at
    WHAT THE COMPILER MUST ESTABLISH (sound_rec), per access:
        RNamed g    the access IS inside g                           (H_named)
+       RPath g p   the access is inside g AND its path begins with p
+                                                                    (H_path)
+                   — the compiler writes one only for a place spelled
+                   `g.f[3].h...` on a global named directly: a step is a
+                   field of a STRUCT or an element of an ARRAY at a constant
+                   index, and the path STOPS (a shorter path is a coarser
+                   record, still sound) at a variable index, a union, a
+                   bit range or a view. Whatever reaches the sub-object
+                   another way (a pointer to it, a view, a callee's
+                   parameter) is RNamed g or RTyped.
        RTyped t    the reference it went through points at a sub-object of
                    type t that the accessed path lies inside        (H_typed)
                    — ZER's reference typing: no pointer arithmetic, casts
@@ -39,11 +53,14 @@
      T3  precision            two different named globals never may-alias;
                               two typed records of unrelated types do not; a
                               named global does not may-alias a type it does
-                              not contain.
+                              not contain; two paths of one global neither of
+                              which extends the other never may-alias
+                              (apart_paths_never_alias).
      T4  necessity            each way of may-aliasing is realised by two
                               overlapping accesses with sound records:
                               same_global_overlaps, named_typed_overlaps,
-                              typed_typed_overlaps.
+                              typed_typed_overlaps, comparable_paths_overlap,
+                              path_whole_overlaps, path_typed_overlaps.
      and for the one fact the compiler trusts about a LOCAL reference:
      T1  local_value_listed   a variable written only by its listed
                               assignments holds one of the listed values;
@@ -166,22 +183,40 @@ Section mem.
   Definition overlap (a1 a2 : access) : Prop :=
     fst a1 = fst a2 /\ (prefix (snd a1) (snd a2) \/ prefix (snd a2) (snd a1)).
 
-  Inductive rec := RNamed (g : nat) | RTyped (t : ty).
+  Inductive rec := RNamed (g : nat) | RPath (g : nat) (p : list nat) | RTyped (t : ty).
 
-  (* H_named / H_typed *)
+  (* H_named / H_path / H_typed *)
   Definition sound_rec (a : access) (r : rec) : Prop :=
     match r with
     | RNamed g => fst a = g
+    | RPath g p => fst a = g /\ prefix p (snd a)
     | RTyped t => exists q, prefix q (snd a) /\ sub (obj_ty (fst a)) q = Some t
     end.
 
+  (* A path record is compared as its whole global against everything but
+     another path record of the same global: only THERE does the path decide. *)
   Definition may_alias (r1 r2 : rec) : Prop :=
     match r1, r2 with
     | RNamed g1, RNamed g2 => g1 = g2
+    | RNamed g1, RPath g2 _ => g1 = g2
+    | RPath g1 _, RNamed g2 => g1 = g2
+    | RPath g1 p1, RPath g2 p2 => g1 = g2 /\ (prefix p1 p2 \/ prefix p2 p1)
     | RNamed g, RTyped t => holds (obj_ty g) t
     | RTyped t, RNamed g => holds (obj_ty g) t
+    | RPath g _, RTyped t => holds (obj_ty g) t
+    | RTyped t, RPath g _ => holds (obj_ty g) t
     | RTyped t1, RTyped t2 => holds t1 t2 \/ holds t2 t1
     end.
+
+  (* prefixes of two comparable paths are comparable *)
+  Lemma prefixes_comparable p1 p2 q1 q2 :
+    prefix p1 q1 -> prefix p2 q2 -> prefix q1 q2 \/ prefix q2 q1 ->
+    prefix p1 p2 \/ prefix p2 p1.
+  Proof.
+    intros H1 H2 [Hq|Hq].
+    - eapply prefix_comparable; [eapply prefix_trans; eauto | exact H2].
+    - eapply prefix_comparable; [exact H1 | eapply prefix_trans; eauto].
+  Qed.
 
   Lemma sub_prefix_holds T q1 q2 t1 t2 :
     prefix q1 q2 -> sub T q1 = Some t1 -> sub T q2 = Some t2 -> holds t1 t2.
@@ -194,10 +229,16 @@ Section mem.
     overlap a1 a2 -> sound_rec a1 r1 -> sound_rec a2 r2 -> may_alias r1 r2.
   Proof.
     intros [Ho Hp] S1 S2. destruct a1 as [o1 p1], a2 as [o2 p2]. simpl in *. subst o2.
-    destruct r1 as [g1|t1], r2 as [g2|t2]; simpl in *.
+    destruct r1 as [g1|g1 f1|t1], r2 as [g2|g2 f2|t2]; simpl in *.
     - congruence.
+    - destruct S2 as [S2 _]. congruence.
     - destruct S2 as [q [_ Hq]]. subst g1. exists q. exact Hq.
+    - destruct S1 as [S1 _]. congruence.
+    - destruct S1 as [S1 F1], S2 as [S2 F2]. split; [congruence|].
+      eapply prefixes_comparable; eauto.
+    - destruct S1 as [S1 _], S2 as [q [_ Hq]]. subst g1. exists q. exact Hq.
     - destruct S1 as [q [_ Hq]]. subst g2. exists q. exact Hq.
+    - destruct S2 as [S2 _], S1 as [q [_ Hq]]. subst g2. exists q. exact Hq.
     - destruct S1 as [q1 [P1 H1]]. destruct S2 as [q2 [P2 H2]].
       assert (C : prefix q1 q2 \/ prefix q2 q1).
       { destruct Hp as [Hp|Hp].
@@ -211,6 +252,46 @@ Section mem.
   (* T3 *)
   Lemma different_globals_never_alias g1 g2 : g1 <> g2 -> ~ may_alias (RNamed g1) (RNamed g2).
   Proof. intros H A. simpl in A. congruence. Qed.
+
+  (* T3, the path refinement: two sub-objects of one global at paths neither
+     of which extends the other never may-alias — sibling fields, two
+     elements, a field and an element of another field *)
+  Lemma apart_paths_never_alias g p1 p2 :
+    ~ prefix p1 p2 -> ~ prefix p2 p1 -> ~ may_alias (RPath g p1) (RPath g p2).
+  Proof. intros H1 H2 [_ [A|A]]; contradiction. Qed.
+
+  (* T4, the path refinement: every may-alias answer a path record gets is
+     realised by two overlapping accesses with sound records — the path cannot
+     be made to say "apart" any more often than it does *)
+  Lemma comparable_paths_overlap g p1 p2 :
+    prefix p1 p2 ->
+    exists a1 a2, overlap a1 a2 /\ sound_rec a1 (RPath g p1) /\ sound_rec a2 (RPath g p2).
+  Proof.
+    intros H. exists (g, p2), (g, p2). repeat split; simpl; try reflexivity.
+    - left. exists []. rewrite app_nil_r. reflexivity.
+    - exact H.
+    - exists []. rewrite app_nil_r. reflexivity.
+  Qed.
+
+  Lemma path_whole_overlaps g p :
+    exists a1 a2, overlap a1 a2 /\ sound_rec a1 (RPath g p) /\ sound_rec a2 (RNamed g).
+  Proof.
+    exists (g, p), (g, []). repeat split; simpl; try reflexivity.
+    - right. exists p. reflexivity.
+    - exists []. rewrite app_nil_r. reflexivity.
+  Qed.
+
+  (* a typed record of the sub-object's own type, reached through a pointer TO
+     it, is inside it *)
+  Lemma path_typed_overlaps g p t :
+    sub (obj_ty g) p = Some t ->
+    exists a1 a2, overlap a1 a2 /\ sound_rec a1 (RPath g p) /\ sound_rec a2 (RTyped t).
+  Proof.
+    intros Hs. exists (g, p), (g, p). repeat split; simpl; try reflexivity.
+    - left. exists []. rewrite app_nil_r. reflexivity.
+    - exists []. rewrite app_nil_r. reflexivity.
+    - exists p. split; [exists []; rewrite app_nil_r; reflexivity | exact Hs].
+  Qed.
 
   (* T4: each way of may-aliasing is realised *)
   Lemma same_global_overlaps g :
@@ -390,16 +471,25 @@ Local Open Scope Z_scope.
 (* may_alias, over what the checker computes: `same_global` is set only for two
    named records of one global; for a named and a typed record `a_holds_b` is
    "the global's type holds the type". *)
-Lemma access_may_alias_meaning sg bn ab ba :
-  zer_access_may_alias_coq sg bn ab ba = 1 <->
-  sg <> 0 \/ (bn = 0 /\ (ab <> 0 \/ ba <> 0)).
+Lemma access_may_alias_meaning sg bn ab ba fa :
+  zer_access_may_alias_coq sg bn ab ba fa = 1 <->
+  fa = 0 /\ (sg <> 0 \/ (bn = 0 /\ (ab <> 0 \/ ba <> 0))).
 Proof.
   unfold zer_access_may_alias_coq.
   repeat destruct (Z.eq_dec _ _); split; intros H; try lia.
 Qed.
 
+(* `paths_apart` — two path records of ONE global, neither path a prefix of the
+   other — is the only thing that makes two records of one global not alias
+   (apart_paths_never_alias); without it the answer is the old one. *)
+Lemma paths_apart_never_alias sg bn ab ba fa :
+  fa <> 0 -> zer_access_may_alias_coq sg bn ab ba fa = 0.
+Proof.
+  intros H. unfold zer_access_may_alias_coq. repeat destruct (Z.eq_dec _ _); lia.
+Qed.
+
 Lemma two_named_alias_only_if_same bn ab ba :
-  bn <> 0 -> zer_access_may_alias_coq 0 bn ab ba = 0.
+  bn <> 0 -> zer_access_may_alias_coq 0 bn ab ba 0 = 0.
 Proof.
   intros H. unfold zer_access_may_alias_coq. repeat destruct (Z.eq_dec _ _); lia.
 Qed.

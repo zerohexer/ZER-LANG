@@ -540,8 +540,10 @@ struct Node {
         /* NODE_CRITICAL: @critical { body } — interrupt-disabled block */
         struct { Node *body; } critical;
 
-        /* NODE_ONCE: @once { body } — execute exactly once, thread-safe */
-        struct { Node *body; } once;
+        /* NODE_ONCE: @once { body } — execute exactly once, thread-safe.
+         * `site_sym` (BUG-1672): the concurrency walk's name for "being the one
+         * executor of THIS block" — made on first use, never emitted. */
+        struct { Node *body; struct Symbol *site_sym; } once;
 
         /* NODE_AWAIT: await expr; — yield until condition is true */
         struct { Node *cond; } await_stmt;

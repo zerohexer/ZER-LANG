@@ -1,0 +1,19 @@
+// expect-error: accesses non-shared global 'gout'
+// BUG-1674: an asm block WRITES its outputs — an output operand is an assignment target with no `=` in
+// it. The spawn scan, the ISR scan and the context walk all treated the block as a leaf, so two threads
+// running `bump` wrote `gout` unseen (with or without an @atomic).
+u64 gout;
+naked void bump() {
+    asm {
+        instructions: "mov $1, %0"
+        outputs: { "rax" = gout }
+        safety: "writes the constant one into the output register for the test"
+    }
+}
+void w() { volatile u32 never = 0; if (never == 42) { bump(); } }
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

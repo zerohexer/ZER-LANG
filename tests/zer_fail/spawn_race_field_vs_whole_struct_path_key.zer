@@ -1,0 +1,23 @@
+// expect-error: both access non-shared global 'cfg'
+// The path key: a write of ONE field beside a copy of the WHOLE struct. The
+// whole struct's path is empty — a prefix of every path inside it.
+u32 tick;
+struct Config { u32 baud; u32 parity; }
+Config cfg;
+Config snapshot;
+
+void tune() {
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&tick, 1); cfg.baud += 1; }
+}
+void capture() {
+    Config local;
+    for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&tick, 1); local = cfg; }
+    @atomic_store(&tick, local.parity);
+}
+u32 main() {
+    ThreadHandle a = spawn tune();
+    ThreadHandle b = spawn capture();
+    a.join();
+    b.join();
+    return 0;
+}

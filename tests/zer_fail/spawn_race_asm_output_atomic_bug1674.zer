@@ -1,0 +1,19 @@
+// expect-error: both access non-shared global 'gout'
+// BUG-1674, the context-walk half: the thread uses an @atomic, so the spawn scan's finding is a warning
+// and the walk judges the asm output's write against the other instance's.
+u32 flagx;
+u64 gout;
+naked void bump() {
+    asm {
+        instructions: "mov $1, %0"
+        outputs: { "rax" = gout }
+        safety: "writes the constant one into the output register for the test"
+    }
+}
+void w() { @atomic_store(&flagx, 1); volatile u32 never = 0; if (never == 42) { bump(); } }
+i32 main() {
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

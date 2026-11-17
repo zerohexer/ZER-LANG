@@ -1,0 +1,17 @@
+// expect-error: the code running beside the thread that started it
+// BUG-1671: a join ends the thread it joins — not a thread THAT thread detached. `child` starts
+// `grandchild` fire-and-forget and returns; main joins `child` and writes `g` while `grandchild` is still
+// writing it. A thread was judged against the window of its OWN spawn site only; it runs inside every
+// thread that can execute the function that spawns it, so it is judged against their windows too — and
+// once a thread on the way down is detached, such a window no longer closes at a join.
+// (race_free.v: `after t n u` says u has finished; it says nothing of what u started.)
+u32 flagx;
+u32 g;
+void grandchild() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { g += 1; } }
+void child() { spawn grandchild(); }
+i32 main() {
+    ThreadHandle t = spawn child();
+    t.join();
+    for (u32 i = 0; i < 100000; i += 1) { g += 1; }
+    return 0;
+}

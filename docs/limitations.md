@@ -116,16 +116,6 @@ Each item was run on the build that carries BUG-1658..1661. None is accept-unsaf
    `docs/limitations-closed.md`, "[ARCHIVED 2026-11-14] OPEN — BRANCH
    `loving-davinci-ii7a90`", sections L and M.
 
-## OPEN — a `static` LOCAL Pool or Ring emits C that GCC refuses (2026-11-14, LOW — loud, valid program refused)
-
-`u32 f() { static Pool(N, 4) sp; … }` passes the checker ("Pool / Ring / Slab / Arena must
-be global or static") and GCC then reports `variable 'sp' has initializer but incomplete
-type`: the struct for a Pool / Ring stamp is emitted from the GLOBAL declarations, and a
-static local's stamp has no definition before the function. A static-local Slab or Arena
-builds. Measured while writing the BUG-1668 grid (whose static-Pool cells are therefore
-checker-only). Fix sketch: collect the stamps of static locals in the same pre-pass that
-collects the globals'. Until then declare the Pool / Ring at file scope.
-
 ## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1643; measured, reproducers in `tests/zer_gaps/`)
 
 Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
@@ -307,6 +297,75 @@ each a missing SUMMARY fact, not a missing key:
    hand-off flag (both recognisers are keyed by global), so data guarded by one is
    refused; a static-local reference is always unknown.
 
+14. [residual of: a thread was judged against its own spawn site's window only — closed by BUG-1671]
+   **Residuals (over-rejections, loud):** a thread is judged against the WHOLE window of
+   every ancestor although it lives for only part of it (the access before the nested
+   spawn, or after the nested join, inside the ancestor's window is still counted); once
+   a thread on the chain is detached an ancestor's window never closes, and only a common
+   lock orders against it — a flag hand-off between a detached grandchild and its
+   grandparent is refused.
+
+15. [residual of: a `@once` body was never walked — closed by BUG-1672]
+   **Residual (over-rejection, loud):** the code AFTER a `@once` block is not ordered
+   after its body, although a thread that loses the race waits for the winner to finish —
+   so `@once { init(); } use();` in two workers is refused when `use` reads what `init`
+   writes (the spawn scan's single-owner rule already refused it without an `@atomic`).
+   A "done" token for the block would recover it; it needs the wait modelled first.
+
+16. [residual of: an async task's state had no record — closed by BUG-1673]
+   **Residual (over-rejection, loud):** a poll is a write of the WHOLE task, so two
+   threads may poll one task only under one lock, and a task reached through a pointer the
+   walk cannot name is "some object of the task type".
+
+17. [residual of: named access records carried no path — closed by the path key, 2026-11-15]
+   **Residuals (over-rejections, loud):** a path is written only for a place SPELLED on
+   the global's own name. It is lost — the access is then "somewhere in the global" (or,
+   for a variable index, "somewhere in the array") — through a pointer to the field
+   (`&g.f` bound to a name, passed to a callee or to an intrinsic), a slice view, a
+   variable index (`g.arr[i]` in two threads with disjoint `i` is refused), a union, and
+   for a `static` local. Forming a view (`ga[0..4]`) still counts as a plain READ of the
+   array. The spawn scan knows no paths: a thread with no `@atomic` may not mention the
+   global at all.
+   **Not modelled:** unions (`access_alias.v` has structs and arrays; the checker stops
+   the path at one), and that sibling sub-objects share no byte in the EMITTED C — true
+   for the struct fields and array elements GCC lays out (a `uN` field has a carrier of
+   its own), argued, not proved.
+   **Argued, not modelled (BUG-1675):** `&g` is the only way to form a reference to a
+   scalar global, so one whose address is never formed (other than as an atomic's cell
+   operand) does not alias a typed record. The census that decides it is a complete walk
+   of every body, global initializer and asm operand; C code is a floor.
+
+18. [residual of: an intrinsic that reads or writes through an argument left no record — closed by BUG-1676]
+   **Residuals:** the access is recorded against the object the reference DESIGNATES — a
+   named global, or "some object of the pointee type"; that `@cpu_fxsave` writes 512
+   bytes from `&buf[0]` and not one is the buffer-size rule's, not this record's. Cache
+   maintenance (`@cache_flush_*`, `@cache_invalidate_*`, `@cache_writeback`) and
+   `@cpu_monitor_addr` / `@cpu_umonitor` are classified "touches nothing behind the
+   address": the bytes are neither read into the program nor changed by it — argued
+   (`@cache_invalidate_range` can DISCARD another core's dirty line: hardware-consequence).
+   **Over-rejection by construction:** an intrinsic with no line in `intrinsic_arg_access`
+   is a write through every reference it is handed.
+
+19. [residual of: a thread the spawn scan found clean was never compared — closed by BUG-1677]
+   **Residuals:** between two instances the scan found clean only the pairs with an
+   ATOMIC access (or a Barrier's set-up, BUG-1678) are judged here; plain against plain is
+   the lend rules' (two loans of one object), a different gate. The atomic-cell rule is
+   still run as well: it is coarser in what it reaches and stricter in one way — a plain
+   WRITE of a scalar atomic cell is refused anywhere in the program, concurrent or not.
+   **Over-rejections the access matrix pins (each an `over` bit, asserted):** a `goto` /
+   label anywhere in a function voids its lock regions; the spawn scan's finding for a
+   call through a function-pointer FIELD is an error even beside an `@atomic`, so neither
+   a lock nor a join is ever considered; one object lent to two live threads is refused
+   when both only read; a `volatile` read-modify-write in a spawned thread is refused even
+   when every other access comes after its join.
+
+20. [residual of: `@barrier_init` beside a waiter was accepted — closed by BUG-1678]
+   **Residual (accept-unsafe, narrow, loud at run time):** only a Barrier NAMED as a
+   global is recorded. One reached through a pointer parameter (`*Barrier`) set up beside
+   its waiters is not judged; the emitted wait traps on a barrier that is still zero, and
+   nothing catches a re-initialisation under a blocked waiter. Semaphores and condition
+   variables have no set-up intrinsic.
+
 **B2. Proof status of the data-race class (2026-11-14 — read before claiming "proven").**
 What is machine-checked, and where the chain stops:
 - `window_cfg.v` (Coq 8.18 + stdpp, zero admits, compiled in the session): the spawn-window
@@ -353,13 +412,38 @@ What is machine-checked, and where the chain stops:
   `proofs/vst/verif_alias_rules.v` (in `make check-vst`): the C of the four extracted
   decisions (`zer_access_may_alias`, `zer_local_ref_known`, `zer_global_ref_known`,
   `zer_fresh_ref_own`) equals its `_coq` definition for every input.
+- `race_free.v` (plain Coq, zero admits, no axioms; in `make check-proofs`): THE
+  COMPOSITION. One interleaving machine with every ordering mechanism in it — locks (a
+  shared struct's mutex, a spin lock, being the one executor of a `@once` block), flag
+  tokens, spawn / join, atomic and plain accesses — a definition of a data race, and
+  `race_free`: an annotation of the program points that satisfies local flow constraints,
+  plus "every two conflicting instructions are ordered", excludes every reachable race.
+  Five necessity theorems (`acc k`: every hypothesis but k holds, and a race is
+  reachable) and one accepted example. `proofs/vst/verif_race_rules.v` (in `make
+  check-vst`): the checker's final pairwise verdict `zer_pair_ordered` equals its `_coq`
+  definition. This is the first statement that the mechanisms TOGETHER suffice; before it
+  each oracle was sound over its own states only.
+- COVERAGE is now ENUMERATED, not proven: `tests/test_access_matrix.c` crosses every
+  form in which a program touches an object with every way two threads meet, tied to
+  `NodeKind` by a switch with no `default:`. It answers "is this construct an access
+  node?" for the forms somebody listed; a form nobody listed (a new intrinsic's argument
+  is covered by the default, a new node kind by the switch — a new VALUE SHAPE or ROUTE
+  by nothing) is still found by a probe. Single-file programs only; the ISR rules are not
+  in it.
 - NOT proven: that `checker.c` discharges each hypothesis of the instances (the syntactic
   walk `win_exits_live`, the branch-depth / jump census at the join; for the lock, that a
   lexical region with no label, no nested release and no out-of-role write IS a dynamic
   critical section for every statement judged inside it, and that a local declared in it
   carries nothing from an earlier one) — by inspection and the conc-matrix "jump x
-  spawn-window" and "lock-region" cells only. NOT modelled at all: the spawn-target race
-  scan, the atomic-cell and atomic-downgrade rules, shared-struct locking, the ISR rules,
+  spawn-window" and "lock-region" cells only. For `race_free.v`: that the contexts the
+  walk computes ARE a solution of its flow constraints, and that the source maps onto its
+  graph with every memory-touching construct as an access node — both by inspection and
+  the grids. Modelled only as a PRIMITIVE of `race_free.v`, with no proof that the
+  compiler's rule is an instance: shared-struct locking (a lock taken and dropped around
+  one statement), the atomic-cell rule (atomic against plain is a conflict), the
+  spawn-target scan (a thread with no ordering at all touches nothing shared). NOT
+  modelled at all: the atomic-downgrade decision itself, the ISR rules (a handler
+  preempts and is not preempted, on one core — not an interleaving of threads),
   (for the hand-off: that an access tagged with a held value is made while its thread
   holds it; for the access records: that every reference is classified correctly, that
   every access the program makes is recorded at all — BUG-1667 and BUG-1668 were two
@@ -374,9 +458,15 @@ What is machine-checked, and where the chain stops:
   Closed that day: the lock regions (BUG-1663), the flag hand-off (BUG-1664), the silent
   depth cap (BUG-1665), the unnamed pointer (BUG-1666), container methods recorded as
   reads (BUG-1667), static locals taken for the thread's own (BUG-1668), an array argument
-  the lend rule gave no root (BUG-1669); before them BUG-1652..1654. That is a statement
-  about this ledger — what was probed and measured — and NOT a proof, and its record is
-  poor: "none" was written here on 2026-11-13 and seven families were found the next day.
+  the lend rule gave no root (BUG-1669), a thread never compared with its ancestors'
+  windows (BUG-1671), `@once` bodies (BUG-1672), async tasks (BUG-1673), asm outputs
+  (BUG-1674), atomic cells touched plainly (BUG-1675); on 2026-11-15 intrinsics that
+  write through an argument (BUG-1676), threads the scan found clean (BUG-1677) and a
+  barrier's set-up (BUG-1678) — the three found by the first runs of the access matrix;
+  before them BUG-1652..1654. That is a statement about this ledger — what
+  was probed and measured — and NOT a proof, and its record is poor: "none" was written
+  here on 2026-11-13 and twelve families were found the next day, the last five within
+  hours of `race_free.v` being written, by reading its hypotheses against the walk.
   The last three were found while writing the POSITIVE tests for the fourth: each
   construct a safe program needed (an allocator call, a static counter, an array handed
   to a helper) turned out to have an unsafe twin nothing recorded. What has not had that

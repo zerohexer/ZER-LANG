@@ -158,14 +158,17 @@ Definition zer_flag_orders_coq (flag_valid values_differ : Z) : Z :=
    named and name one global.  Otherwise two named records never do; a named
    and a typed one do when the global's type holds the type (`a_holds_b`); two
    typed ones when either type holds the other. *)
-Definition zer_access_may_alias_coq (same_global both_named a_holds_b b_holds_a : Z) : Z :=
-  if Z.eq_dec same_global 0 then
-    (if Z.eq_dec both_named 0 then
-       (if Z.eq_dec a_holds_b 0 then
-          (if Z.eq_dec b_holds_a 0 then 0 else 1)
-        else 1)
-     else 0)
-  else 1.
+Definition zer_access_may_alias_coq
+    (same_global both_named a_holds_b b_holds_a paths_apart : Z) : Z :=
+  if Z.eq_dec paths_apart 0 then
+    (if Z.eq_dec same_global 0 then
+       (if Z.eq_dec both_named 0 then
+          (if Z.eq_dec a_holds_b 0 then
+             (if Z.eq_dec b_holds_a 0 then 0 else 1)
+           else 1)
+        else 0)
+     else 1)
+  else 0.
 
 (* A local reference is KNOWN (it points only where the values assigned to it
    point) iff its name is one variable, its address is never taken, and every
@@ -187,3 +190,22 @@ Definition zer_global_ref_known_coq (is_const never_mutated : Z) : Z :=
 Definition zer_fresh_ref_own_coq (fresh leaves : Z) : Z :=
   if Z.eq_dec fresh 0 then 0
   else (if Z.eq_dec leaves 0 then 1 else 0).
+
+(* THE PAIRWISE VERDICT (race_free.v, `conflict -> ordered`): two access
+   records of two thread instances.  1 = this pair needs nothing more:
+   the records cannot overlap, or neither writes, or both are atomic — no
+   conflict — or the pair is ordered by a common lock, by two different
+   held values of one flag, or because one thread is not running at the
+   other's access. *)
+Definition zer_pair_ordered_coq
+    (may_alias a_write b_write both_atomic common_lock tok_differ apart : Z) : Z :=
+  if Z.eq_dec may_alias 0 then 1
+  else if Z.eq_dec both_atomic 0 then
+    (if Z.eq_dec common_lock 0 then
+      (if Z.eq_dec tok_differ 0 then
+        (if Z.eq_dec apart 0 then
+          (if Z.eq_dec a_write 0 then (if Z.eq_dec b_write 0 then 1 else 0) else 0)
+         else 1)
+       else 1)
+     else 1)
+  else 1.

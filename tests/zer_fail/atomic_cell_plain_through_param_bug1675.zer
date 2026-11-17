@@ -1,0 +1,16 @@
+// expect-error: both access non-shared global 'g'
+// BUG-1675: `g` is an atomic cell — one thread updates it with @atomic_add. The other writes it PLAINLY,
+// through a helper's pointer parameter. The atomic-cell rule polices the SPAWNER's plain accesses; a
+// thread that uses an @atomic of its own has its plain accesses judged by the context walk, which skipped
+// every atomic cell ("the atomic-cell rule's"). Nobody judged this one. TSan: data race.
+u32 flagx;
+u32 g;
+void bump(*u32 p) { *p += 1; }
+void wa() { for (u32 i = 0; i < 100000; i += 1) { @atomic_add(&g, 1); } }
+void wp() { @atomic_store(&flagx, 1); for (u32 i = 0; i < 100000; i += 1) { bump(&g); } }
+i32 main() {
+    ThreadHandle a = spawn wa();
+    ThreadHandle b = spawn wp();
+    a.join(); b.join();
+    return 0;
+}

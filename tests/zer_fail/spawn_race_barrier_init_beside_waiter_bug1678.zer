@@ -1,0 +1,21 @@
+// expect-error: both access non-shared global 'gate'
+// BUG-1678: a Barrier synchronises its WAITERS, not its own set-up.
+// @barrier_init zeroes the object and re-creates its mutex with plain stores;
+// here it runs in a function the spawner calls while a thread may already be
+// waiting on the barrier. Set a barrier up before the first spawn.
+Barrier gate;
+u32 arrived;
+
+void runner() {
+    @barrier_wait(gate);
+    @atomic_add(&arrived, 1);
+}
+void open_gate() {
+    @barrier_init(gate, 1);
+}
+u32 main() {
+    ThreadHandle th = spawn runner();
+    open_gate();
+    th.join();
+    return 0;
+}

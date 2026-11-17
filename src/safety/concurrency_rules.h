@@ -97,9 +97,12 @@ int zer_flag_orders(int flag_valid, int values_differ);
  * type T" when it goes through a reference that is not KNOWN to point only
  * into recorded globals or the thread's own stack. Two records are compared
  * when they may alias. */
-int zer_access_may_alias(int same_global, int both_named, int a_holds_b, int b_holds_a);
+int zer_access_may_alias(int same_global, int both_named, int a_holds_b, int b_holds_a,
+                         int paths_apart);
 int zer_local_ref_known(int bound_once, int addr_taken, int values_known);
 int zer_global_ref_known(int is_const, int never_mutated);
 int zer_fresh_ref_own(int fresh, int leaves);
+int zer_pair_ordered(int may_alias, int a_write, int b_write, int both_atomic,
+                     int common_lock, int tok_differ, int apart);
 
 #endif

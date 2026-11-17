@@ -1,0 +1,61 @@
+// BUG-1676, the positive side: the same intrinsics, used so that no two
+// threads meet over the object behind the argument.
+//   - @cstr into a buffer on the thread's own stack
+//   - @cstr into one global buffer, every access under one lock
+//   - @nt_store into the thread's own slot, summed by the spawner after join
+//   - @wait_on_address beside an @atomic_store of the same word
+u32 lk;
+u32 ready;
+u32 done;
+u8[32] banner;
+u32 banner_sum;
+u64 slot_a;
+u64 slot_b;
+
+u32 sum_bytes(const [*]u8 s) {
+    u32 t = 0;
+    for (u32 i = 0; i < (u32)s.len; i += 1) {
+        if (s[i] == 0) { break; }
+        t += (u32)s[i];
+    }
+    return t;
+}
+
+void worker_a() {
+    @wait_on_address(&ready, 0);
+    u8[16] mine;
+    @cstr(mine, "abc");
+    u32 local = sum_bytes(mine[0..16]);
+    @nt_store(&slot_a, (u64)local);
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    @cstr(banner, "aa");
+    banner_sum += sum_bytes(banner[0..32]);
+    @atomic_store(&lk, 0);
+    @atomic_add(&done, 1);
+}
+void worker_b() {
+    @wait_on_address(&ready, 0);
+    u8[16] mine;
+    @cstr(mine, "abd");
+    u32 local = sum_bytes(mine[0..16]);
+    @nt_store(&slot_b, (u64)local);
+    while (!@atomic_cas(&lk, 0, 1)) { }
+    @cstr(banner, "b");
+    banner_sum += sum_bytes(banner[0..32]);
+    @atomic_store(&lk, 0);
+    @atomic_add(&done, 1);
+}
+
+u32 main() {
+    ThreadHandle a = spawn worker_a();
+    ThreadHandle b = spawn worker_b();
+    @atomic_store(&ready, 1);
+    a.join();
+    b.join();
+    // 'a'=97 'b'=98 'c'=99 'd'=100
+    if (slot_a != 294) { return 1; }
+    if (slot_b != 295) { return 2; }
+    if (banner_sum != 97 + 97 + 98) { return 3; }
+    if (@atomic_load(&done) != 2) { return 4; }
+    return 0;
+}

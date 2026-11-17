@@ -1,0 +1,18 @@
+// expect-error: both access non-shared global 'g'
+// BUG-1677 (and BUG-1422's program as it was first written): the handle is
+// overwritten on the way round the loop, so two threads are still running
+// @atomic_add when main's plain `g = 0` runs after the one join. The threads
+// are all-atomic — clean in the spawn scan — and are judged against their
+// spawner's window all the same; under a goto that window never closes.
+u32 g;
+void w() { for (u32 k = 0; k < 1000000; k += 1) { @atomic_add(&g, 1); } }
+u32 main() {
+    u32 i = 0;
+again:
+    ThreadHandle th = spawn w();
+    i += 1;
+    if (i < 3) { goto again; }
+    th.join();
+    g = 0;
+    return g;
+}

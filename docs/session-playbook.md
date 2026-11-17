@@ -896,6 +896,53 @@ REWRITTEN it (`alloc(T)` is `T.alloc_ptr()`, `orelse return` is a flag with no f
 node). A recogniser written against the source spelling compiled, ran, and matched
 nothing; one trace line showed it (rule 8 — verify the edit RUNS).
 
+**Compose the oracles; and a baseline row is an unexamined hypothesis (BUG-1671..1674,
+2026-11-14).** Four oracles, one per ordering mechanism, each proved sound — and no
+statement that together they are enough. Writing the ONE machine (`race_free.v`) took an
+afternoon and paid at once, three ways. (1) Its definitions were more precise than the
+code's comments: "u has finished" (`after`) is not "u was joined, so everything below it
+is over" — two accepted races. (2) Every primitive of the machine needs a construct of
+the language mapped onto it, and going down the constructs — what IS a lock here? a
+`@once` block is one, and the walk skipped its body — found a third. (3) The header's
+COVERAGE line ("every construct that touches memory is an access node") sent me to
+`tools/walker_field_baseline.txt`, where `sync_walk:NODE_ONCE:once.body` and
+`…:NODE_ASM:asm_stmt.outputs` had been sitting as justified rows: the gate had FOUND both
+holes and filed them. So: when a walk's result feeds an ACCEPT, every baseline row of it
+is a probe — write the two-thread negative, do not write the justification. And when the
+model's own accepted example is refused by the theorem, believe the theorem first (mine
+had a lock-guarded and a token-guarded write of one location).
+
+**Enumerate the rows; a probe list is whatever somebody thought of (BUG-1676..1678,
+2026-11-15).** Ten families of accepted race had been found by probing, each "an access
+nobody wrote down", and the residual was always the same sentence: nothing enumerates the
+constructs that touch memory. Writing the enumeration — `tests/test_access_matrix.c`:
+every form in which a program touches an object x every way two threads meet — took a
+morning, and its FIRST run was red in a family no probe had gone near (an intrinsic that
+writes through its argument); a row added to pin the new path key down found a second (a
+thread the scan calls clean is compared with nobody); a question asked while writing the
+residuals found a third (`@barrier_init` beside a waiter). Four things made it work. (1)
+The verdict of a cell comes from the DEFINITION of a race, written once as a function of
+(row, column) — never from today's output. (2) Each row has a safe twin column (one lock;
+after the join): a rejection is then known to be for the race. (3) The rows are tied to
+the `NodeKind` enum by a no-`default:` switch, so the list cannot fall behind the AST.
+(4) A known over-rejection is an asserted REJECT with a reason, not a skipped cell.
+And one that nearly did not: judge a negative by the compiler's `error:` lines only — the
+downgraded scan finding prints "data race" as a WARNING on every program in the grid, and
+a substring test over the whole stderr would have passed anything. Mistakes in my own row
+expectations (two instances of a writing form ARE a race; atomic beside atomic is not)
+showed up as red cells too: read a red cell before believing either side.
+**A relaxation's corpus cost is not only its over-rejections.** Judging clean threads
+turned two existing POSITIVE tests red: the older atomic-cell rule already told `g.i.a`
+from `g.i.b`, and my first key (one field level) was coarser than the rule it was meant to
+subsume. The sweep found it in minutes; the fix was the general key (a path), which is
+also what the oracle's model had all along.
+**A verdict sweep that compares EXIT CODES is blind to a masked negative.** The corpus
+sweep said "no change" and `make check` then failed: `scoped_spawn_goto_respawn_atomic_
+bug1422` was still rejected — by the new rule, in the checker, before zercheck's re-spawn
+rule (the one the file states) could speak. Both findings were true of that program; the
+file now has one defect and its twin states the other. For a NEW REJECTION, sweep the
+negatives for their stated reason (the runner's own test), not for their exit status.
+
 **THE PRECISION CEILING — design to this (the theory that bounds the standard).** 100%
 precision (accept EXACTLY the safe programs) is IMPOSSIBLE — not hard, impossible — by
 Rice: the true set "memory-safe on every execution" is undecidable, so no sound,

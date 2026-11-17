@@ -1,0 +1,15 @@
+// expect-error: both access non-shared global 'g'
+// BUG-1672: a @once body runs once program-wide, so it cannot meet ITSELF. It can meet everything else.
+// The context walk never entered it ("runs once"), so a thread reading what another thread's @once body
+// writes had nothing to be judged against. TSan: data race on the pre-fix compiler.
+u32 flagx;
+u32 g;
+u32 sink;
+void init_once() { @atomic_store(&flagx, 1); @once { for (u32 i = 0; i < 100000; i += 1) { g += 1; } } }
+void reader() { @atomic_store(&flagx, 1); u32 acc = 0; for (u32 i = 0; i < 100000; i += 1) { acc += g; } sink = acc; }
+i32 main() {
+    ThreadHandle a = spawn init_once();
+    ThreadHandle b = spawn reader();
+    a.join(); b.join();
+    return 0;
+}

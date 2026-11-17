@@ -304,8 +304,6 @@ checker.c:walk_callee_globals:NODE_INTERRUPT:interrupt.body
 checker.c:walk_callee_globals:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- checker.c: record_isr_globals ---
-checker.c:record_isr_globals:NODE_ASM:asm_stmt.inputs
-checker.c:record_isr_globals:NODE_ASM:asm_stmt.outputs
 checker.c:record_isr_globals:NODE_FILE:file.decls
 checker.c:record_isr_globals:NODE_FUNC_DECL:func_decl.body
 checker.c:record_isr_globals:NODE_GLOBAL_VAR:var_decl.init
@@ -344,8 +342,6 @@ checker.c:scan_func_props:NODE_INTERRUPT:interrupt.body
 checker.c:scan_func_props:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- checker.c: scan_unsafe_global_access ---
-checker.c:scan_unsafe_global_access:NODE_ASM:asm_stmt.inputs
-checker.c:scan_unsafe_global_access:NODE_ASM:asm_stmt.outputs
 checker.c:scan_unsafe_global_access:NODE_FILE:file.decls
 checker.c:scan_unsafe_global_access:NODE_FUNC_DECL:func_decl.body
 checker.c:scan_unsafe_global_access:NODE_GLOBAL_VAR:var_decl.init
@@ -2380,8 +2376,6 @@ checker.c:vf_walk:NODE_STATIC_ASSERT:static_assert_stmt.cond
 # BUG-1563 sync_walk / census_walk: declarations and asm (naked-only) hold no thread access or
 # call; a @once body runs once program-wide (BUG-1276). sync_lvalue: names an lvalue's ROOT
 # without reading it and hands every other kind to sync_walk, which descends it.
-checker.c:census_walk:NODE_ASM:asm_stmt.inputs
-checker.c:census_walk:NODE_ASM:asm_stmt.outputs
 checker.c:census_walk:NODE_FILE:file.decls
 checker.c:census_walk:NODE_FUNC_DECL:func_decl.body
 checker.c:census_walk:NODE_INTERRUPT:interrupt.body
@@ -2427,13 +2421,10 @@ checker.c:sync_lvalue:NODE_UNARY:unary.operand
 checker.c:sync_lvalue:NODE_VAR_DECL:var_decl.init
 checker.c:sync_lvalue:NODE_WHILE:while_stmt.body
 checker.c:sync_lvalue:NODE_WHILE:while_stmt.cond
-checker.c:sync_walk:NODE_ASM:asm_stmt.inputs
-checker.c:sync_walk:NODE_ASM:asm_stmt.outputs
 checker.c:sync_walk:NODE_FILE:file.decls
 checker.c:sync_walk:NODE_FUNC_DECL:func_decl.body
 checker.c:sync_walk:NODE_GLOBAL_VAR:var_decl.init
 checker.c:sync_walk:NODE_INTERRUPT:interrupt.body
-checker.c:sync_walk:NODE_ONCE:once.body
 checker.c:sync_walk:NODE_STATIC_ASSERT:static_assert_stmt.cond
 # BUG-1566: vrp_cond_effect_free answers NO (not effect-free) for every kind it does not descend — a proof-of-absence walk, conservative by construction.
 checker.c:vrp_cond_effect_free:NODE_ASM:asm_stmt.inputs
